@@ -17,6 +17,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = [
+    "polars>=1.31.0",
+]
 
 [project.urls]
 Homepage = "https://switchbox-data.github.io/smart-meter-analysis/"
