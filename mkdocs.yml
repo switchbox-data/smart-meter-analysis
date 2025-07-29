@@ -1,0 +1,52 @@
+site_name: smart-meter-analysis
+repo_url: https://github.com/switchbox-data/smart-meter-analysis
+site_url: https://switchbox-data.github.io/smart-meter-analysis
+site_description: This is the repo for the smart-meter-analysis project
+site_author: Switchbox
+edit_uri: edit/main/docs/
+repo_name: switchbox-data/smart-meter-analysis
+copyright: Maintained by <a href="https://switchbox-data.com">switchbox-data</a>.
+
+nav:
+  - Home: index.md
+  - Modules: modules.md
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["smart_meter_analysis"]
+theme:
+  name: material
+  feature:
+    tabs: true
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      accent: deep orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: deep orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/switchbox-data/smart-meter-analysis
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/smart-meter-analysis
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
