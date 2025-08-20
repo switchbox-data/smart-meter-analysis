@@ -112,5 +112,3 @@ ignore = [
 
 [tool.ruff.format]
 preview = true
-
-
