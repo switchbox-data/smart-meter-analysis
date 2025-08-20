@@ -18,9 +18,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "boto3>=1.7.84",
     "ipykernel>=6.30.1",
     "polars>=1.31.0",
     "quarto>=0.1.0",
+    "requests>=2.32.4",
+    "rich>=14.1.0",
 ]
 
 [project.urls]
