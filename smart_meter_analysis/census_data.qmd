@@ -1,445 +1,430 @@
 
 Finalized code
 ```{python}
-# ===== Imports =====
+# Imports
 import polars as pl
 import cenpy as cen
 
+# Census uses special codes for missing/suppressed data instead of nulls
+CENSUS_MISSING_CODES = [-666666666, -999999999, -888888888, -555555555, -222222222]
 
-# ===== Helpers =====
+FIPS_code = '17' #Illinois
+
+# Helper Functions
 def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
-    """Create an 11-digit tract GEOID from state(2)+county(3)+tract(6), with zero-padding."""
+    """Create 11-digit tract GEOID per Census standard: state(2)+county(3)+tract(6)."""
     return df.with_columns(
-        pl.concat_str(
-            [
-                pl.col("state").cast(pl.Utf8).str.zfill(2),
-                pl.col("county").cast(pl.Utf8).str.zfill(3),
-                pl.col("tract").cast(pl.Utf8).str.zfill(6),
-            ]
-        ).alias("GEOID")
+        pl.concat_str([
+            pl.col("state").cast(pl.Utf8).str.zfill(2),
+            pl.col("county").cast(pl.Utf8).str.zfill(3),
+            pl.col("tract").cast(pl.Utf8).str.zfill(6),
+        ]).alias("GEOID")
     )
 
-
 def safe_percent(numer: pl.Expr, denom: pl.Expr) -> pl.Expr:
-    """Compute (numer/denom)*100, returning null if denom<=0 or either side is null."""
+    """Calculate percentage with null safety for Census data edge cases."""
     return (
         pl.when(denom.is_not_null() & numer.is_not_null() & (denom > 0))
         .then((numer / denom) * 100.0)
         .otherwise(None)
     )
 
-
-# ===== 1) ACS (ACSDP5Y2023) =====
-conn = cen.remote.APIConnection("ACSDP5Y2023")
-
-acs_vars_to_download = {
-    "DP02_0001E": "Households by type: Total Households",
-    "DP02_0016E": "Average household size",
-    "DP02_0017E": "Average family size",
-    "DP02_0059E": "Educational attainment 25 years and over",
-    "DP03_0052E": "Income and benefits less than $10,000",
-    "DP03_0053E": "Income and benefits $10,000 to $14,999",
-    "DP03_0054E": "Income and benefits $15,000 to $24,999",
-    "DP03_0055E": "Income and benefits $25,000 to $34,999",
-    "DP03_0056E": "Income and benefits $35,000 to $49,999",
-    "DP03_0057E": "Income and benefits $50,000 to $74,999",
-    "DP03_0058E": "Income and benefits $75,000 to $99,999",
-    "DP03_0059E": "Income and benefits $100,000 to $149,999",
-    "DP03_0060E": "Income and benefits $150,000 to $199,999",
-    "DP03_0061E": "Income and benefits $200,000 or more",
-    "DP03_0062E": "Median household income",
-    "DP04_0001E": "Total housing units",
-    "DP04_0002E": "Occupied housing units",
-    "DP04_0003E": "Vacant housing units",
-    "DP04_0017E": "Built 2020 or after",
-    "DP04_0018E": "Built 2010 to 2019",
-    "DP04_0019E": "Built 2000 to 2009",
-    "DP04_0020E": "Built 1990 to 1999",
-    "DP04_0021E": "Built 1980 to 1989",
-    "DP04_0022E": "Built 1970 to 1979",
-    "DP04_0023E": "Built 1960 to 1969",
-    "DP04_0024E": "Built 1950 to 1959",
-    "DP04_0025E": "Built 1940 to 1949",
-    "DP04_0026E": "Built 1939 or earlier",
-    "DP04_0028E": "1 room",
-    "DP04_0029E": "2 rooms",
-    "DP04_0030E": "3 rooms",
-    "DP04_0031E": "4 rooms",
-    "DP04_0032E": "5 rooms",
-    "DP04_0033E": "6 rooms",
-    "DP04_0034E": "7 rooms",
-    "DP04_0035E": "8 rooms",
-    "DP04_0036E": "9 rooms or more",
-    "DP04_0046E": "Owner occupied",
-    "DP04_0047E": "Renter occupied",
-    "DP04_0062E": "Utility gas heating",
-    "DP04_0064E": "Electric heating",
-    "DP05_0006E": "5 to 9 years old",
-    "DP05_0007E": "10 to 14 years old",
-    "DP05_0008E": "15 to 19 years old",
-    "DP05_0009E": "20 to 24 years old",
-    "DP05_0010E": "25 to 34 years old",
-    "DP05_0011E": "35 to 44 years old",
-    "DP05_0012E": "45 to 54 years old",
-    "DP05_0013E": "55 to 59 years old",
-    "DP05_0014E": "60 to 64 years old",
-    "DP05_0015E": "65 to 74 years old",
-    "DP05_0016E": "75 to 84 years old",
-    "DP05_0017E": "85 years or older",
-    "DP04_0081E": "Value less than $50,000",
-    "DP04_0082E": "Value $50,000 to $99,999",
-    "DP04_0083E": "Value $100,000 to $149,999",
-    "DP04_0084E": "Value $150,000 to $199,999",
-    "DP04_0085E": "Value $200,000 to $299,999",
-    "DP04_0086E": "Value $300,000 to $499,999",
-    "DP04_0087E": "Value $500,000 to $999,999",
-    "DP04_0088E": "Value $1,000,000 or more",
-}
-
-acs_vars_to_download_list = list(acs_vars_to_download.keys())
-
-acs_df_pandas = conn.query(
-    cols=["NAME"] + acs_vars_to_download_list,
-    geo_unit="tract",
-    geo_filter={"state": "17"},  # Illinois
-)
-acs_df_polars = pl.from_pandas(acs_df_pandas)
-
-# Proper padded GEOID
-acs_df_polars = build_geoid(acs_df_polars)
-
-# Rename ACS columns to the provided labels (note: spaces in names are fine but less convenient)
-acs_df_polars = acs_df_polars.rename(
-    {k: v for k, v in acs_vars_to_download.items() if k in acs_df_polars.columns}
-)
-```
-
-
-Working section
-
-```{python}
-import polars as pl
-import pandas as pd
-import cenpy as cen
-
-# Constants
-
-STATE_FIPS = "17"  # Illinois
-
-# Helper functions
-
-# Ensure consistent GEOIDs
-def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Create a proper 11-digit tract GEOID from 'state' (2), 'county' (3), 'tract' (6).
-    Preserves leading zeros by zero-padding each piece, then concatenates.
-    """
-    return df.with_columns(
-        pl.concat_str([
-            pl.col("state").cast(pl.Utf8).str.zfill(2),   # 2 chars, e.g. '17'
-            pl.col("county").cast(pl.Utf8).str.zfill(3),  # 3 chars, e.g. '031'
-            pl.col("tract").cast(pl.Utf8).str.zfill(6),   # 6 chars, e.g. '841200'
-        ]).alias("GEOID")
-    )
-
-# Make sure that we never divide by zero (for instance when calculations 
-# include tracts with no population) 
-def safe_percent(numer: pl.Expr, denom: pl.Expr) -> pl.Expr:
-    """
-    Compute (numer/denom)*100 safely in Polars:
-    - returns null if denom <= 0 or either side is null (avoids divide-by-zero and NaNs)
-    - returns a float percentage otherwise
-    """
-    return (
-        pl.when(denom.is_not_null() & numer.is_not_null() & (denom > 0))
-          .then((numer / denom) * 100.0)
-          .otherwise(None)
-    )
-
-
-# Step 3: open ACS connection & pick a small starter variable set
-conn_acs = cen.remote.APIConnection("ACSDP5Y2023")  # 3.1
-
-acs_vars = {                                           # 3.2
-    "DP02_0001E": "households_total",                  # total households
-    "DP03_0062E": "median_household_income",           # median household income
-    "DP04_0001E": "housing_units_total",               # total housing units
-}
-
-acs_cols = ["NAME"] + list(acs_vars.keys())            # 3.3
-
-# Step 4: query ACS (tracts in Illinois) and convert to Polars
-
-acs_pd = conn_acs.query(                             # 4.1
-    cols=acs_cols,                                   #      request NAME + our ACS vars
-    geo_unit="tract",                                #      tract-level geography
-    geo_filter={"state": STATE_FIPS},                #      filter to Illinois ("17")
-)
-print(f"ACS rows returned (pandas): {len(acs_pd)}")  # 4.2
-
-acs_pl = pl.from_pandas(acs_pd)                      # 4.3
-print(f"ACS rows after Polars conversion: {acs_pl.height}")  # 4.4
-print(acs_pl.columns)
-
-
-# Step 5: confirm geography keys exist, then build GEOID
-
-print("Columns present:", acs_pl.columns)                 # 5.1
-
-required_geo = {"state", "county", "tract"}               # 5.2
-missing = required_geo - set(acs_pl.columns)              # 5.3
-if missing:                                               # 5.4
-    raise ValueError(
-        f"Expected geography columns {required_geo}, but missing {missing}. "
-        "Your cenpy version may name them differently; inspect acs_pl.columns."
-    )
-
-acs_pl = build_geoid(acs_pl)                              # 5.5
-
-acs_pl.select(["state", "county", "tract", "GEOID", "NAME"]).head(3)  # 5.6                               # 4.5
-
-
-# Assumes you've already run Steps 1–5 (acs_pl exists and has GEOID)
-
-# 5.a — basic shape
-print("rows, cols:", acs_pl.shape)
-
-# 5.b — peek at a few rows (this does not truncate your DF in memory)
-print("\nfirst 3 rows:")
-print(acs_pl.head(3))
-
-# 5.c — GEOID sanity checks (should all look "good")
-print("\nGEOID checks:")
-
-# Use len_chars() on modern Polars; fall back to lengths() on older versions
-try:
-    geo_len = pl.col("GEOID").cast(pl.Utf8).str.len_chars()  # modern
-except AttributeError:
-    geo_len = pl.col("GEOID").cast(pl.Utf8).str.lengths()    # older
-
-print(
-    acs_pl.select([
-        pl.len().alias("n_rows"),
-        pl.col("GEOID").n_unique().alias("n_unique_geoid"),
-        (geo_len == 11).all().alias("all_geoid_len_11"),
-        pl.col("GEOID").is_null().any().alias("any_geoid_null"),
-        pl.col("GEOID").cast(pl.Utf8).str.contains(r"^\d{11}$").all().alias("all_geoid_digits"),
+def clean_census_values(df: pl.DataFrame) -> pl.DataFrame:
+    """Replace Census missing data codes with proper nulls for statistical validity."""
+    numeric_cols = [
+        col for col in df.columns 
+        if df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
+    ]
+    
+    return df.with_columns([
+        pl.when(pl.col(col).is_in(CENSUS_MISSING_CODES))
+          .then(None)
+          .otherwise(pl.col(col))
+          .alias(col)
+        for col in numeric_cols
     ])
-)
 
-# 5.d — list columns we actually have (varies slightly by cenpy version)
-print("\ncolumns present:")
-print(acs_pl.columns)
+# Load ACS 5-Year Data (2023)
+conn_acs = cen.remote.APIConnection("ACSDP5Y2023")
 
-# 5.e — quick dtype snapshot (helps us know if numbers came back as strings)
-print("\ncolumn dtypes:")
-print(list(zip(acs_pl.columns, acs_pl.dtypes)))
-
-
-# Step 6: rename ACS variables and cast to numeric
-
-rename_map = acs_vars                          # 6.1
-acs_pl = acs_pl.rename(rename_map)             # 6.2
-
-num_cols = list(rename_map.values())           # 6.3
-acs_pl = acs_pl.with_columns(                  # 6.4
-    pl.col(num_cols).cast(pl.Int64, strict=False)
-)
-
-print("Preview after rename + cast:")          # 6.5
-print(acs_pl.select(num_cols + ["GEOID"]).head(3))  # 6.6
-
-print("\nDtypes of renamed numeric columns:")  # 6.7
-print(list(zip(num_cols, acs_pl.select(num_cols).dtypes)))  # 6.8
-
-```
-
-
-
-# 1. FIRST, GET YOUR ACS DATA (fixed version)
-print("Fetching ACS data for Illinois census tracts...")
-
-conn = cen.remote.APIConnection('ACSDP5Y2023')
-
-acs_vars_to_download = {
-    'DP02_0001E': 'Households by type: Total Households',
-    'DP02_0016E': 'Average household size',
-    'DP02_0017E': 'Average family size',
-    'DP02_0059E': 'Educational attainment 25 years and over',
-    'DP03_0052E': 'Income and benefits less than $10,000',
-    'DP03_0053E': 'Income and benefits $10,000 to $14,999',
-    'DP03_0054E': 'Income and benefits $15,000 to $24,999',
-    'DP03_0055E': 'Income and benefits $25,000 to $34,999',
-    'DP03_0056E': 'Income and benefits $35,000 to $49,999',
-    'DP03_0057E': 'Income and benefits $50,000 to $74,999',
-    'DP03_0058E': 'Income and benefits $75,000 to $99,999',
-    'DP03_0059E': 'Income and benefits $100,000 to $149,999',
-    'DP03_0060E': 'Income and benefits $150,000 to $199,999',
-    'DP03_0061E': 'Income and benefits $200,000 or more',
-    'DP03_0062E': 'Median household income',
-    'DP04_0001E': 'Total housing units',
-    'DP04_0002E': 'Occupied housing units',
-    'DP04_0003E': 'Vacant housing units',
-    'DP04_0017E': 'Built 2020 or after',
-    'DP04_0018E': 'Built 2010 to 2019',
-    'DP04_0019E': 'Built 2000 to 2009',
-    'DP04_0020E': 'Built 1990 to 1999',
-    'DP04_0021E': 'Built 1980 to 1989',
-    'DP04_0022E': 'Built 1970 to 1979',
-    'DP04_0023E': 'Built 1960 to 1969',
-    'DP04_0024E': 'Built 1950 to 1959',
-    'DP04_0025E': 'Built 1940 to 1949',
-    'DP04_0026E': 'Built 1939 or earlier',
-    'DP04_0028E': '1 room',
-    'DP04_0029E': '2 rooms',
-    'DP04_0030E': '3 rooms',
-    'DP04_0031E': '4 rooms',
-    'DP04_0032E': '5 rooms',
-    'DP04_0033E': '6 rooms',
-    'DP04_0034E': '7 rooms',
-    'DP04_0035E': '8 rooms',
-    'DP04_0036E': '9 rooms or more',
-    'DP04_0046E': 'Owner occupied',
-    'DP04_0047E': 'Renter occupied',
-    'DP04_0062E': 'Utility gas heating',  # Fixed code
-    'DP04_0064E': 'Electric heating',      # Fixed code
-    'DP05_0006E': '5 to 9 years old',
-    'DP05_0007E': '10 to 14 years old',
-    'DP05_0008E': '15 to 19 years old',
-    'DP05_0009E': '20 to 24 years old',
-    'DP05_0010E': '25 to 34 years old',
-    'DP05_0011E': '35 to 44 years old',
-    'DP05_0012E': '45 to 54 years old',
-    'DP05_0013E': '55 to 59 years old',
-    'DP05_0014E': '60 to 64 years old',
-    'DP05_0015E': '65 to 74 years old',
-    'DP05_0016E': '75 to 84 years old',
-    'DP05_0017E': '85 years or older',
-    'DP04_0081E': 'Value less than $50,000',
-    'DP04_0082E': 'Value $50,000 to $99,999',
-    'DP04_0083E': 'Value $100,000 to $149,999',
-    'DP04_0084E': 'Value $150,000 to $199,999',
-    'DP04_0085E': 'Value $200,000 to $299,999',
-    'DP04_0086E': 'Value $300,000 to $499,999',
-    'DP04_0087E': 'Value $500,000 to $999,999',
-    'DP04_0088E': 'Value $1,000,000 or more'
+# Variable mappings from Census codes to readable names
+acs_vars = {
+    "DP02_0001E": "Total_Households",
+    "DP02_0016E": "Avg_Household_Size",
+    "DP02_0017E": "Avg_Family_Size",
+    "DP02_0060E": "Less_9th_Grade",
+    "DP02_0062E": "High_School_Dip",
+    "DP02_0063E": "Some_College",
+    "DP02_0064E": "Associates_Deg",
+    "DP02_0065E": "Bachelors_Deg",
+    "DP02_0066E": "Grad/Professional_Deg",
+    "DP03_0052E": "Income_Less_10k",
+    "DP03_0053E": "Income_10k_to_15k",
+    "DP03_0054E": "Income_15k_to_25k",
+    "DP03_0055E": "Income_25k_to_35k",
+    "DP03_0056E": "Income_35k_to_50k",
+    "DP03_0057E": "Income_50k_to_75k",
+    "DP03_0058E": "Income_75k_to_100k",
+    "DP03_0059E": "Income_100k_to_150k",
+    "DP03_0060E": "Income_150k_to_200k",
+    "DP03_0061E": "Income_200k_Plus",
+    "DP03_0062E": "Median_Household_Income",
+    "DP04_0001E": "Total_Housing_Units",
+    "DP04_0002E": "Occupied_Housing_Units",
+    "DP04_0003E": "Vacant_Housing_Units",
+    "DP04_0017E": "Built_2020_After",
+    "DP04_0018E": "Built_2010_2019",
+    "DP04_0019E": "Built_2000_2009",
+    "DP04_0020E": "Built_1990_1999",
+    "DP04_0021E": "Built_1980_1989",
+    "DP04_0022E": "Built_1970_1979",
+    "DP04_0023E": "Built_1960_1969",
+    "DP04_0024E": "Built_1950_1959",
+    "DP04_0025E": "Built_1940_1949",
+    "DP04_0026E": "Built_Before_1940",
+    "DP04_0028E": "Rooms_1",
+    "DP04_0029E": "Rooms_2",
+    "DP04_0030E": "Rooms_3",
+    "DP04_0031E": "Rooms_4",
+    "DP04_0032E": "Rooms_5",
+    "DP04_0033E": "Rooms_6",
+    "DP04_0034E": "Rooms_7",
+    "DP04_0035E": "Rooms_8",
+    "DP04_0036E": "Rooms_9_Plus",
+    "DP04_0046E": "Owner_Occupied",
+    "DP04_0047E": "Renter_Occupied",
+    "DP04_0062E": "Heat_Utility_Gas",
+    "DP04_0064E": "Heat_Electric",
+    "DP05_0006E": "Age_5_to_9",
+    "DP05_0007E": "Age_10_to_14",
+    "DP05_0008E": "Age_15_to_19",
+    "DP05_0009E": "Age_20_to_24",
+    "DP05_0010E": "Age_25_to_34",
+    "DP05_0011E": "Age_35_to_44",
+    "DP05_0012E": "Age_45_to_54",
+    "DP05_0013E": "Age_55_to_59",
+    "DP05_0014E": "Age_60_to_64",
+    "DP05_0015E": "Age_65_to_74",
+    "DP05_0016E": "Age_75_to_84",
+    "DP05_0017E": "Age_85_Plus",
+    "DP04_0081E": "Value_Less_50k",
+    "DP04_0082E": "Value_50k_to_100k",
+    "DP04_0083E": "Value_100k_to_150k",
+    "DP04_0084E": "Value_150k_to_200k",
+    "DP04_0085E": "Value_200k_to_300k",
+    "DP04_0086E": "Value_300k_to_500k",
+    "DP04_0087E": "Value_500k_to_1M",
+    "DP04_0088E": "Value_1M_Plus",
 }
-
-acs_vars_to_download_list = list(acs_vars_to_download.keys())
 
 # Query ACS data
-acs_df_pandas = conn.query(
-    cols=['NAME'] + acs_vars_to_download_list,
-    geo_unit='tract',
-    geo_filter={'state': '17'}  # Illinois
+acs_df = conn_acs.query(
+    cols=["NAME"] + list(acs_vars.keys()),
+    geo_unit="tract",
+    geo_filter={"state": FIPS_code}
 )
 
-# Convert to Polars
-acs_polars = pl.from_pandas(acs_df_pandas)
-
-# Create GEOID from components
-acs_polars = acs_polars.with_columns(
-    (pl.col('state') + pl.col('county') + pl.col('tract')).alias('GEOID')
+acs_df = pl.from_pandas(acs_df)
+acs_df = build_geoid(acs_df)
+acs_df = acs_df.rename(
+    {k: v for k, v in acs_vars.items() if k in acs_df.columns}
 )
 
-# Rename columns
-rename_map = {
-    k: v for k, v in acs_vars_to_download.items() if k in acs_polars.columns
-}
-acs_df_polars = acs_polars.rename(rename_map)
+# Load Decennial Census Urban/Rural Data (2020)
+# Urban/rural designation requires decennial census, not available in ACS
 
-print(f"✓ Loaded {len(acs_df_polars)} census tracts from Illinois")
-
-# 2. NOW ADD URBAN/RURAL FROM 2020 CENSUS
-print("\nFetching urban/rural classification from 2020 Census...")
-
-# Connect to DHC 2020
 conn_dhc = cen.remote.APIConnection('DECENNIALDHC2020')
 
-# First, let's check if H2 variables are available at tract level
-dhc_vars_to_download = {
+dhc_vars = {
     'H2_002N': 'Urban_Housing_Units',
     'H2_003N': 'Rural_Housing_Units'
 }
 
-dhc_vars_to_download_list = list(dhc_vars_to_download.keys())
-
-# Query DHC data - note: using conn_dhc, not conn!
-try:
-    dhc_df_pandas = conn_dhc.query(  # <- Fixed: was using 'conn' instead of 'conn_dhc'
-        cols=['NAME'] + dhc_vars_to_download_list,
-        geo_unit='tract',
-        geo_filter={'state': '17'}
-    )
-    print("H2 variables worked at tract level!")
-    
-except Exception as e:
-    print(f"H2 variables not available at tract level: {e}")
-    print("\nTrying P2 variables instead (population instead of housing)...")
-    
-    # Try P2 variables (population) instead
-    dhc_vars_to_download = {
-        'P2_002N': 'Urban_Population',
-        'P2_003N': 'Rural_Population'
-    }
-    
-    dhc_vars_to_download_list = list(dhc_vars_to_download.keys())
-    
-    dhc_df_pandas = conn_dhc.query(
-        cols=['NAME'] + dhc_vars_to_download_list,
-        geo_unit='tract',
-        geo_filter={'state': '17'}
-    )
-
-# Convert to Polars
-dhc_df_polars = pl.from_pandas(dhc_df_pandas)
-
-# Create GEOID from components
-dhc_df_polars = dhc_df_polars.with_columns(  # <- Fixed: consistent naming
-    (pl.col('state') + pl.col('county') + pl.col('tract')).alias('GEOID')
+dhc_df = conn_dhc.query(
+    cols=['NAME'] + list(dhc_vars.keys()),
+    geo_unit='tract',
+    geo_filter={'state': FIPS_code}
 )
 
-# Rename columns
-rename_map = {
-    k: v for k, v in dhc_vars_to_download.items() if k in dhc_df_polars.columns
-}
-dhc_df_polars = dhc_df_polars.rename(rename_map)
+dhc_df = pl.from_pandas(dhc_df)
+dhc_df = build_geoid(dhc_df)
+dhc_df = dhc_df.rename(
+    {k: v for k, v in dhc_vars.items() if k in dhc_df.columns}
+)
 
-# Calculate urban/rural classification
-if 'Urban_Housing_Units' in dhc_df_polars.columns:
-    # Using housing units
-    dhc_df_polars = dhc_df_polars.with_columns([
-        (pl.col('Urban_Housing_Units').cast(pl.Float64) / 
-         (pl.col('Urban_Housing_Units').cast(pl.Float64) + 
-          pl.col('Rural_Housing_Units').cast(pl.Float64)) * 100)
-        .alias('Urban_Percent'),
-        
-        pl.when(pl.col('Urban_Housing_Units') > pl.col('Rural_Housing_Units'))
-         .then(pl.lit('Urban'))
-         .otherwise(pl.lit('Rural'))
-         .alias('Urban_Rural_Classification')
-    ])
-else:
-    # Using population
-    dhc_df_polars = dhc_df_polars.with_columns([
-        (pl.col('Urban_Population').cast(pl.Float64) / 
-         (pl.col('Urban_Population').cast(pl.Float64) + 
-          pl.col('Rural_Population').cast(pl.Float64)) * 100)
-        .alias('Urban_Percent'),
-        
-        pl.when(pl.col('Urban_Population') > pl.col('Rural_Population'))
-         .then(pl.lit('Urban'))
-         .otherwise(pl.lit('Rural'))
-         .alias('Urban_Rural_Classification')
-    ])
+# Calculate urban/rural metrics
+dhc_df = dhc_df.with_columns([
+    pl.col('Urban_Housing_Units').cast(pl.Float64),
+    pl.col('Rural_Housing_Units').cast(pl.Float64)
+]).with_columns([
+    safe_percent(
+        pl.col('Urban_Housing_Units'),
+        pl.col('Urban_Housing_Units') + pl.col('Rural_Housing_Units')
+    ).alias('Urban_Percent'),
+    
+    # Classify based on majority
+    pl.when((pl.col('Urban_Housing_Units') + pl.col('Rural_Housing_Units')) == 0)
+     .then(pl.lit('No Housing'))
+     .when(pl.col('Urban_Housing_Units') > pl.col('Rural_Housing_Units'))
+     .then(pl.lit('Urban'))
+     .otherwise(pl.lit('Rural'))
+     .alias('Urban_Rural_Classification')
+])
 
-print(f"Loaded {len(dhc_df_polars)} tracts")
-print(dhc_df_polars.head())
-
-# Now merge with your original ACS data
-df_polars = acs_df_polars.join(
-    dhc_df_polars.select(['GEOID', 'Urban_Percent', 'Urban_Rural_Classification']),
+# Merge Datasets
+census_df = acs_df.join(
+    dhc_df.select(['GEOID', 'Urban_Percent', 'Urban_Rural_Classification']),
     on='GEOID',
     how='left'
 )
+
+# Data Type Conversion and Cleaning
+# Convert string numerics to float (Census API returns strings)
+
+numeric_cols = [
+    col for col in census_df.columns 
+    if col not in ["NAME", "Urban_Rural_Classification"]
+]
+
+census_df = census_df.with_columns([
+    pl.col(col).cast(pl.Float64, strict=False) 
+    for col in numeric_cols 
+    if census_df[col].dtype == pl.Utf8
+])
+# Replace Census missing codes with nulls
+census_df = clean_census_values(census_df)
+```
+
+Possible improvements
+1. Error handling
+2. Config files for variables
+3. Data validation
+
+Tests
+```{python}
+# Test group 1: After completing acs_df_polars
+
+# Test 1: Check what columns the API actually returned
+print("=" * 50)
+print("TEST 1: Column inspection")
+print("=" * 50)
+print("Columns from API:", acs_df_polars.columns[:10])  # First 10 columns
+print("\nLooking for GEOID-related columns:")
+geoid_cols = [col for col in acs_df_polars.columns if 'GEO' in col.upper()]
+print(f"Found: {geoid_cols}")
+
+# Test 2: Examine geographic identifiers
+print("\n" + "=" * 50)
+print("TEST 2: Geographic identifier format")
+print("=" * 50)
+sample = acs_df_polars.select(['state', 'county', 'tract']).head(5)
+print(sample)
+print("\nData types:")
+for col in ['state', 'county', 'tract']:
+    if col in acs_df_polars.columns:
+        print(f"{col}: {acs_df_polars[col].dtype}")
+
+# Test 3: Check if GEOID already exists and its format
+print("\n" + "=" * 50)
+print("TEST 3: GEOID validation")
+print("=" * 50)
+if 'GEOID' in acs_df_polars.columns:
+    geoid_sample = acs_df_polars.select(['GEOID', 'NAME']).head(5)
+    print(geoid_sample)
+    print(f"\nGEOID length: {acs_df_polars['GEOID'].str.len_chars().unique()}")
+    print(f"GEOID format check (should be 11 digits): {acs_df_polars['GEOID'].str.len_chars().unique().to_list() == [11]}")
+else:
+    print("No GEOID column found - build_geoid function IS necessary")
+
+# Test 4: Verify data completeness
+print("\n" + "=" * 50)
+print("TEST 4: Data completeness")
+print("=" * 50)
+print(f"Total tracts loaded: {len(acs_df_polars)}")
+print(f"Expected ~3100-3300 tracts for Illinois")
+print(f"Data looks complete: {3100 <= len(acs_df_polars) <= 3300}")
+
+
+# Test 5: Check for nulls in critical columns
+print("\n" + "=" * 50)
+print("TEST 5: Null value check")
+print("=" * 50)
+critical_cols = ['state', 'county', 'tract', 'NAME', 'Median household income']
+for col in critical_cols:
+    if col in acs_df_polars.columns:
+        null_count = acs_df_polars[col].null_count()
+        print(f"{col}: {null_count} nulls")
+
+# Test 6: Validate renamed columns
+print("\n" + "=" * 50)
+print("TEST 6: Column renaming validation")
+print("=" * 50)
+original_codes = list(acs_vars_to_download.keys())[:5]
+print("Original codes to check:", original_codes)
+print("Still present (renaming failed):", [c for c in original_codes if c in acs_df_polars.columns])
+renamed = ['Median household income', 'Average household size', 'Owner occupied']
+print("Renamed columns present:", [c for c in renamed if c in acs_df_polars.columns])
+
+# Test 7: Data type validation
+print("\n" + "=" * 50)
+print("TEST 7: Data types for numeric columns")
+print("=" * 50)
+numeric_cols = ['Median household income', 'Average household size', 'Total housing units']
+for col in numeric_cols:
+    if col in acs_df_polars.columns:
+        dtype = acs_df_polars[col].dtype
+        sample_values = acs_df_polars[col].drop_nulls().head(3).to_list()
+        print(f"{col}: {dtype} - Sample: {sample_values}")
+
+# Test 8: Specific GEOID format test (if it exists)
+print("\n" + "=" * 50)
+print("TEST 8: GEOID structure validation")
+print("=" * 50)
+if 'GEOID' in acs_df_polars.columns:
+    test_geoid = acs_df_polars['GEOID'][0]
+    print(f"Sample GEOID: {test_geoid}")
+    print(f"Length: {len(test_geoid)}")
+    print(f"Illinois prefix (should start with '17'): {test_geoid[:2] == '17'}")
+    print(f"All digits: {test_geoid.isdigit() if isinstance(test_geoid, str) else 'Not a string'}")
+
+
+# Test group 2: After creating census_df_final
+
+# Test 1: Verify join didn't lose records
+print("=" * 50)
+print("TEST 1: Join integrity")
+print("=" * 50)
+print(f"ACS records: {len(acs_df_polars)}")
+print(f"DHC records: {len(dhc_df_polars)}")
+print(f"Final records: {len(census_df_final)}")
+print(f"Records preserved: {len(census_df_final) == len(acs_df_polars)}")
+if len(census_df_final) != len(acs_df_polars):
+    print("WARNING: Join changed row count - investigate!")
+
+# Test 2: Check GEOID matching
+print("\n" + "=" * 50)
+print("TEST 2: GEOID match validation")
+print("=" * 50)
+
+acs_geoids = set(acs_df_polars['GEOID'].unique().to_list()[:10])
+dhc_geoids = set(dhc_df_polars['GEOID'].unique().to_list()[:10])
+print(f"Sample ACS GEOIDs: {list(acs_geoids)[:3]}")
+print(f"Sample DHC GEOIDs: {list(dhc_geoids)[:3]}")
+print(f"Intersection: {len(acs_geoids.intersection(dhc_geoids))}/10 match")
+
+
+# Check for null Urban_Rural_Classification (indicates join failure)
+null_urban = census_df_final.filter(pl.col('Urban_Rural_Classification').is_null()).height
+print(f"\nTracts with no urban/rural data: {null_urban}")
+if null_urban > 100:
+    print("WARNING: High number of unmatched tracts - GEOID format issue likely")
+
+# Test 3: Data type validation
+print("\n" + "=" * 50)
+print("TEST 4: Numeric column conversion")
+print("=" * 50)
+numeric_cols_to_check = [
+    'Median household income',
+    'Average household size', 
+    'Total housing units',
+    'Urban_Percent'
+]
+
+for col in numeric_cols_to_check:
+    if col in census_df_final.columns:
+        dtype = census_df_final[col].dtype
+        is_numeric = dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
+        non_null = census_df_final[col].drop_nulls().head(3).to_list()
+        print(f"{col[:30]:30} | Type: {str(dtype):10} | Numeric: {is_numeric} | Sample: {non_null[:2]}")
+
+# Test 4: Value ranges
+print("\n" + "=" * 50)
+print("TEST 5: Data value sanity checks")
+print("=" * 50)
+
+checks = [
+    ('Urban_Percent', 0, 100, "Should be 0-100"),
+    ('Average household size', 1, 10, "Should be 1-10 people"),
+    ('Median household income', 0, 500000, "Should be $0-500k"),
+]
+
+for col, min_val, max_val, note in checks:
+    if col in census_df_final.columns:
+        actual_min = census_df_final[col].min()
+        actual_max = census_df_final[col].max()
+        in_range = (actual_min >= min_val if actual_min else True) and (actual_max <= max_val if actual_max else True)
+        print(f"{col}: [{actual_min:.1f} - {actual_max:.1f}] | Expected [{min_val}-{max_val}] | Valid: {in_range}")
+        if not in_range:
+            print(f"  WARNING: {note}")
+
+# INVESTIGATION: Census missing data codes
+
+print("=" * 50)
+print("INVESTIGATING NEGATIVE VALUES")
+print("=" * 50)
+
+# Check the raw data from API
+print("Checking Average household size column:")
+problematic = census_df_final.filter(pl.col('Average household size') < 0)
+print(f"Rows with negative values: {len(problematic)}")
+print(f"Unique negative values: {problematic['Average household size'].unique().to_list()}")
+
+# Check multiple columns for this pattern
+census_numeric_cols = [
+    'Average household size',
+    'Median household income',
+    'Average family size',
+    'Total housing units'
+]
+
+print("\nNegative value patterns across columns:")
+for col in census_numeric_cols:
+    if col in census_df_final.columns:
+        negative_vals = census_df_final.filter(pl.col(col) < 0)[col].unique().to_list()
+        if negative_vals:
+            print(f"{col}: {negative_vals}")
+
+# See actual examples
+print("\nSample tracts with negative values:")
+print(census_df_final.filter(pl.col('Average household size') < 0).select(['NAME', 'GEOID', 'Average household size', 'Median household income']).head())
+
+CENSUS_MISSING_CODES = [
+    -666666666,  # Commonly used for suppressed data
+    -999999999,  # Another suppression code
+    -888888888,  # No data
+    -555555555,  # Not applicable
+    -222222222,  # Not available
+]
+
+# Get all numeric columns
+numeric_cols = [col for col in census_df_final.columns 
+                if census_df_final[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
+
+# Replace missing codes with nulls
+census_df_final_clean = census_df_final.with_columns([
+    pl.when(pl.col(col).is_in(CENSUS_MISSING_CODES))
+      .then(None)
+      .otherwise(pl.col(col))
+      .alias(col)
+    for col in numeric_cols
+])
+
+# Verify the fix
+print("\nAfter cleaning:")
+print(f"Minimum Average household size: {census_df_final_clean['Average household size'].min()}")
+print(f"Minimum Median income: {census_df_final_clean['Median household income'].min()}")
+print(f"Nulls in Average household size: {census_df_final_clean['Average household size'].null_count()}")
+
+# Test 5: Column count verification
+print("\n" + "=" * 50)
+print("TEST 7: Column completeness")
+print("=" * 50)
+acs_cols = len(acs_df_polars.columns)
+dhc_unique_cols = len([c for c in dhc_df_polars.columns if c not in acs_df_polars.columns])
+expected_cols = acs_cols + 2  # Urban_Percent and Urban_Rural_Classification
+actual_cols = len(census_df_final_clean.columns)
+print(f"ACS columns: {acs_cols}")
+print(f"Added from DHC: {dhc_unique_cols} (should be ~2)")
+print(f"Final columns: {actual_cols}")
+print(f"Column count correct: {abs(actual_cols - expected_cols) <= 3}")
 ```
