@@ -146,3 +146,5 @@ cython_debug/
 *.tsv
 *.kml
 *.zip
+smart_meter_analysis/census_data.ipynb
+.ipynb_checkpoints/
