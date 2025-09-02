@@ -94,7 +94,7 @@ k: v for k, v in vars_to_download.items() if k in df_polars_raw.columns
 }
 df_polars = df_polars_raw.rename(rename_map)
 
-# The rural/urban label is not available in the ACS data. We'll have to get 
+# The rural/urban label is not available in the ACS data. We'll have to get
 # in a separate call to the decennial Census API
 
 # Connect to the 2020 Decennial Census
@@ -107,7 +107,7 @@ conn_2020 = cen.remote.APIConnection('DECENNIALPL2020')
 
 urban_rural_vars = {
     'P0020001': 'Total_Population',
-    'P0020002': 'Urban_Population', 
+    'P0020002': 'Urban_Population',
     'P0020005': 'Rural_Population'
 }
 
@@ -135,7 +135,7 @@ df_urban_rural_pl = df_urban_rural_pl.with_columns([
 
 # Merge with your ACS data
 df_polars = df_polars.join(
-    df_urban_rural_pl.select(['GEOID', 'Urban_Percentage', 'Rural_Percentage', 
+    df_urban_rural_pl.select(['GEOID', 'Urban_Percentage', 'Rural_Percentage',
                                'Urban_Rural_Classification']),
     on='GEOID',
     how='left'

@@ -1,5 +1,3 @@
-
-Finalized code
 ```{python}
 # Imports
 import polars as pl
@@ -11,8 +9,9 @@ CENSUS_MISSING_CODES = [-666666666, -999999999, -888888888, -555555555, -2222222
 FIPS_code = '17' #Illinois
 
 # Helper Functions
+
+# Ensure consistent GEOID
 def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
-    """Create 11-digit tract GEOID per Census standard: state(2)+county(3)+tract(6)."""
     return df.with_columns(
         pl.concat_str([
             pl.col("state").cast(pl.Utf8).str.zfill(2),
@@ -21,21 +20,21 @@ def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
         ]).alias("GEOID")
     )
 
+# Prevent division with zeroes
 def safe_percent(numer: pl.Expr, denom: pl.Expr) -> pl.Expr:
-    """Calculate percentage with null safety for Census data edge cases."""
     return (
         pl.when(denom.is_not_null() & numer.is_not_null() & (denom > 0))
         .then((numer / denom) * 100.0)
         .otherwise(None)
     )
 
+# Avoid Census codes for unavailable data
 def clean_census_values(df: pl.DataFrame) -> pl.DataFrame:
-    """Replace Census missing data codes with proper nulls for statistical validity."""
     numeric_cols = [
-        col for col in df.columns 
+        col for col in df.columns
         if df[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]
     ]
-    
+
     return df.with_columns([
         pl.when(pl.col(col).is_in(CENSUS_MISSING_CODES))
           .then(None)
@@ -161,7 +160,7 @@ dhc_df = dhc_df.with_columns([
         pl.col('Urban_Housing_Units'),
         pl.col('Urban_Housing_Units') + pl.col('Rural_Housing_Units')
     ).alias('Urban_Percent'),
-    
+
     # Classify based on majority
     pl.when((pl.col('Urban_Housing_Units') + pl.col('Rural_Housing_Units')) == 0)
      .then(pl.lit('No Housing'))
@@ -182,13 +181,13 @@ census_df = acs_df.join(
 # Convert string numerics to float (Census API returns strings)
 
 numeric_cols = [
-    col for col in census_df.columns 
+    col for col in census_df.columns
     if col not in ["NAME", "Urban_Rural_Classification"]
 ]
 
 census_df = census_df.with_columns([
-    pl.col(col).cast(pl.Float64, strict=False) 
-    for col in numeric_cols 
+    pl.col(col).cast(pl.Float64, strict=False)
+    for col in numeric_cols
     if census_df[col].dtype == pl.Utf8
 ])
 # Replace Census missing codes with nulls

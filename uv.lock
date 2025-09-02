@@ -3484,6 +3484,8 @@ dependencies = [
     { name = "boto3", version = "1.7.84", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "boto3", version = "1.40.17", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "cenpy" },
+    { name = "geopandas", version = "1.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "geopandas", version = "1.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "ipykernel" },
     { name = "jupyter" },
     { name = "polars" },
@@ -3491,6 +3493,8 @@ dependencies = [
     { name = "pygris" },
     { name = "requests" },
     { name = "rich" },
+    { name = "shapely", version = "2.0.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "shapely", version = "2.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
 
 [package.dev-dependencies]
@@ -3513,6 +3517,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.7.84" },
     { name = "cenpy", specifier = ">=1.0.1" },
+    { name = "geopandas", specifier = ">=1.0.1" },
     { name = "ipykernel", specifier = ">=6.30.1" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "polars", specifier = ">=1.32.3" },
@@ -3520,6 +3525,7 @@ requires-dist = [
     { name = "pygris", specifier = ">=0.2.0" },
     { name = "requests", specifier = ">=2.32.4" },
     { name = "rich", specifier = ">=14.1.0" },
+    { name = "shapely", specifier = ">=2.0.7" },
 ]
 
 [package.metadata.requires-dev]

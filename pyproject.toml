@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "boto3>=1.7.84",
     "cenpy>=1.0.1",
+    "geopandas>=1.0.1",
     "ipykernel>=6.30.1",
     "jupyter>=1.1.1",
     "polars>=1.32.3",
@@ -27,6 +28,7 @@ dependencies = [
     "pygris>=0.2.0",
     "requests>=2.32.4",
     "rich>=14.1.0",
+    "shapely>=2.0.7",
 ]
 
 [project.urls]
@@ -119,7 +121,7 @@ select = [
     "RUF",
     # tryceratops
     "TRY",
-    "UP",   
+    "UP",
     "B",
     "TID"
 ]
@@ -150,7 +152,7 @@ per_rule_ignores.DEP002 = [
     "pytest",
     # Documentation tools
     "mkdocs",
-    "mkdocs-material", 
+    "mkdocs-material",
     "mkdocstrings",
     # Code quality tools
     "pre-commit",
