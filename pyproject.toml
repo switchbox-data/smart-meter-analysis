@@ -165,4 +165,11 @@ per_rule_ignores.DEP002 = [
     "quarto",
     # Type stubs
     "types-requests",
+     # Data analysis packages to be used later
+    "cenpy",
+    "geopandas",
+    "jupyter",
+    "pyarrow",
+    "pygris",
+    "shapely",
 ]
