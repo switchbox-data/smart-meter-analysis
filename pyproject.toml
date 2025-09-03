@@ -173,4 +173,5 @@ per_rule_ignores.DEP002 = [
     "pyarrow",
     "pygris",
     "shapely",
+    "just",
 ]
