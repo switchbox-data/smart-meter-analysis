@@ -1,0 +1,9 @@
+```{python}
+import polars as pl
+from datetime import datetime, timedelta
+
+def transform_to_long_format(df: pl.DataFrame) -> pl.DataFrame:
+    """Convert wide interval data to long format per client specs."""
+
+
+```

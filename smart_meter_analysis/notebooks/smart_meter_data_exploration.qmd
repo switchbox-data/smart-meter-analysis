@@ -1,0 +1,191 @@
+```{python}
+import polars as pl
+
+df_raw = pl.read_csv("/Users/griffinsharps/Documents/Switchbox/smart-meter-analysis/data/ANONYMOUS_DATA_202301_60002-1102.csv")
+
+df_raw.describe()
+
+df_raw.schema
+
+df_raw.shape
+
+df_raw['ZIP_CODE'].n_unique()
+df_raw['DELIVERY_SERVICE_CLASS'].n_unique()
+df_raw['DELIVERY_SERVICE_NAME'].n_unique()
+df_raw['ACCOUNT_IDENTIFIER'].n_unique()
+```
+
+1 zip code
+1 class and name (do they ever differ?)
+24 accounts in the csv
+
+Wide to long
+```{python}
+from datetime import datetime, timedelta
+
+interval_cols = [col for col in df_raw.columns if col.startswith('INTERVAL_HR')]
+
+id_cols = [
+  'ZIP_CODE',
+  'DELIVERY_SERVICE_CLASS',
+  'DELIVERY_SERVICE_NAME',
+  'ACCOUNT_IDENTIFIER',
+  'INTERVAL_READING_DATE',
+  'INTERVAL_LENGTH',
+  'TOTAL_REGISTERED_ENERGY',
+  'PLC_VALUE',
+  'NSPL_VALUE'
+  ]
+
+def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
+
+    long_df = df.select(id_cols + interval_cols).melt(
+        id_vars=id_cols,
+        value_vars=interval_cols,
+        variable_name="interval_time",
+        value_name="kwh",
+    )
+
+    long_df = long_df.with_columns([
+        pl.col("interval_time")
+          .str.extract(r"HR(\d{4})", group_index=1)
+          .alias("time_str")
+    ])
+
+    long_df = (
+        long_df
+        .with_columns([
+            pl.col("INTERVAL_READING_DATE")
+              .str.strptime(pl.Date, format="%m/%d/%Y", strict=False)
+              .alias("service_date"),
+
+            pl.col("time_str").str.slice(0, 2).cast(pl.Int16).alias("hour_raw"),
+            pl.col("time_str").str.slice(2, 2).cast(pl.Int16).alias("minute"),
+        ])
+        .with_columns([
+            (pl.col("hour_raw") // 24).alias("days_offset"),
+            # HR2400 represents midnight of the NEXT day, so hour_raw can be 24
+            # HR2430 would be 00:30 of the next day (hour_raw = 24)
+            # The company uses this to account for DST transition days
+            (pl.col("hour_raw") % 24).alias("hour"),
+        ])
+        .with_columns([
+            (
+                pl.col("service_date").cast(pl.Datetime)
+                + pl.duration(days=pl.col("days_offset"),
+                              hours=pl.col("hour"),
+                              minutes=pl.col("minute"))
+            ).alias("datetime")
+        ])
+    )
+
+    sort_keys = []
+    if "ACCOUNT_IDENTIFIER" in long_df.columns:
+        sort_keys.append("ACCOUNT_IDENTIFIER")
+    sort_keys.append("datetime")
+    long_df = long_df.sort(sort_keys)
+
+    long_df = long_df.select([
+        pl.col("ZIP_CODE").alias("zip_code"),
+        pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class"),
+        pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name"),
+        pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier"),
+        pl.col("datetime"),
+        pl.col("kwh").cast(pl.Float64),
+    ])
+
+    return long_df
+
+    print(f"Missing values in kwh: {long_df['kwh'].null_count()}")
+
+df_long = transform_wide_to_long(df_raw)
+```
+
+Adding in time features
+```{python}
+def add_time_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Attach date/hour/weekday/is_weekend to long-format data."""
+    return df.with_columns([
+        pl.col("datetime").dt.date().alias("date"),
+        pl.col("datetime").dt.hour().alias("hour"),
+        pl.col("datetime").dt.weekday().alias("weekday"),
+        (pl.col("datetime").dt.weekday() >= 5).alias("is_weekend"),
+    ])
+
+def daily_features(df_with_time: pl.DataFrame) -> pl.DataFrame:
+    """Daily load-shape metrics per account."""
+    return (
+        df_with_time
+        .group_by(["account_identifier", "date"])
+        .agg([
+            pl.col("kwh").sum().alias("daily_total"),
+            pl.col("kwh").mean().alias("daily_mean"),
+            pl.col("kwh").std().alias("daily_std"),
+            pl.col("kwh").max().alias("peak_kwh"),
+            pl.col("kwh").min().alias("base_load"),
+            pl.col("kwh").filter((pl.col("hour") >= 6) & (pl.col("hour") < 9)).sum().alias("morning_usage"),
+            pl.col("kwh").filter((pl.col("hour") >= 17) & (pl.col("hour") < 21)).sum().alias("evening_usage"),
+            pl.col("kwh").filter((pl.col("hour") >= 22) | (pl.col("hour") < 6)).sum().alias("overnight_usage"),
+            pl.col("hour").take(pl.col("kwh").arg_max()).alias("peak_hour"),
+            pl.col("kwh").filter((pl.col("hour") >= 13) & (pl.col("hour") < 19)).sum().alias("comed_peak_summer_usage")
+        ])
+    )
+
+def summarize_by_month(daily: pl.DataFrame) -> pl.DataFrame:
+    """Monthly summary per account (calendar months)."""
+    return (
+        daily
+        .with_columns(pl.col("date").dt.truncate("1mo").alias("month"))
+        .group_by(["account_identifier", "month"])
+        .agg([
+            pl.col("daily_total").mean().alias("avg_daily_consumption"),
+            pl.col("daily_total").std().alias("consumption_variability"),
+            pl.col("peak_kwh").mean().alias("avg_peak"),
+            pl.col("base_load").mean().alias("avg_base_load"),
+            # safe mean of daily_mean/peak_kwh (skip zeros)
+            (
+                (pl.col("daily_mean") /
+                 pl.when(pl.col("peak_kwh") == 0).then(None).otherwise(pl.col("peak_kwh")))
+            ).mean().alias("load_factor"),
+            pl.col("peak_hour").mode().first().alias("typical_peak_hour"),
+            (
+                pl.col("evening_usage") /
+                pl.when(pl.col("morning_usage") == 0).then(None).otherwise(pl.col("morning_usage"))
+            ).mean().alias("evening_morning_ratio"),
+        ])
+    )
+```
+
+Checking Daylight Savings Time Dates
+```{python}
+def daily_interval_qc(df_long: pl.DataFrame) -> pl.DataFrame:
+    """Check per-day interval counts and flag DST/odd days."""
+    df = df_long.with_columns(pl.col("datetime").dt.date().alias("date"))
+    return (
+        df.group_by(["account_identifier", "date"])
+          .agg([
+              pl.len().alias("n_intervals"),
+              pl.col("kwh").null_count().alias("null_intervals"),
+              pl.col("kwh").sum().alias("sum_kwh"),
+          ])
+          .with_columns([
+              pl.when(pl.col("n_intervals") == 46).then(pl.lit("spring_forward"))
+               .when(pl.col("n_intervals") == 50).then(pl.lit("fall_back"))
+               .when(pl.col("n_intervals") == 48).then(pl.lit("normal"))
+               .otherwise(pl.lit("odd"))
+               .alias("day_type"),
+              pl.col("n_intervals").is_in([46, 50]).alias("is_dst_transition"),
+              (~pl.col("n_intervals").is_in([46, 48, 50])).alias("is_odd_count"),
+          ])
+    )
+
+def dst_transition_dates(df_long: pl.DataFrame) -> pl.DataFrame:
+    """Return unique dates that are DST transition days present in the data."""
+    qc = daily_interval_qc(df_long)
+    return (
+        qc.filter(pl.col("is_dst_transition"))
+          .select(["date", "day_type"])
+          .unique()
+          .sort("date")
+    )
+```
