@@ -1,4 +1,4 @@
-# scripts/extract_cookies.py - Method A
+# scripts/extract_cookies.py
 import pathlib
 
 
