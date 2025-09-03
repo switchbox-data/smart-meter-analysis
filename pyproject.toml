@@ -23,6 +23,7 @@ dependencies = [
     "geopandas>=1.0.1",
     "ipykernel>=6.30.1",
     "jupyter>=1.1.1",
+    "just>=0.8.165",
     "polars>=1.32.3",
     "pyarrow>=21.0.0",
     "pygris>=0.2.0",

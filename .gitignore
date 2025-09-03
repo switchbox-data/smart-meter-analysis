@@ -149,3 +149,4 @@ cython_debug/
 smart_meter_analysis/census_data.ipynb
 .ipynb_checkpoints/
 *.vdoc.*
+cookies.txt
