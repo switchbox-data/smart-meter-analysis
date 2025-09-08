@@ -1,8 +1,10 @@
 
+Cleaning ComEd's Usage Data
 ```{python}
 from __future__ import annotations
 from datetime import datetime
 import polars as pl
+import warnings
 
 ID_COLS = [
     "ZIP_CODE",
@@ -187,7 +189,7 @@ def calculate_daily_stats(df: pl.DataFrame) -> pl.DataFrame:
     )
 ```
 
-
+Sanity check
 ```{python}
 test_df = pl.read_csv("/Users/griffinsharps/Documents/Switchbox/smart-meter-analysis/data/ANONYMOUS_DATA_202301_60002-1102.csv")
 
@@ -195,4 +197,131 @@ long_df = transform_wide_to_long(test_df)
 enhanced_df = add_time_features(long_df)
 daily_stats_df = calculate_daily_stats(enhanced_df)
 dst_df = check_dst_intervals(enhanced_df)
+```
+
+ComEd flat-rate (needs historical data here)
+```{python}
+ELECTRICITY_RATES = {
+    2023: {
+        "winter": {"supply": , "delivery": },
+        "summer": {"supply": , "delivery": }
+    },
+    2024: {
+        "winter": {"supply": , "delivery": },
+        "summer": {"supply": , "delivery": }
+    },
+    2025: {
+
+        "winter": {"supply": , "delivery": },
+        "summer": {"supply": , "delivery": }
+    }
+}
+
+def get_flat_rate(date: datetime) -> dict[str, float]:
+    year = date.year
+    season = "summer" if 6 <= date.month <= 9 else "winter"
+
+    try:
+        rates_for_year = ELECTRICITY_RATES[year]
+    except KeyError as e:
+        raise KeyError(f"No electricity rates defined for year {year}.") from e
+
+    try:
+        return rates_for_year[season]
+    except KeyError as e:
+        raise KeyError(f"No '{season}' rates defined for year {year}.") from e
+```
+
+
+API Call
+```{python}
+def fetch_comed_prices(
+    start_date: str,
+    end_date: str,
+    price_type: str = "5minutefeed",
+    aggregate_hourly: bool = True,
+    timeout: int = 30,
+) -> pl.DataFrame:
+
+    try:
+        sd = datetime.strptime(start_date, "%Y-%m-%d")
+        ed = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError as e:
+        raise ValueError("Dates must be in 'YYYY-MM-DD' format") from e
+
+    if ed < sd:
+        raise ValueError("end_date must be on or after start_date")
+
+    datestart = sd.strftime("%Y%m%d") + "0000"
+    dateend = ed.strftime("%Y%m%d") + "2359"
+
+# Call ComEd API
+    url = "https://hourlypricing.comed.com/api"
+    params = {
+        "type": price_type,
+        "datestart": datestart,
+        "dateend": dateend,
+        "format": "json"
+    }
+
+    try:
+        print(f"Fetching prices from {start_date} to {end_date}...")
+        resp = requests.get(url, params=params, timeout=timeout)
+        if not resp.ok:
+            print(f"API error: {resp.status_code}")
+            return pl.DataFrame()
+        data = resp.json()
+    except Exception as e:
+        print(f"Error fetching prices: {e}")
+        return pl.DataFrame()
+
+    if not data:
+        print("No price data returned")
+        return pl.DataFrame()
+
+    print(f"Retrieved {len(data)} price points")
+
+    # Convert to DataFrame
+    prices_df = (
+        pl.DataFrame(data)
+        .with_columns([
+            pl.col("millisUTC").cast(pl.Int64).alias("millis"),
+            pl.col("price").cast(pl.Float64).alias("price_cents")
+        ])
+        .with_columns([
+            pl.from_epoch("millis", time_unit="ms")
+              .dt.replace_time_zone("UTC")
+              .dt.convert_time_zone("America/Chicago")
+              .dt.replace_time_zone(None)
+              .alias("datetime"),
+            (pl.col("price_cents") / 100).alias("price_per_kwh")
+        ])
+        .select(["datetime", "price_cents", "price_per_kwh"])
+        .sort("datetime")
+    )
+
+    if aggregate_hourly and not prices_df.is_empty():
+        prices_df = (
+            prices_df
+            .group_by_dynamic("datetime", every="1h")
+            .agg([
+                pl.col("price_cents").mean(),
+                pl.col("price_per_kwh").mean()
+            ])
+            .sort("datetime")
+        )
+        print(f"Aggregated to {prices_df.height} hourly prices")
+
+    return prices_df
+```
+
+Pricing Comparison
+```{python}
+def calculate_savings(
+    usage_df: pl.DataFrame,
+    prices_df: pl.DataFrame,
+    warn_on_missing: bool = True,
+) -> pl.DataFrame:
+
+def summarize_savings(df_with_costs: pl.DataFrame) -> pl.DataFrame:
 ```
