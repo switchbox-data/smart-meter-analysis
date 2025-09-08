@@ -1,0 +1,217 @@
+
+```{python}
+from __future__ import annotations
+from datetime import datetime
+import polars as pl
+
+# Simplified constants - only the essential ID columns
+ID_COLS = [
+    "ZIP_CODE",
+    "DELIVERY_SERVICE_CLASS",
+    "DELIVERY_SERVICE_NAME",
+    "ACCOUNT_IDENTIFIER",
+    "INTERVAL_READING_DATE",  # Include this as it's always needed
+]
+
+def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Convert ComEd smart-meter CSV from wide to long format.
+
+    Handles half-hourly intervals:
+    - Regular intervals (HR0030 through HR2330)
+    - DST fall-back intervals (HR2430 = 24:30, HR2500 = 25:00 = 1:00 AM next day)
+
+    Normal days: 48 intervals (HR0030-HR2330)
+    Spring forward: 46 intervals (missing 2 intervals at 2 AM)
+    Fall back: 50 intervals (includes HR2430 and HR2500)
+    """
+
+    # Check for required columns
+    missing = set(ID_COLS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # Find all interval columns
+    interval_cols = [col for col in df.columns if col.startswith("INTERVAL_HR")]
+    if not interval_cols:
+        raise ValueError("No interval columns found")
+
+    # Unpivot from wide to long
+    long_df = df.select(ID_COLS + interval_cols).unpivot(
+        index=ID_COLS,
+        on=interval_cols,
+        variable_name="interval_time",
+        value_name="kwh"
+    )
+
+    # Extract time and create datetime
+    long_df = long_df.with_columns([
+        # Extract HHMM from both formats:
+        # "INTERVAL_HR0030_ENERGY_QTY" → "0030"
+        # "INTERVAL_HR0030" → "0030"
+        pl.col("interval_time").str.extract(r"HR(\d{4})").alias("time_str"),
+        # Parse the date
+        pl.col("INTERVAL_READING_DATE").str.strptime(pl.Date, format="%m/%d/%Y").alias("service_date"),
+    ])
+
+    # Parse hours and minutes - handle regular times AND DST times (2430, 2500)
+    long_df = long_df.with_columns([
+        pl.col("time_str").str.slice(0, 2).cast(pl.Int16).alias("hour_raw"),
+        pl.col("time_str").str.slice(2, 2).cast(pl.Int16).alias("minute"),
+    ])
+
+    # Handle day rollover for DST times (HR2430 = hour 24, HR2500 = hour 25)
+    long_df = long_df.with_columns([
+        (pl.col("hour_raw") // 24).alias("days_offset"),  # 1 if hour >= 24
+        (pl.col("hour_raw") % 24).alias("hour"),          # 24→0, 25→1
+    ])
+
+    # Create datetime - IMPORTANT: Cast date to datetime first!
+    long_df = long_df.with_columns([
+        (pl.col("service_date").cast(pl.Datetime) +  # Cast to Datetime here
+         pl.duration(
+             days=pl.col("days_offset"),
+             hours=pl.col("hour"),
+             minutes=pl.col("minute")
+         )).alias("datetime")
+    ])
+
+    # Clean kwh values
+    long_df = long_df.with_columns([
+        pl.col("kwh")
+        .cast(pl.Utf8, strict=False)
+        .str.strip_chars()
+        .replace({"": None, "NULL": None, "null": None})
+        .cast(pl.Float64, strict=False)
+        .alias("kwh")
+    ])
+
+    # IMPORTANT: Remove rows where kwh is null (handles empty DST columns)
+    long_df = long_df.filter(pl.col("kwh").is_not_null())
+
+    # Sort and select final columns
+    sort_keys = ["datetime"]
+    if "ACCOUNT_IDENTIFIER" in df.columns:
+        sort_keys.insert(0, "ACCOUNT_IDENTIFIER")
+
+    return (
+        long_df
+        .sort(sort_keys)
+        .select([
+            pl.col("ZIP_CODE").alias("zip_code"),
+            pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class"),
+            pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name"),
+            pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier"),
+            "datetime",
+            "kwh",
+        ])
+    )
+
+
+def add_time_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add time-based features for analysis.
+
+    No separate date column - use datetime.dt.date() when needed.
+    """
+    return df.with_columns([
+        pl.col("datetime").dt.hour().alias("hour"),
+        pl.col("datetime").dt.weekday().alias("weekday"),
+        (pl.col("datetime").dt.weekday() >= 6).alias("is_weekend"),
+        pl.col("datetime").dt.month().alias("month"),
+
+        # Time of day categories
+        pl.when(pl.col("datetime").dt.hour().is_between(6, 11))
+        .then(pl.lit("Morning"))
+        .when(pl.col("datetime").dt.hour().is_between(12, 17))
+        .then(pl.lit("Afternoon"))
+        .when(pl.col("datetime").dt.hour().is_between(18, 21))
+        .then(pl.lit("Evening"))
+        .otherwise(pl.lit("Night"))
+        .alias("time_of_day"),
+
+        # Season
+        pl.when(pl.col("datetime").dt.month().is_in([12, 1, 2]))
+        .then(pl.lit("Winter"))
+        .when(pl.col("datetime").dt.month().is_in([3, 4, 5]))
+        .then(pl.lit("Spring"))
+        .when(pl.col("datetime").dt.month().is_in([6, 7, 8]))
+        .then(pl.lit("Summer"))
+        .otherwise(pl.lit("Fall"))
+        .alias("season"),
+    ])
+
+
+def calculate_daily_stats(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calculate daily usage statistics.
+
+    Groups by account and date (extracted from datetime).
+    """
+    return (
+        df
+        .group_by([
+            "account_identifier",
+            pl.col("datetime").dt.date().alias("date")  # Extract date here
+        ])
+        .agg([
+            pl.col("kwh").sum().alias("daily_total"),
+            pl.col("kwh").mean().alias("daily_average"),
+            pl.col("kwh").max().alias("peak_usage"),
+            pl.col("kwh").min().alias("base_load"),
+            pl.len().alias("n_intervals"),  # Should be 48 normally
+        ])
+        .with_columns([
+            # Flag DST days
+            pl.when(pl.col("n_intervals") == 46).then(pl.lit("spring_forward"))
+            .when(pl.col("n_intervals") == 50).then(pl.lit("fall_back"))
+            .when(pl.col("n_intervals") == 48).then(pl.lit("normal"))
+            .otherwise(pl.lit("data_issue"))
+            .alias("day_type")
+        ])
+        .sort(["account_identifier", "date"])
+    )
+
+
+def check_dst_intervals(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Check which days have DST intervals (HR2430, HR2500) populated.
+
+    This helps identify the actual DST transition days in your data.
+    """
+    # Check for DST columns
+    dst_cols = []
+    if "INTERVAL_HR2430" in df.columns:
+        dst_cols.append("INTERVAL_HR2430")
+    if "INTERVAL_HR2500" in df.columns:
+        dst_cols.append("INTERVAL_HR2500")
+
+    if not dst_cols:
+        print("No DST columns (HR2430, HR2500) found")
+        return pl.DataFrame()
+
+    # For each date, check if DST columns have non-null values
+    result = df.group_by("INTERVAL_READING_DATE").agg([
+        *[pl.col(col).is_not_null().sum().alias(f"{col}_count") for col in dst_cols],
+        pl.len().alias("total_rows")
+    ])
+
+    return result.sort("INTERVAL_READING_DATE")
+```
+
+
+```{python}
+test_df = pl.read_csv("/Users/griffinsharps/Documents/Switchbox/smart-meter-analysis/data/ANONYMOUS_DATA_202301_60002-1102.csv")
+
+long_df = transform_wide_to_long(test_df)
+enhanced_df = add_time_features(long_df)
+daily_stats_df = calculate_daily_stats(enhanced_df)
+dst_df = check_dst_intervals(enhanced_df)
+```
+
+Issues:
+1. Weekday doesn't line up (Sunday not 1st of the month)
+2. Need 0030 and 1000 to be hour 1
+3. Code currently converts 2400 into next day
+4. 'data_issue's with daily stats
+5.
