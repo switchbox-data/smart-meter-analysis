@@ -4,13 +4,12 @@ from __future__ import annotations
 from datetime import datetime
 import polars as pl
 
-# Simplified constants - only the essential ID columns
 ID_COLS = [
     "ZIP_CODE",
     "DELIVERY_SERVICE_CLASS",
     "DELIVERY_SERVICE_NAME",
     "ACCOUNT_IDENTIFIER",
-    "INTERVAL_READING_DATE",  # Include this as it's always needed
+    "INTERVAL_READING_DATE",
 ]
 
 def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
@@ -46,9 +45,7 @@ def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
 
     # Extract time and create datetime
     long_df = long_df.with_columns([
-        # Extract HHMM from both formats:
-        # "INTERVAL_HR0030_ENERGY_QTY" → "0030"
-        # "INTERVAL_HR0030" → "0030"
+
         pl.col("interval_time").str.extract(r"HR(\d{4})").alias("time_str"),
         # Parse the date
         pl.col("INTERVAL_READING_DATE").str.strptime(pl.Date, format="%m/%d/%Y").alias("service_date"),
@@ -62,13 +59,14 @@ def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
 
     # Handle day rollover for DST times (HR2430 = hour 24, HR2500 = hour 25)
     long_df = long_df.with_columns([
-        (pl.col("hour_raw") // 24).alias("days_offset"),  # 1 if hour >= 24
-        (pl.col("hour_raw") % 24).alias("hour"),          # 24→0, 25→1
+        (pl.col("hour_raw") // 24).alias("days_offset"),
+        (pl.col("hour_raw") % 24).alias("hour"),
     ])
 
-    # Create datetime - IMPORTANT: Cast date to datetime first!
+    # Create datetime
+
     long_df = long_df.with_columns([
-        (pl.col("service_date").cast(pl.Datetime) +  # Cast to Datetime here
+        (pl.col("service_date").cast(pl.Datetime) +
          pl.duration(
              days=pl.col("days_offset"),
              hours=pl.col("hour"),
@@ -86,7 +84,7 @@ def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
         .alias("kwh")
     ])
 
-    # IMPORTANT: Remove rows where kwh is null (handles empty DST columns)
+    # Remove rows where kwh is null
     long_df = long_df.filter(pl.col("kwh").is_not_null())
 
     # Sort and select final columns
@@ -214,4 +212,3 @@ Issues:
 2. Need 0030 and 1000 to be hour 1
 3. Code currently converts 2400 into next day
 4. 'data_issue's with daily stats
-5.
