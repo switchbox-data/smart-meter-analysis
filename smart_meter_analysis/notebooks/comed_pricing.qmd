@@ -1,327 +1,210 @@
 
-Cleaning ComEd's Usage Data
+# Imports etc...
 ```{python}
-from __future__ import annotations
-from datetime import datetime
+import os
+import requests
 import polars as pl
-import warnings
+from typing import Sequence, Optional
 
-ID_COLS = [
-    "ZIP_CODE",
-    "DELIVERY_SERVICE_CLASS",
-    "DELIVERY_SERVICE_NAME",
-    "ACCOUNT_IDENTIFIER",
-    "INTERVAL_READING_DATE",
-]
-
-def transform_wide_to_long(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Convert ComEd smart-meter CSV from wide to long format.
-
-    Each interval represents energy used DURING that 30-min period.
-    The column name (e.g., HR0030) is the END time of the period.
-    """
-
-    # Check for required columns
-    missing = set(ID_COLS) - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Find all interval columns
-    interval_cols = [col for col in df.columns if col.startswith("INTERVAL_HR")]
-    if not interval_cols:
-        raise ValueError("No interval columns found")
-
-    # Unpivot from wide to long
-    long_df = df.select(ID_COLS + interval_cols).unpivot(
-        index=ID_COLS,
-        on=interval_cols,
-        variable_name="interval_time",
-        value_name="kwh"
-    )
-
-    # Extract time and create datetime
-    long_df = long_df.with_columns([
-        pl.col("interval_time").str.extract(r"HR(\d{4})").alias("time_str"),
-        pl.col("INTERVAL_READING_DATE").str.strptime(pl.Date, format="%m/%d/%Y").alias("service_date"),
-    ])
-
-    # Parse hours and minutes
-    long_df = long_df.with_columns([
-        pl.col("time_str").str.slice(0, 2).cast(pl.Int16).alias("hour_raw"),
-        pl.col("time_str").str.slice(2, 2).cast(pl.Int16).alias("minute"),
-    ])
-
-    # Handle day rollover for DST times (HR2400, HR2430, HR2500)
-    long_df = long_df.with_columns([
-        (pl.col("hour_raw") // 24).alias("days_offset"),
-        (pl.col("hour_raw") % 24).alias("hour"),
-    ])
-
-    # Create interval_end datetime
-    long_df = long_df.with_columns([
-        (
-            pl.col("service_date").cast(pl.Datetime) +
-            pl.duration(
-                days=pl.col("days_offset"),
-                hours=pl.col("hour"),
-                minutes=pl.col("minute")
-            )
-        ).alias("interval_end")
-    ])
-
-    # Create interval_start (30 minutes before end)
-    long_df = long_df.with_columns([
-        (pl.col("interval_end") - pl.duration(minutes=30)).alias("interval_start")
-    ])
-
-    # Clean kwh values
-    long_df = long_df.with_columns([
-        pl.col("kwh")
-        .cast(pl.Utf8, strict=False)
-        .str.strip_chars()
-        .replace({"": None, "NULL": None, "null": None})
-        .cast(pl.Float64, strict=False)
-        .alias("kwh")
-    ])
-
-    # Remove rows where kwh is null (handles empty DST columns)
-    long_df = long_df.filter(pl.col("kwh").is_not_null())
-
-    # Sort and select final columns
-    # Use interval_start as the primary datetime
-    sort_keys = ["interval_start"]
-    if "ACCOUNT_IDENTIFIER" in df.columns:
-        sort_keys.insert(0, "ACCOUNT_IDENTIFIER")
-
-    return (
-        long_df
-        .sort(sort_keys)
-        .select([
-            pl.col("ZIP_CODE").alias("zip_code"),
-            pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class"),
-            pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name"),
-            pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier"),
-            pl.col("interval_start").alias("datetime"),  # Primary datetime column
-            pl.col("interval_start"),  # Keep original too
-            pl.col("interval_end"),     # Keep end time
-            pl.col("kwh"),
-        ])
-    )
-
-
-def add_time_features(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Add time-based features for analysis.
-
-    Uses the interval START time for hour categorization.
-    Hour 1 = 00:00-00:30, Hour 2 = 00:30-01:00, etc.
-    """
-
-    return df.with_columns([
-        # Hour of day based on interval START (1-24 instead of 0-23)
-        (pl.col("datetime").dt.hour() +
-         (pl.col("datetime").dt.minute() // 30) + 1).alias("hour_period"),
-
-        # Standard hour (0-23) for other uses
-        pl.col("datetime").dt.hour().alias("hour"),
-
-        # Weekday (1=Monday, 7=Sunday)
-        pl.col("datetime").dt.weekday().alias("weekday"),
-
-        # Is weekend (Saturday=6, Sunday=7)
-        (pl.col("datetime").dt.weekday() >= 6).alias("is_weekend"),
-
-        # Month
-        pl.col("datetime").dt.month().alias("month"),
-
-        # Time of day categories (based on interval start)
-        pl.when(pl.col("datetime").dt.hour().is_between(6, 11))
-        .then(pl.lit("Morning"))
-        .when(pl.col("datetime").dt.hour().is_between(12, 17))
-        .then(pl.lit("Afternoon"))
-        .when(pl.col("datetime").dt.hour().is_between(18, 21))
-        .then(pl.lit("Evening"))
-        .otherwise(pl.lit("Night"))
-        .alias("time_of_day"),
-
-        # Season
-        pl.when(pl.col("datetime").dt.month().is_in([12, 1, 2]))
-        .then(pl.lit("Winter"))
-        .when(pl.col("datetime").dt.month().is_in([3, 4, 5]))
-        .then(pl.lit("Spring"))
-        .when(pl.col("datetime").dt.month().is_in([6, 7, 8]))
-        .then(pl.lit("Summer"))
-        .otherwise(pl.lit("Fall"))
-        .alias("season"),
-    ])
-
-
-def calculate_daily_stats(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Calculate daily usage statistics.
-
-    Groups by account and date (extracted from datetime).
-    """
-    return (
-        df
-        .group_by([
-            "account_identifier",
-            pl.col("datetime").dt.date().alias("date")
-        ])
-        .agg([
-            pl.col("kwh").sum().alias("daily_total"),
-            pl.col("kwh").mean().alias("daily_average"),
-            pl.col("kwh").max().alias("peak_usage"),
-            pl.col("kwh").min().alias("base_load"),
-            pl.len().alias("n_intervals"),
-        ])
-        .with_columns([
-            # Flag DST days and data issues
-            pl.when(pl.col("n_intervals") == 46).then(pl.lit("spring_forward"))
-            .when(pl.col("n_intervals") == 50).then(pl.lit("fall_back"))
-            .when(pl.col("n_intervals") == 48).then(pl.lit("normal"))
-            .when(pl.col("n_intervals") == 47).then(pl.lit("missing_1_interval"))
-            .otherwise(pl.lit("data_issue"))
-            .alias("day_type")
-        ])
-        .sort(["account_identifier", "date"])
-    )
+USE_MULTI   = False                  #
+STATE       = "IL"
+YEAR        = 2024
+QUARTERS    = [1]
+INPUT_FILE  = None
+ZIP_COLUMN  = "zip_code"
+OUTPUT_FILE = "zip_and_tracts.csv"
+HUD_API_KEY = ""
 ```
 
-Sanity check
+# Flatten Crosswalk from HUD
 ```{python}
-test_df = pl.read_csv("/Users/griffinsharps/Documents/Switchbox/smart-meter-analysis/data/ANONYMOUS_DATA_202301_60002-1102.csv")
+def flatten_crosswalk(hud_json: dict) -> list[dict]:
+    if not isinstance(hud_json, dict):
+        return []
+    data = hud_json.get("data")
+    if data is None:
+        return []
 
-long_df = transform_wide_to_long(test_df)
-enhanced_df = add_time_features(long_df)
-daily_stats_df = calculate_daily_stats(enhanced_df)
-dst_df = check_dst_intervals(enhanced_df)
+    items = data if isinstance(data, list) else [data]
+
+    rows: list[dict] = []
+    for item in items:
+        zip5 = item.get("input") or item.get("zip")
+        results = item.get("results") or []
+
+        for r in results:
+            rows.append({
+                "zip5": str(zip5).zfill(5) if zip5 else None,
+                "tract": r.get("geoid"),
+                "res_ratio": r.get("res_ratio"),
+                "bus_ratio": r.get("bus_ratio"),
+                "oth_ratio": r.get("oth_ratio"),
+                "tot_ratio": r.get("tot_ratio"),
+            })
+    return rows
 ```
 
-ComEd flat-rate (needs historical data here)
+# Get Crosswalk from HUD API (Basic, 1 Quarter)
 ```{python}
-ELECTRICITY_RATES = {
-    2023: {
-        "winter": {"supply": , "delivery": },
-        "summer": {"supply": , "delivery": }
-    },
-    2024: {
-        "winter": {"supply": , "delivery": },
-        "summer": {"supply": , "delivery": }
-    },
-    2025: {
+def fetch_crosswalk_one_quarter(
+    api_key: str,
+    state: str,
+    year: int,
+    quarter: int
+    ) -> pl.DataFrame:
 
-        "winter": {"supply": , "delivery": },
-        "summer": {"supply": , "delivery": }
-    }
-}
-
-def get_flat_rate(date: datetime) -> dict[str, float]:
-    year = date.year
-    season = "summer" if 6 <= date.month <= 9 else "winter"
-
-    try:
-        rates_for_year = ELECTRICITY_RATES[year]
-    except KeyError as e:
-        raise KeyError(f"No electricity rates defined for year {year}.") from e
-
-    try:
-        return rates_for_year[season]
-    except KeyError as e:
-        raise KeyError(f"No '{season}' rates defined for year {year}.") from e
-```
-
-
-API Call
-```{python}
-def fetch_comed_prices(
-    start_date: str,
-    end_date: str,
-    price_type: str = "5minutefeed",
-    aggregate_hourly: bool = True,
-    timeout: int = 30,
-) -> pl.DataFrame:
-
-    try:
-        sd = datetime.strptime(start_date, "%Y-%m-%d")
-        ed = datetime.strptime(end_date, "%Y-%m-%d")
-    except ValueError as e:
-        raise ValueError("Dates must be in 'YYYY-MM-DD' format") from e
-
-    if ed < sd:
-        raise ValueError("end_date must be on or after start_date")
-
-    datestart = sd.strftime("%Y%m%d") + "0000"
-    dateend = ed.strftime("%Y%m%d") + "2359"
-
-# Call ComEd API
-    url = "https://hourlypricing.comed.com/api"
+    url = "https://www.huduser.gov/hudapi/public/usps"
+    headers = {"Authorization": f"Bearer {api_key}"}
     params = {
-        "type": price_type,
-        "datestart": datestart,
-        "dateend": dateend,
-        "format": "json"
+        "type": 1,        # 1 = ZIP to tract crosswalk
+        "query": state.upper(),
+        "year": year,
+        "quarter": quarter
     }
 
-    try:
-        print(f"Fetching prices from {start_date} to {end_date}...")
-        resp = requests.get(url, params=params, timeout=timeout)
-        if not resp.ok:
-            print(f"API error: {resp.status_code}")
-            return pl.DataFrame()
-        data = resp.json()
-    except Exception as e:
-        print(f"Error fetching prices: {e}")
-        return pl.DataFrame()
+    r = requests.get(url, headers=headers, params=params, timeout=60)
 
-    if not data:
-        print("No price data returned")
-        return pl.DataFrame()
+    if r.status_code != 200:
+        raise RuntimeError(f"HUD API returned {r.status_code}: {r.text[:300]}")
 
-    print(f"Retrieved {len(data)} price points")
+    hud_json = r.json()
+    rows = _flatten_crosswalk_json(hud_json)
 
-    # Convert to DataFrame
-    prices_df = (
-        pl.DataFrame(data)
-        .with_columns([
-            pl.col("millisUTC").cast(pl.Int64).alias("millis"),
-            pl.col("price").cast(pl.Float64).alias("price_cents")
-        ])
-        .with_columns([
-            pl.from_epoch("millis", time_unit="ms")
-              .dt.replace_time_zone("UTC")
-              .dt.convert_time_zone("America/Chicago")
-              .dt.replace_time_zone(None)
-              .alias("datetime"),
-            (pl.col("price_cents") / 100).alias("price_per_kwh")
-        ])
-        .select(["datetime", "price_cents", "price_per_kwh"])
-        .sort("datetime")
-    )
+    if rows:
+        df = pl.DataFrame(rows)
+    else:
+        df = pl.DataFrame(schema={
+            "zip5": pl.Utf8,
+            "tract": pl.Utf8,
+            "res_ratio": pl.Float64,
+            "bus_ratio": pl.Float64,
+            "oth_ratio": pl.Float64,
+            "tot_ratio": pl.Float64
+        })
 
-    if aggregate_hourly and not prices_df.is_empty():
-        prices_df = (
-            prices_df
-            .group_by_dynamic("datetime", every="1h")
-            .agg([
-                pl.col("price_cents").mean(),
-                pl.col("price_per_kwh").mean()
-            ])
-            .sort("datetime")
-        )
-        print(f"Aggregated to {prices_df.height} hourly prices")
+    df = df.with_columns([
+        pl.col("zip5").cast(pl.Utf8).str.zfill(5),
+        pl.col("tract").cast(pl.Utf8),
+    ])
 
-    return prices_df
+    return df
 ```
 
-Pricing Comparison
+# Multiple Quarters
 ```{python}
-def calculate_savings(
-    usage_df: pl.DataFrame,
-    prices_df: pl.DataFrame,
-    warn_on_missing: bool = True,
+def fetch_crosswalk_multi_quarters(
+    api_key: str,
+     state: str,
+     year: int,
+     quarters: list[int]
+     ) -> pl.DataFrame:
+
+    dfs = []
+    for q in quarters:
+        df_q = fetch_crosswalk_one_quarter(api_key, state, year, q)
+        if df_q.height > 0:
+            dfs.append(df_q)
+        else:
+            print(f"  — No rows returned for Q{q}")
+
+    if not dfs:
+        raise RuntimeError(f"No data returned for {state} {year} in any of {quarters}.")
+
+    df_multi = pl.concat(dfs)
+      .sort(
+        ["zip5", "tract", "year", "quarter"],
+        descending=[False, False, True, True]
+        )
+      .unique(
+        subset=["zip5",
+        "tract"],
+        keep="first"
+        )
+
+    return df_multi
+```
+
+
+```{python}
+def add_tracts_to_data(
+    data: pl.DataFrame,
+    crosswalk_df: pl.DataFrame,
+    zip_column: str = "zip_code",
+    metric_cols: Optional[Sequence[str]] = None,   # e.g., ["households", "kwh_total"]
+    aggregate_to_tract: bool = False               # True → return tract-level sums
 ) -> pl.DataFrame:
 
-def summarize_savings(df_with_costs: pl.DataFrame) -> pl.DataFrame:
+if zip_column not in data.columns:
+        raise ValueError(
+            f"'{zip_column}' not found in input data columns: {data.columns}"
+            )
+
+    if (
+        "res_ratio" not in crosswalk_df.columns
+        )
+        and (
+            "tot_ratio" not in crosswalk_df.columns):
+        raise ValueError(
+            "crosswalk_df must contain at least one of: 'res_ratio' or 'tot_ratio'"
+        )
+
+    metric_cols = list(metric_cols) if metric_cols is not None else []
+    for c in metric_cols:
+        if c not in data.columns:
+            raise ValueError(
+                f"metric column '{c}' not found in data columns: {data.columns}"
+                )
+
+    data_zip = data.with_columns(
+    pl.col(zip_column)
+        .cast(pl.Utf8)
+        .str.extract(r"\d{5}")
+        .str.zfill(5)
+        .alias("zip5")
+        )
+
+    cw = crosswalk_df.with_columns(
+    pl.col("zip5").cast(pl.Utf8).str.zfill(5)
+        )
+
+    if {"year", "quarter"}.issubset(set(cw.columns)):
+        cw = (
+            cw.sort(["zip5", "tract", "year", "quarter"], descending=[False, False, True, True])
+              .unique(subset=["zip5", "tract"], keep="first")
+        )
+    else:
+        cw = cw.unique(subset=["zip5", "tract"], keep="first")
+
+    cw = cw.with_columns(
+        pl.coalesce([pl.col(
+            "res_ratio"),
+            pl.col(
+                "tot_ratio"
+                )]).alias("w_raw")
+                )
+                .with_columns(
+                    pl.col("w_raw").fill_null(0.0)
+                    )
+
+    cw = cw.join(
+        cw.group_by("zip5").agg(pl.col("w_raw").sum().alias("w_sum")),
+        on="zip5",
+        how="left"
+    ).with_columns(
+        pl.when(pl.col("w_sum") > 0)
+          .then(pl.col("w_raw") / pl.col("w_sum"))
+          .otherwise(None)
+          .alias("w_norm")
+    ).select(["zip5", "tract", "w_norm"])
+
+        joined = data_zip.join(cw, on="zip5", how="left")
+
+    return joined
+```
+
+
+
+col(zip_column).cast(pl.Utf8).str.extract(r"(\d{5})").str.zfill(5).alias("zip5")
+    )
+    return data.join(crosswalk_df, on="zip5", how="left")
 ```
