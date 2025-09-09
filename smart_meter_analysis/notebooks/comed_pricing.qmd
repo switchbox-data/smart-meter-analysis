@@ -1,0 +1,210 @@
+
+# Imports etc...
+```{python}
+import os
+import requests
+import polars as pl
+from typing import Sequence, Optional
+
+USE_MULTI   = False                  #
+STATE       = "IL"
+YEAR        = 2024
+QUARTERS    = [1]
+INPUT_FILE  = None
+ZIP_COLUMN  = "zip_code"
+OUTPUT_FILE = "zip_and_tracts.csv"
+HUD_API_KEY = ""
+```
+
+# Flatten Crosswalk from HUD
+```{python}
+def flatten_crosswalk(hud_json: dict) -> list[dict]:
+    if not isinstance(hud_json, dict):
+        return []
+    data = hud_json.get("data")
+    if data is None:
+        return []
+
+    items = data if isinstance(data, list) else [data]
+
+    rows: list[dict] = []
+    for item in items:
+        zip5 = item.get("input") or item.get("zip")
+        results = item.get("results") or []
+
+        for r in results:
+            rows.append({
+                "zip5": str(zip5).zfill(5) if zip5 else None,
+                "tract": r.get("geoid"),
+                "res_ratio": r.get("res_ratio"),
+                "bus_ratio": r.get("bus_ratio"),
+                "oth_ratio": r.get("oth_ratio"),
+                "tot_ratio": r.get("tot_ratio"),
+            })
+    return rows
+```
+
+# Get Crosswalk from HUD API (Basic, 1 Quarter)
+```{python}
+def fetch_crosswalk_one_quarter(
+    api_key: str,
+    state: str,
+    year: int,
+    quarter: int
+    ) -> pl.DataFrame:
+
+    url = "https://www.huduser.gov/hudapi/public/usps"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {
+        "type": 1,        # 1 = ZIP to tract crosswalk
+        "query": state.upper(),
+        "year": year,
+        "quarter": quarter
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=60)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"HUD API returned {r.status_code}: {r.text[:300]}")
+
+    hud_json = r.json()
+    rows = _flatten_crosswalk_json(hud_json)
+
+    if rows:
+        df = pl.DataFrame(rows)
+    else:
+        df = pl.DataFrame(schema={
+            "zip5": pl.Utf8,
+            "tract": pl.Utf8,
+            "res_ratio": pl.Float64,
+            "bus_ratio": pl.Float64,
+            "oth_ratio": pl.Float64,
+            "tot_ratio": pl.Float64
+        })
+
+    df = df.with_columns([
+        pl.col("zip5").cast(pl.Utf8).str.zfill(5),
+        pl.col("tract").cast(pl.Utf8),
+    ])
+
+    return df
+```
+
+# Multiple Quarters
+```{python}
+def fetch_crosswalk_multi_quarters(
+    api_key: str,
+     state: str,
+     year: int,
+     quarters: list[int]
+     ) -> pl.DataFrame:
+
+    dfs = []
+    for q in quarters:
+        df_q = fetch_crosswalk_one_quarter(api_key, state, year, q)
+        if df_q.height > 0:
+            dfs.append(df_q)
+        else:
+            print(f"  — No rows returned for Q{q}")
+
+    if not dfs:
+        raise RuntimeError(f"No data returned for {state} {year} in any of {quarters}.")
+
+    df_multi = pl.concat(dfs)
+      .sort(
+        ["zip5", "tract", "year", "quarter"],
+        descending=[False, False, True, True]
+        )
+      .unique(
+        subset=["zip5",
+        "tract"],
+        keep="first"
+        )
+
+    return df_multi
+```
+
+
+```{python}
+def add_tracts_to_data(
+    data: pl.DataFrame,
+    crosswalk_df: pl.DataFrame,
+    zip_column: str = "zip_code",
+    metric_cols: Optional[Sequence[str]] = None,   # e.g., ["households", "kwh_total"]
+    aggregate_to_tract: bool = False               # True → return tract-level sums
+) -> pl.DataFrame:
+
+if zip_column not in data.columns:
+        raise ValueError(
+            f"'{zip_column}' not found in input data columns: {data.columns}"
+            )
+
+    if (
+        "res_ratio" not in crosswalk_df.columns
+        )
+        and (
+            "tot_ratio" not in crosswalk_df.columns):
+        raise ValueError(
+            "crosswalk_df must contain at least one of: 'res_ratio' or 'tot_ratio'"
+        )
+
+    metric_cols = list(metric_cols) if metric_cols is not None else []
+    for c in metric_cols:
+        if c not in data.columns:
+            raise ValueError(
+                f"metric column '{c}' not found in data columns: {data.columns}"
+                )
+
+    data_zip = data.with_columns(
+    pl.col(zip_column)
+        .cast(pl.Utf8)
+        .str.extract(r"\d{5}")
+        .str.zfill(5)
+        .alias("zip5")
+        )
+
+    cw = crosswalk_df.with_columns(
+    pl.col("zip5").cast(pl.Utf8).str.zfill(5)
+        )
+
+    if {"year", "quarter"}.issubset(set(cw.columns)):
+        cw = (
+            cw.sort(["zip5", "tract", "year", "quarter"], descending=[False, False, True, True])
+              .unique(subset=["zip5", "tract"], keep="first")
+        )
+    else:
+        cw = cw.unique(subset=["zip5", "tract"], keep="first")
+
+    cw = cw.with_columns(
+        pl.coalesce([pl.col(
+            "res_ratio"),
+            pl.col(
+                "tot_ratio"
+                )]).alias("w_raw")
+                )
+                .with_columns(
+                    pl.col("w_raw").fill_null(0.0)
+                    )
+
+    cw = cw.join(
+        cw.group_by("zip5").agg(pl.col("w_raw").sum().alias("w_sum")),
+        on="zip5",
+        how="left"
+    ).with_columns(
+        pl.when(pl.col("w_sum") > 0)
+          .then(pl.col("w_raw") / pl.col("w_sum"))
+          .otherwise(None)
+          .alias("w_norm")
+    ).select(["zip5", "tract", "w_norm"])
+
+        joined = data_zip.join(cw, on="zip5", how="left")
+
+    return joined
+```
+
+
+
+col(zip_column).cast(pl.Utf8).str.extract(r"(\d{5})").str.zfill(5).alias("zip5")
+    )
+    return data.join(crosswalk_df, on="zip5", how="left")
+```
