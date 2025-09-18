@@ -18,9 +18,19 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "ipykernel>=6.30.1",
-    "polars>=1.31.0",
     "quarto>=0.1.0",
+    "jupyter>=1.1.1",
+    "ipykernel>=6.30.1",
+    "polars>=1.32.3",
+    "pyarrow>=21.0.0",
+    "seaborn>=0.13.2",
+    "geopandas>=1.0.1",
+    "pygris>=0.2.0",
+    "cenpy>=1.0.1",
+    "boto3>=1.7.84",
+    "requests>=2.32.4",
+    "rich>=14.1.0",
+    "shapely>=2.0.7",
 ]
 
 [project.urls]
@@ -34,12 +44,12 @@ dev = [
     "pre-commit>=2.20.0",
     "tox-uv>=1.11.3",
     "deptry>=0.23.0",
-    "mypy>=0.991",
-    
+    "ty>=0.0.1a16",
     "ruff>=0.11.5",
     "mkdocs>=1.4.2",
     "mkdocs-material>=8.5.10",
     "mkdocstrings[python]>=0.26.1",
+    "types-requests>=2.32.4.20250809",
 ]
 
 [build-system]
@@ -49,23 +59,29 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["smart_meter_analysis"]
 
-[tool.mypy]
-files = ["smart_meter_analysis"]
-disallow_untyped_defs = true
-disallow_any_unimported = true
-no_implicit_optional = true
-check_untyped_defs = true
-warn_return_any = true
-warn_unused_ignores = true
-show_error_codes = true
+[tool.ty.environment]
+python = "./.venv"
+python-version = "3.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py312"
 line-length = 120
 fix = true
+exclude = [
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    "build",
+    "dist"
+]
+extend-exclude = [
+  "smart_meter_analysis/.vdoc.*.py",
+  ".vdoc.*.py",
+]
 
 [tool.ruff.lint]
 select = [
@@ -99,7 +115,11 @@ select = [
     "RUF",
     # tryceratops
     "TRY",
+    "UP",
+    "B",
+    "TID"
 ]
+fixable = ["ALL"]
 ignore = [
     # LineTooLong
     "E501",
@@ -113,4 +133,38 @@ ignore = [
 [tool.ruff.format]
 preview = true
 
+[tool.deptry]
+# Exclude directories that shouldn't be analyzed
+exclude = [
+    "utils",
+    "\\.venv"
+]
 
+# Ignore dev-only dependencies that are not used in main package code
+per_rule_ignores.DEP002 = [
+    # Testing framework
+    "pytest",
+    # Documentation tools
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings",
+    # Code quality tools
+    "pre-commit",
+    "tox-uv",
+    "deptry",
+    "mypy",
+    "ruff",
+    # Development utilities
+    "ipykernel",
+    "quarto",
+    # Type stubs
+    "types-requests",
+     # Data analysis packages to be used later
+    "cenpy",
+    "geopandas",
+    "jupyter",
+    "pyarrow",
+    "pygris",
+    "shapely",
+    "just",
+]
