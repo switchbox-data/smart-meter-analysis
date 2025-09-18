@@ -2,22 +2,77 @@
 // README at: https://github.com/devcontainers/templates/tree/main/src/python
 {
     "name": "smart-meter-analysis",
-    // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-    "image": "mcr.microsoft.com/devcontainers/python:1-3.13",
+    "image": "mcr.microsoft.com/devcontainers/python:1-3.13-bookworm",
+    "features": {
+        // Install Quarto CLI
+        "ghcr.io/rocker-org/devcontainer-features/quarto-cli:1": {
+            "version": "1.7.33",
+            "installChromium": true
+        },
+        // Install Chromium to render mermaid and graphviz diagrams in Quarto
+        "ghcr.io/rocker-org/devcontainer-features/apt-packages:1": {
+            "packages": "chromium python3-tk"
+        },
+        // Install just
+        "ghcr.io/guiyomh/features/just:0.1.0": {
+            "version": "1.42.4"
+        },
+        // Install AWS CLI
+        "ghcr.io/devcontainers/features/aws-cli:1": {
+            "version": "2.27.4"
+        }
+    },
+
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.aws",  // Container won't start if .aws dir is missing
+    "mounts": [
+        "source=${localEnv:HOME}/.aws,target=/home/vscode/.aws,type=bind,consistency=cached"
+    ],
+
+    "remoteEnv": {
+        "AWS_REGION": "us-west-2"
+    },
 
     // Use 'postCreateCommand' to run commands after the container is created.
     "postCreateCommand": "./.devcontainer/postCreateCommand.sh",
 
+    // Tell quarto to use Python interpreter in the uv virtual environment.
+    "containerEnv": {
+        "QUARTO_PYTHON": "/workspaces/smart-meter-analysis/.venv/bin/python"
+    },
+
     // Configure tool-specific properties.
     "customizations": {
         "vscode": {
-            "extensions": ["ms-python.python", "editorconfig.editorconfig"],
+            "extensions": [
+                "ms-python.python", 
+                "nefrob.vscode-just-syntax",
+                "quarto.quarto",
+                "ms-toolsai.jupyter",
+                "tamasfe.even-better-toml",
+                "astral-sh.ty",
+                "charliermarsh.ruff"
+            ],
             "settings": {
                 "python.testing.pytestArgs": ["tests"],
                 "python.testing.unittestEnabled": false,
                 "python.testing.pytestEnabled": true,
                 "python.defaultInterpreterPath": "/workspaces/smart-meter-analysis/.venv/bin/python",
-                "python.testing.pytestPath": "/workspaces/smart-meter-analysis/.venv/bin/pytest"
+                "python.testing.pytestPath": "/workspaces/smart-meter-analysis/.venv/bin/pytest",
+                "python.languageServer": "None", // Use language server from ty
+                "ruff.nativeServer": "on", // Use native server for ruff
+                "notebook.formatOnSave.enabled": true,
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff", // Use ruff as default formatter
+                    "editor.formatOnSave": true, // Format on save
+                    "editor.codeActionsOnSave": {
+                        "source.fixAll": "explicit", // Fix all errors on save
+                        "source.organizeImports": "explicit" // Organize imports on save
+                    },
+                    "notebook.codeActionsOnSave": {
+                        "notebook.source.fixAll": "explicit", // Fix all errors on save in notebooks
+                        "notebook.source.organizeImports": "explicit" // Organize imports on save in notebooks
+                    }
+                }
             }
         }
     }
