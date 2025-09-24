@@ -21,6 +21,11 @@ dependencies = [
     "ipykernel>=6.30.1",
     "polars>=1.31.0",
     "quarto>=0.1.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "pyyaml>=6.0",
+    "selenium>=4.35.0",
+    "webdriver-manager>=4.0.2",
 ]
 
 [project.urls]
@@ -35,7 +40,6 @@ dev = [
     "tox-uv>=1.11.3",
     "deptry>=0.23.0",
     "mypy>=0.991",
-    
     "ruff>=0.11.5",
     "mkdocs>=1.4.2",
     "mkdocs-material>=8.5.10",
@@ -112,5 +116,3 @@ ignore = [
 
 [tool.ruff.format]
 preview = true
-
-
