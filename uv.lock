@@ -1093,6 +1093,10 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+dep003 = [
+    { name = "botocore", version = "1.10.84", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "botocore", version = "1.40.41", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+]
 dev = [
     { name = "deptry" },
     { name = "mkdocs" },
@@ -1114,6 +1118,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+dep003 = [{ name = "botocore" }]
 dev = [
     { name = "deptry", specifier = ">=0.23.0" },
     { name = "mkdocs", specifier = ">=1.4.2" },
