@@ -51,6 +51,7 @@ dev = [
     "mkdocstrings[python]>=0.26.1",
 ]
 DEP003 = ["botocore"]
+DEP004 = ["botocore"]
 
 [build-system]
 requires = ["hatchling"]
