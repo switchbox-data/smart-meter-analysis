@@ -46,8 +46,18 @@ install-dev:
 clean:
     rm -rf .pytest_cache .ruff_cache build dist *.egg-info **/__pycache__
 
-# -------------------- Project-specific tasks --------------------
+# -------------------- Ameren Data Collection --------------------
 
-# Download all Ameren CSVs (your Selenium+requests script)
+# Download Ameren CSV files and upload to S3 (interactive mode)
+# Note: May require 2-3 runs due to server rate limiting
+# The script automatically skips files already in S3
 download-ameren:
     uv run python scripts/data_collection/ameren_scraper.py
+
+# Download Ameren files with force flag (skip all prompts, overwrite existing)
+download-ameren-force:
+    uv run python scripts/data_collection/ameren_scraper.py --force
+
+# Download Ameren files to custom S3 bucket
+download-ameren-bucket BUCKET:
+    uv run python scripts/data_collection/ameren_scraper.py --bucket-name {{BUCKET}} --force

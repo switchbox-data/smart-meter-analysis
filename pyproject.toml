@@ -18,11 +18,16 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "boto3>=1.7.84",
     "pyyaml>=6.0.2",
     "requests>=2.32.4",
     "selenium>=4.35.0",
 ]
 
+[project.urls]
+Homepage = "https://switchbox-data.github.io/smart-meter-analysis/"
+Repository = "https://github.com/switchbox-data/smart-meter-analysis"
+Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [tool.deptry.per_rule_ignores]
 DEP002 = [
@@ -32,17 +37,6 @@ DEP002 = [
   "beautifulsoup4>=4.12.0",
   "webdriver-manager>=4.0.2",
 ]
-
-dependencies = [
-    "requests>=2.31.0",
-    "pyyaml>=6.0",
-    "selenium>=4.35.0",
-]
-
-[project.urls]
-Homepage = "https://switchbox-data.github.io/smart-meter-analysis/"
-Repository = "https://github.com/switchbox-data/smart-meter-analysis"
-Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [dependency-groups]
 dev = [
@@ -124,6 +118,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
+"scripts/data_collection/*" = ["C901"]
 
 [tool.ruff.format]
 preview = true
