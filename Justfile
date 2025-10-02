@@ -61,3 +61,5 @@ download-ameren-force:
 # Download Ameren files to custom S3 bucket
 download-ameren-bucket BUCKET:
     uv run python scripts/data_collection/ameren_scraper.py --bucket-name {{BUCKET}} --force
+
+echo "" >> Justfile
