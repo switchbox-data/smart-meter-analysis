@@ -1,16 +1,16 @@
 """
 Enhanced Ameren WebFTP CSV Downloader with S3 Upload Integration
 
-IMPORTANT: This script typically requires 2-3 runs to successfully download all 
+IMPORTANT: This script typically requires 2-3 runs to successfully download all
 files due to external factors beyond my control:
 
 1. Ameren's server intermittently blocks large file downloads after processing
    several GB of data, returning HTML error pages instead of CSV files
-2. The WebFTP page uses heavy JavaScript that sometimes fails to load file 
+2. The WebFTP page uses heavy JavaScript that sometimes fails to load file
     listings on the first attempt.
 
-The script checks S3 before downloading and skips files that already exist. 
-This means you can safely re-run the command multiple times until all files are 
+The script checks S3 before downloading and skips files that already exist.
+This means you can safely re-run the command multiple times until all files are
 successfully uploaded.
 
 Typical workflow:
@@ -36,7 +36,7 @@ Known Limitations:
 - Page scraping intermittently returns 0 files; simply re-run if this occurs
 - Ameren's server may rate-limit or invalidate sessions unpredictably
 
-These limitations are handled through the idempotent design - failures are 
+These limitations are handled through the idempotent design - failures are
 expected and resolved by re-running the script.
 """
 
@@ -96,55 +96,34 @@ def setup_driver() -> webdriver.Chrome:
     return webdriver.Chrome(service=service, options=options)
 
 
-def login_and_get_cookies(
-    driver: webdriver.Chrome, username: str, password: str
-    ) -> list[dict]:
+def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str) -> list[dict]:
     """Login to Ameren WebFTP and return session cookies."""
     print("Logging in to Ameren WebFTP...")
     driver.get("https://webftp.ameren.com/login")
 
     # Fill login form
-    username_field = WebDriverWait(
-        driver, 15
-        ).until(
-            EC.presence_of_element_located(
-                (By.NAME, "username")
-                ))
+    username_field = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.NAME, "username")))
     password_field = driver.find_element(By.NAME, "password")
     username_field.send_keys(username)
     password_field.send_keys(password)
 
     # Submit and wait for redirect
-    submit_button = driver.find_element(
-        By.CSS_SELECTOR, 
-        'button[type="submit"]'
-        )
-    driver.execute_script(
-        "arguments[0].click();", 
-        submit_button
-        )
-    WebDriverWait(driver, 15).until(
-        lambda d: d.current_url != "https://webftp.ameren.com/login"
-        )
+    submit_button = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+    driver.execute_script("arguments[0].click();", submit_button)
+    WebDriverWait(driver, 15).until(lambda d: d.current_url != "https://webftp.ameren.com/login")
 
     print("Login successful")
     return driver.get_cookies()
 
 
-def list_csv_urls_in_folder(
-    driver: webdriver.Chrome, 
-    folder_url: str
-    ) -> list[str]:
+def list_csv_urls_in_folder(driver: webdriver.Chrome, folder_url: str) -> list[str]:
     """Scrape folder page and return list of CSV file URLs."""
     print(f"Scanning folder: {folder_url}")
     driver.get(folder_url)
 
     # Wait for page content to load - look for table or file list elements
     try:
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located(
-                (By.TAG_NAME, "table")
-                ))
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
     except TimeoutException:
         print("Warning: Table element not found, proceeding anyway...")
 
@@ -152,20 +131,14 @@ def list_csv_urls_in_folder(
     time.sleep(5)
 
     # Scroll to trigger lazy-loading until page height stabilizes
-    last_height = driver.execute_script(
-        "return document.body.scrollHeight"
-        )
+    last_height = driver.execute_script("return document.body.scrollHeight")
     scroll_attempts = 0
     max_scroll_attempts = 10
 
     while scroll_attempts < max_scroll_attempts:
-        driver.execute_script(
-            "window.scrollTo(0, document.body.scrollHeight);"
-            )
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1.5)
-        new_height = driver.execute_script(
-            "return document.body.scrollHeight"
-            )
+        new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
         last_height = new_height
@@ -208,19 +181,12 @@ def list_csv_urls_in_folder(
 # ============================================================================
 
 
-def make_authenticated_session(
-    cookies: list[dict], 
-    referer: str
-    ) -> requests.Session:
+def make_authenticated_session(cookies: list[dict], referer: str) -> requests.Session:
     """Create requests session with Selenium cookies and headers."""
     session = requests.Session()
     for cookie in cookies:
         session.cookies.set(cookie["name"], cookie["value"])
-    session.headers.update(
-        {"User-Agent": BROWSER_USER_AGENT, 
-        "Referer": referer, 
-        "Accept": "*/*"}
-        )
+    session.headers.update({"User-Agent": BROWSER_USER_AGENT, "Referer": referer, "Accept": "*/*"})
     return session
 
 
@@ -238,20 +204,12 @@ def is_valid_csv(filepath: Path) -> bool:
     return True
 
 
-def download_csv(
-    file_url: str, 
-    cookies: list[dict], 
-    out_dir: Path, 
-    max_retries: int = 3
-    ) -> Path | None:
+def download_csv(file_url: str, cookies: list[dict], out_dir: Path, max_retries: int = 3) -> Path | None:
     """
     Download CSV file to local directory with retry logic.
     Returns filepath on success, None on failure.
     """
-    out_dir.mkdir(
-        parents=True, 
-        exist_ok=True
-        )
+    out_dir.mkdir(parents=True, exist_ok=True)
     filename = file_url.rstrip("/").split("/")[-1]
     filepath = out_dir / filename
 
@@ -263,10 +221,7 @@ def download_csv(
         else:
             print(f"Downloading: {filename}")
 
-        session = make_authenticated_session(
-            cookies, 
-            referer=file_url.rsplit("/", 1)[0] + "/"
-            )
+        session = make_authenticated_session(cookies, referer=file_url.rsplit("/", 1)[0] + "/")
 
         try:
             with session.get(file_url, stream=True, timeout=120) as response:
@@ -319,9 +274,7 @@ def download_csv(
 # ============================================================================
 
 
-def extract_date_from_filename(
-    filename: str
-    ) -> str | None:
+def extract_date_from_filename(filename: str) -> str | None:
     """Extract YYYYMM date from filename, returns None if not found."""
     base_name = filename.replace(".csv", "")
     matches = re.findall(r"\d{6}", base_name)
@@ -335,20 +288,14 @@ def extract_date_from_filename(
     return None
 
 
-def get_s3_key(
-    filename: str
-    ) -> str:
+def get_s3_key(filename: str) -> str:
     """Generate S3 key with folder structure: ameren-data/YYYYMM/filename.csv"""
     date_str = extract_date_from_filename(filename)
     folder = date_str if date_str else "undated"
     return f"ameren-data/{folder}/{filename}"
 
 
-def file_exists_in_s3(
-    s3_client, 
-    bucket: str, 
-    key: str
-    ) -> bool:
+def file_exists_in_s3(s3_client, bucket: str, key: str) -> bool:
     """Check if file exists in S3 bucket."""
     try:
         s3_client.head_object(Bucket=bucket, Key=key)
@@ -360,12 +307,7 @@ def file_exists_in_s3(
         return True
 
 
-def upload_to_s3(
-    s3_client, 
-    local_path: Path, 
-    bucket: str, 
-    key: str
-    ) -> bool:
+def upload_to_s3(s3_client, local_path: Path, bucket: str, key: str) -> bool:
     """Upload file to S3. Returns True on success."""
     try:
         file_size = local_path.stat().st_size
@@ -387,11 +329,7 @@ def upload_to_s3(
 # ============================================================================
 
 
-def ask_overwrite_permission(
-    filename: str, 
-    s3_key: str, 
-    bucket: str
-    ) -> bool:
+def ask_overwrite_permission(filename: str, s3_key: str, bucket: str) -> bool:
     """Ask user if they want to overwrite existing S3 file."""
     print("\nFile already exists in S3:")
     print(f"  Location: s3://{bucket}/{s3_key}")
@@ -411,12 +349,7 @@ def ask_overwrite_permission(
 
 
 def process_single_file_with_fresh_session(
-    file_url: str, 
-    username: str, 
-    password: str, 
-    s3_client, 
-    bucket: str, 
-    force: bool
+    file_url: str, username: str, password: str, s3_client, bucket: str, force: bool
 ) -> bool:
     """
     Process a single file with its own browser session.
@@ -431,11 +364,7 @@ def process_single_file_with_fresh_session(
 
     # Check if file already exists in S3
     exists = file_exists_in_s3(s3_client, bucket, s3_key)
-    if exists and not force and not ask_overwrite_permission(
-        filename, 
-        s3_key, 
-        bucket
-        ):
+    if exists and not force and not ask_overwrite_permission(filename, s3_key, bucket):
         print(f"Skipping: {filename}")
         return True
     if exists:
