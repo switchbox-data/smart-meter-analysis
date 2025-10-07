@@ -18,12 +18,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "awscli>=1.42.46",
+    "boto3>=1.40.46",
     "cenpy>=1.0.1",
     "ipykernel>=6.30.1",
     "openpyxl>=3.1.5",
     "polars>=1.31.0",
-    "quarto>=0.1.0",
     "scikit-learn>=1.6.1",
 ]
 
@@ -39,11 +38,11 @@ dev = [
     "tox-uv>=1.11.3",
     "deptry>=0.23.0",
     "mypy>=0.991",
-
     "ruff>=0.11.5",
     "mkdocs>=1.4.2",
     "mkdocs-material>=8.5.10",
     "mkdocstrings[python]>=0.26.1",
+    "boto3-stubs>=1.40.46",
 ]
 
 [build-system]
@@ -63,6 +62,10 @@ warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 
+[[tool.mypy.overrides]]
+module = "boto3.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -73,46 +76,20 @@ fix = true
 
 [tool.ruff.lint]
 select = [
-    # flake8-2020
-    "YTT",
-    # flake8-bandit
-    "S",
-    # flake8-bugbear
-    "B",
-    # flake8-builtins
-    "A",
-    # flake8-comprehensions
-    "C4",
-    # flake8-debugger
-    "T10",
-    # flake8-simplify
-    "SIM",
-    # isort
-    "I",
-    # mccabe
-    "C90",
-    # pycodestyle
-    "E", "W",
-    # pyflakes
-    "F",
-    # pygrep-hooks
-    "PGH",
-    # pyupgrade
-    "UP",
-    # ruff
-    "RUF",
-    # tryceratops
-    "TRY",
+    "YTT", "S", "B", "A", "C4", "T10", "SIM", "I", "C90",
+    "E", "W", "F", "PGH", "UP", "RUF", "TRY",
 ]
-ignore = [
-    # LineTooLong
-    "E501",
-    # DoNotAssignLambda
-    "E731",
-]
+ignore = ["E501", "E731"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry]
+# Ignore dependencies that will be used soon
+known_first_party = ["smart_meter_analysis"]
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["cenpy", "ipykernel", "openpyxl", "scikit-learn"]

@@ -1,11 +1,7 @@
-#!/usr/bin/env python
-"""
-Test script for Step 0 transformation pipeline.
-Tests both local transformation and AWS batch processing.
-"""
+"""Tests for Step 0: AWS ingestion and transformation pipeline"""
 
-import logging
-from pathlib import Path
+import polars as pl
+import pytest
 
 from smart_meter_analysis.step0_aws import (
     list_s3_files,
@@ -17,131 +13,93 @@ from smart_meter_analysis.step0_transform import (
     dst_transition_dates,
 )
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+@pytest.fixture(scope="module")
+def s3_files():
+    """Get list of S3 files for testing"""
+    return list_s3_files(year_month="202308", max_files=3)
+
+
+@pytest.fixture(scope="module")
+def sample_df(s3_files):
+    """Process a single CSV for testing"""
+    return process_single_csv(s3_files[0])
 
 
 def test_aws_listing():
-    """Test 1: Can we list files from S3?"""
-    print("\n" + "=" * 60)
-    print("TEST 1: List S3 Files")
-    print("=" * 60)
-
+    """Test that we can list files from S3"""
     files = list_s3_files(year_month="202308", max_files=5)
-    print(f"✅ Found {len(files)} files")
-    for f in files:
-        print(f"  - {Path(f).name}")
-
-    return files
+    assert len(files) > 0
+    assert all(f.endswith(".csv") for f in files)
+    assert all("202308" in f for f in files)
 
 
-def test_single_file_processing(s3_key: str):
-    """Test 2: Process a single file from S3"""
-    print("\n" + "=" * 60)
-    print("TEST 2: Process Single CSV")
-    print("=" * 60)
-    print(f"Processing: {Path(s3_key).name}")
+def test_single_file_processing(sample_df):
+    """Test processing a single CSV file"""
+    # Check shape
+    assert sample_df.height > 0
 
-    df = process_single_csv(s3_key)
+    # Check required columns exist
+    required_cols = ["zip_code", "account_identifier", "datetime", "kwh", "date", "hour", "weekday"]
+    for col in required_cols:
+        assert col in sample_df.columns
 
-    print("\n✅ Transformation successful!")
-    print(f"  Rows: {df.height:,}")
-    print(f"  Columns: {df.columns}")
-    print("\nFirst few rows:")
-    print(df.head())
+    # Check data types
+    assert sample_df["datetime"].dtype == pl.Datetime
+    assert sample_df["kwh"].dtype == pl.Float64
+    assert sample_df["hour"].dtype == pl.Int8
 
     # Check data quality
-    print("\n📊 Data Quality:")
-    print(f"  Unique accounts: {df['account_identifier'].n_unique()}")
-    print(f"  Date range: {df['date'].min()} to {df['date'].max()}")
-    print(f"  Total kWh: {df['kwh'].sum():,.2f}")
-    print(f"  Null kWh values: {df['kwh'].null_count()}")
-
-    return df
+    assert sample_df["account_identifier"].n_unique() > 0
+    assert sample_df["date"].min() is not None
+    assert sample_df["date"].max() is not None
 
 
-def test_qc_checks(df):
-    """Test 3: QC checks for interval counts"""
-    print("\n" + "=" * 60)
-    print("TEST 3: Quality Control Checks")
-    print("=" * 60)
+def test_qc_checks(sample_df):
+    """Test quality control checks"""
+    qc = daily_interval_qc(sample_df)
 
-    qc = daily_interval_qc(df)
-    print("\nInterval counts by day type:")
-    print(
-        qc.group_by("day_type")
-        .agg([
-            pl.len().alias("n_days"),
-            pl.col("n_intervals").mean().alias("avg_intervals"),
-        ])
-        .sort("day_type")
-    )
+    # Check QC columns exist
+    assert "day_type" in qc.columns
+    assert "n_intervals" in qc.columns
+    assert "is_dst_transition" in qc.columns
 
-    # Check for DST
-    dst_dates = dst_transition_dates(df)
-    if dst_dates.height > 0:
-        print("\n🕐 DST Transition Dates Found:")
-        print(dst_dates)
-    else:
-        print("\n✅ No DST transitions in this data")
+    # Check day types are valid
+    valid_day_types = {"normal", "spring_forward", "fall_back", "odd"}
+    assert set(qc["day_type"].unique()) <= valid_day_types
 
-    return qc
+    # Most August days should be normal (48 intervals)
+    normal_days = qc.filter(pl.col("day_type") == "normal").height
+    total_days = qc.height
+    assert normal_days > total_days * 0.5  # At least 50% normal days
 
 
-def test_batch_processing():
-    """Test 4: Process multiple files and save"""
-    print("\n" + "=" * 60)
-    print("TEST 4: Batch Processing (3 files)")
-    print("=" * 60)
-
-    output_path = Path("data/processed/test_august_2023.parquet")
+def test_batch_processing(tmp_path):
+    """Test batch processing multiple files"""
+    output_path = tmp_path / "test_batch.parquet"
 
     process_month_batch(
         year_month="202308",
         output_path=output_path,
-        max_files=3,  # Just 3 files for testing
+        max_files=2,  # Just 2 files for speed
     )
 
-    print("\n✅ Batch processing complete!")
-    print(f"  Output: {output_path}")
-    print(f"  Size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+    # Check file was created
+    assert output_path.exists()
 
-    # Read it back to verify
-    import polars as pl
-
+    # Read and verify
     df = pl.read_parquet(output_path)
-    print(f"  Rows in saved file: {df.height:,}")
-    print(f"  Unique accounts: {df['account_identifier'].n_unique()}")
+    assert df.height > 0
+    assert "account_identifier" in df.columns
+    assert df["account_identifier"].n_unique() > 0
 
-    return df
 
+def test_dst_detection(sample_df):
+    """Test DST transition detection"""
+    dst_dates = dst_transition_dates(sample_df)
 
-if __name__ == "__main__":
-    import polars as pl
-
-    try:
-        # Test 1: List files
-        files = test_aws_listing()
-
-        # Test 2: Process single file
-        df = test_single_file_processing(files[0])
-
-        # Test 3: QC checks
-        qc = test_qc_checks(df)
-
-        # Test 4: Batch processing
-        df_batch = test_batch_processing()
-
-        print("\n" + "=" * 60)
-        print("🎉 ALL TESTS PASSED!")
-        print("=" * 60)
-        print("\nNext steps:")
-        print("  1. Review the output in data/processed/")
-        print("  2. Check if timestamps look correct")
-        print("  3. Ready to build crosswalk module!")
-
-    except Exception as e:
-        print(f"\n❌ TEST FAILED: {e}")
-        import traceback
-
-        traceback.print_exc()
+    # August should have no DST transitions
+    # But if there are any odd interval counts, they might be flagged
+    # Just check the function runs without error
+    assert "date" in dst_dates.columns
+    assert "day_type" in dst_dates.columns

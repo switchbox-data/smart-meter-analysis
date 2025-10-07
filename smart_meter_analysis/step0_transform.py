@@ -59,9 +59,9 @@ def transform_wide_to_long(
 
     long_df = (
         df_raw.select(keep_ids + interval_cols)
-        .melt(
-            id_vars=keep_ids,
-            value_vars=interval_cols,
+        .unpivot(
+            index=keep_ids,
+            on=interval_cols,
             variable_name="interval_col",
             value_name="kwh",
         )
