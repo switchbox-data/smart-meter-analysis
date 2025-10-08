@@ -93,8 +93,8 @@ class PipelineValidator:
         cp1 = self.checkpoints[step1]
         cp2 = self.checkpoints[step2]
 
-        row_change = cp2["rows"] - cp1["rows"]
-        row_pct = 100 * row_change / cp1["rows"] if cp1["rows"] > 0 else 0
+        row_change = cp2["rows"] - cp1["rows"]  # type: ignore[operator]
+        row_pct = 100 * row_change / cp1["rows"] if cp1["rows"] > 0 else 0  # type: ignore[operator]
 
         report: dict[str, object] = {
             "from": step1,
@@ -127,10 +127,10 @@ class PipelineValidator:
 
             if report["issues"]:
                 print("  Issues:")
-                for issue in report["issues"]:
+                for issue in report["issues"]:  # type: ignore[attr-defined]
                     print(f"    ❌ {issue}")
 
             if report["warnings"]:
                 print("  Warnings:")
-                for warning in report["warnings"]:
+                for warning in report["warnings"]:  # type: ignore[attr-defined]
                     print(f"    ⚠️  {warning}")
