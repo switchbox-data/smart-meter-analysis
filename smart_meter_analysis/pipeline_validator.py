@@ -17,7 +17,7 @@ class PipelineValidator:
     """Track data through pipeline transformations"""
 
     def __init__(self) -> None:
-        self.checkpoints = {}
+        self.checkpoints: dict[str, dict[str, object]] = {}
 
     def checkpoint(
         self,
