@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 CENSUS_MISSING_CODES = [-666666666, -999999999, -888888888, -555555555, -222222222]
 
 
-def _import_cen():
+def _import_cen() -> object:
     try:
         import cenpy as cen  # type: ignore[import-untyped]
     except ImportError as e:
