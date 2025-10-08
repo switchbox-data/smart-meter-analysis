@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class PipelineValidator:
     """Track data through pipeline transformations"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.checkpoints = {}
 
     def checkpoint(
@@ -93,8 +93,8 @@ class PipelineValidator:
         cp1 = self.checkpoints[step1]
         cp2 = self.checkpoints[step2]
 
-        row_change = cp2["rows"] - cp1["rows"]  # type: ignore
-        row_pct = 100 * row_change / cp1["rows"] if cp1["rows"] > 0 else 0  # type: ignore
+        row_change = cp2["rows"] - cp1["rows"]
+        row_pct = 100 * row_change / cp1["rows"] if cp1["rows"] > 0 else 0
 
         report: dict[str, object] = {
             "from": step1,
@@ -127,10 +127,10 @@ class PipelineValidator:
 
             if report["issues"]:
                 print("  Issues:")
-                for issue in report["issues"]:  # type: ignore
+                for issue in report["issues"]:
                     print(f"    ❌ {issue}")
 
             if report["warnings"]:
                 print("  Warnings:")
-                for warning in report["warnings"]:  # type: ignore
+                for warning in report["warnings"]:
                     print(f"    ⚠️  {warning}")
