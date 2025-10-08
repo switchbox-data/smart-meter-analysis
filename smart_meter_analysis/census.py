@@ -19,7 +19,7 @@ CENSUS_MISSING_CODES = [-666666666, -999999999, -888888888, -555555555, -2222222
 
 def _import_cen():
     try:
-        import cenpy as cen
+        import cenpy as cen  # type: ignore[import-untyped]
     except ImportError as e:
         # TRY003 note handled below (short message)
         raise ImportError("cenpy is required; install with: uv add cenpy") from e  # noqa: TRY003
