@@ -18,25 +18,15 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "pyyaml>=6.0.2",
-    "requests>=2.32.4",
-    "selenium>=4.35.0",
-]
-
-
-[tool.deptry.per_rule_ignores]
-DEP002 = [
-  "ipykernel>=6.30.1",
-  "polars>=1.31.0",
-  "quarto>=0.1.0",
-  "beautifulsoup4>=4.12.0",
-  "webdriver-manager>=4.0.2",
-]
-
-dependencies = [
-    "requests>=2.31.0",
-    "pyyaml>=6.0",
-    "selenium>=4.35.0",
+    "boto3>=1.40.46",
+    "cenpy>=1.0.1",
+    "ipykernel>=6.30.1",
+    "openpyxl>=3.1.5",
+    "polars>=1.31.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+    "scikit-learn>=1.6.1",
+    "selenium>=4.32.0",
 ]
 
 [project.urls]
@@ -55,6 +45,7 @@ dev = [
     "mkdocs>=1.4.2",
     "mkdocs-material>=8.5.10",
     "mkdocstrings[python]>=0.26.1",
+    "boto3-stubs>=1.40.46",
 ]
 
 [build-system]
@@ -74,8 +65,14 @@ warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 
+[[tool.mypy.overrides]]
+module = "boto3.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+]
 
 [tool.ruff]
 target-version = "py39"
@@ -84,46 +81,22 @@ fix = true
 
 [tool.ruff.lint]
 select = [
-    # flake8-2020
-    "YTT",
-    # flake8-bandit
-    "S",
-    # flake8-bugbear
-    "B",
-    # flake8-builtins
-    "A",
-    # flake8-comprehensions
-    "C4",
-    # flake8-debugger
-    "T10",
-    # flake8-simplify
-    "SIM",
-    # isort
-    "I",
-    # mccabe
-    "C90",
-    # pycodestyle
-    "E", "W",
-    # pyflakes
-    "F",
-    # pygrep-hooks
-    "PGH",
-    # pyupgrade
-    "UP",
-    # ruff
-    "RUF",
-    # tryceratops
-    "TRY",
+    "YTT", "S", "B", "A", "C4", "T10", "SIM", "I", "C90",
+    "E", "W", "F", "PGH", "UP", "RUF", "TRY",
 ]
-ignore = [
-    # LineTooLong
-    "E501",
-    # DoNotAssignLambda
-    "E731",
-]
+ignore = ["E501", "E731"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
+"scripts/diagnostics/*.py" = ["C901"]
+"smart_meter_analysis/pipeline_validator.py" = ["C901", "PGH003"]
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry]
+# Ignore dependencies that will be used soon
+known_first_party = ["smart_meter_analysis"]
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["cenpy", "ipykernel", "openpyxl", "scikit-learn"]

@@ -149,4 +149,28 @@ cython_debug/
 
 # Ameren scraper files
 scripts/.secrets/
+
+# Data files
 data/raw/
+data/processed/*.parquet
+data/interim/
+data/processed/*_full.parquet
+data/processed/census_*.parquet
+
+# But allow test files
+!data/processed/test_*.parquet
+
+# Temporary files
+scratch/
+*_sample_*.csv
+test_*.py
+debug_*.py
+
+# Data files (don't commit large data)
+data/raw/*.csv
+data/processed/*.parquet
+data/interim/
+
+# Debug files
+*_sample_*.csv
+validate_*.py.bak
