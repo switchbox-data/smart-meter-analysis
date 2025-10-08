@@ -1,10 +1,12 @@
 # smart_meter_analysis/step0_transform.py
 """
-Step 0: Transform ComEd wide-format CSVs to long format with timestamps.
+Transform ComEd wide-format CSVs to long format with timestamps.
 Handles DST transitions and adds time features.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import polars as pl
 
@@ -22,6 +24,10 @@ STEP0_ID_COLS = [
 ]
 
 INTERVAL_PREFIXES = ("INTERVAL_HR", "HR")
+
+# DST transition dates for 2023
+DST_SPRING_2023 = date(2023, 3, 12)  # Spring Forward
+DST_FALL_2023 = date(2023, 11, 5)  # Fall Back
 
 # Error messages
 ERR_NO_INTERVAL_COLS = "No interval columns found. Looked for prefixes: {}"
@@ -47,7 +53,10 @@ def transform_wide_to_long(
 ) -> pl.DataFrame:
     """
     Melt wide ComEd interval file to long format with proper timestamps.
-    Handles HR2400/HR2430 (next-day midnight/00:30 roll).
+    Handles DST transitions correctly:
+    - Spring Forward: Filters nulls in HR0200/HR0230 (missing hour) + HR2430/HR2500
+    - Fall Back: Keeps all 50 intervals (HR2430/HR2500 contain repeated 1 AM hour)
+    - Normal days: Filters nulls in HR2430/HR2500 (unused DST placeholders)
 
     Returns: DataFrame with columns [zip_code, account_identifier, datetime, kwh]
     """
@@ -65,6 +74,12 @@ def transform_wide_to_long(
             variable_name="interval_col",
             value_name="kwh",
         )
+        # CRITICAL: Filter null kWh values
+        # This automatically handles DST correctly:
+        # - Spring Forward: Removes null HR0200/0230 + HR2430/2500 = 46 intervals
+        # - Fall Back: Keeps all 50 intervals (none are null)
+        # - Normal: Removes null HR2430/2500 = 48 intervals
+        .filter(pl.col("kwh").is_not_null())
         .with_columns(pl.col("interval_col").str.extract(r"HR(\d{4})", 1).alias("time_str"))
         .with_columns([
             pl.col(date_col).str.strptime(pl.Date, format="%m/%d/%Y", strict=False).alias("service_date"),
@@ -101,12 +116,19 @@ def transform_wide_to_long(
 
 
 def add_time_columns(df_long: pl.DataFrame) -> pl.DataFrame:
-    """Add date/hour/weekday/is_weekend columns to long-format data."""
+    """
+    Add date/hour/weekday/is_weekend columns AND DST flags.
+    """
     return df_long.with_columns([
         pl.col("datetime").dt.date().alias("date"),
         pl.col("datetime").dt.hour().alias("hour"),
         pl.col("datetime").dt.weekday().alias("weekday"),
         (pl.col("datetime").dt.weekday() >= 5).alias("is_weekend"),
+    ]).with_columns([
+        # Flag DST transition days
+        (pl.col("date") == DST_SPRING_2023).alias("is_spring_forward_day"),
+        (pl.col("date") == DST_FALL_2023).alias("is_fall_back_day"),
+        ((pl.col("date") == DST_SPRING_2023) | (pl.col("date") == DST_FALL_2023)).alias("is_dst_day"),
     ])
 
 
@@ -114,16 +136,13 @@ def daily_interval_qc(df_long: pl.DataFrame) -> pl.DataFrame:
     """
     QC: Count intervals per account/day and flag DST transitions.
 
-    UPDATED: Only counts non-null kWh values to properly identify normal (48) vs DST days.
-
     Returns: DataFrame with day_type ('normal', 'spring_forward', 'fall_back', 'odd')
     """
     df = df_long.with_columns(pl.col("datetime").dt.date().alias("date"))
     return (
         df.group_by(["account_identifier", "date"])
         .agg([
-            pl.len().alias("total_intervals"),
-            pl.col("kwh").filter(pl.col("kwh").is_not_null()).len().alias("n_intervals"),
+            pl.len().alias("n_intervals"),
             pl.col("kwh").null_count().alias("null_intervals"),
             pl.col("kwh").sum().alias("sum_kwh"),
         ])
