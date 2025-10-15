@@ -3552,8 +3552,11 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "botocore" },
     { name = "cenpy" },
     { name = "ipykernel" },
+    { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "matplotlib", version = "3.10.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "openpyxl" },
     { name = "polars" },
     { name = "pyarrow" },
@@ -3583,8 +3586,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.46" },
+    { name = "botocore", specifier = ">=1.40.47" },
     { name = "cenpy", specifier = ">=1.0.1" },
     { name = "ipykernel", specifier = ">=6.30.1" },
+    { name = "matplotlib", specifier = ">=3.9.4" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "polars", specifier = ">=1.31.0" },
     { name = "pyarrow", specifier = ">=14.0.0" },
