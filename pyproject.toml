@@ -103,4 +103,4 @@ preview = true
 known_first_party = ["smart_meter_analysis"]
 
 [tool.deptry.per_rule_ignores]
-DEP002 = ["cenpy", "ipykernel", "openpyxl", "scikit-learn"]
+DEP002 = ["cenpy", "ipykernel", "openpyxl", "scikit-learn", "pyarrow"]
