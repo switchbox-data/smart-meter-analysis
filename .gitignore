@@ -174,3 +174,6 @@ data/interim/
 # Debug files
 *_sample_*.csv
 validate_*.py.bak
+archive/
+archive/
+archive/
