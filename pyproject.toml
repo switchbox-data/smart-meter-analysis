@@ -30,7 +30,7 @@ Repository = "https://github.com/switchbox-data/smart-meter-analysis"
 Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [tool.deptry]
-exclude = ["archive", ".venv"]
+exclude = ["archive", ".venv", "tests"]
 
 [tool.deptry.per_rule_ignores]
 DEP002 = [
@@ -42,12 +42,6 @@ DEP002 = [
 ]
 DEP003 = ["botocore"]
 DEP004 = ["botocore"]
-
-[tool.deptry.package_module_name_map]
-scripts = "scripts"
-
-[tool.deptry.per-file-ignores]
-"tests/*" = ["DEP003", "DEP004"]
 
 [dependency-groups]
 dev = [
