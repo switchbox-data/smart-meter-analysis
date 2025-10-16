@@ -1,7 +1,10 @@
+import pytest
+
+pytest.skip("smart_meter_analysis.census module removed during repo restructure", allow_module_level=True)
+
 """Tests for Census data module"""
 
 import polars as pl
-import pytest
 
 from smart_meter_analysis.census import (
     build_geoid,

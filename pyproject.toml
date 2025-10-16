@@ -131,6 +131,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
+"tests/test_aws_transform.py" = ["E402"]
+"tests/test_census.py" = ["E402"]
 "scripts/data_collection/*" = ["C901"]
 
 [tool.ruff.format]
