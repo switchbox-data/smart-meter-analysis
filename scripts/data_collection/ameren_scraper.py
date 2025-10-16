@@ -35,6 +35,9 @@ Known Limitations:
 - Large file downloads (5-7 GB) occasionally fail due to network/server issues
 - Page scraping intermittently returns 0 files; simply re-run if this occurs
 - Ameren's server may rate-limit or invalidate sessions unpredictably
+- If an S3 bucket is not provided, files are not saved locally--the program
+just exits.
+- If an S3 bucket is provided, the program will not check against local files
 
 These limitations are handled through the idempotent design - failures are
 expected and resolved by re-running the script.
@@ -291,7 +294,15 @@ def extract_date_from_filename(filename: str) -> str | None:
 def get_s3_key(filename: str) -> str:
     """Generate S3 key with folder structure: ameren-data/YYYYMM/filename.csv"""
     date_str = extract_date_from_filename(filename)
-    folder = date_str if date_str else "undated"
+
+    if date_str is None:
+        print(f"⚠️  WARNING: Could not extract date from filename: {filename}")
+        print("    Expected format: filename with YYYYMM (e.g., usage_202401.csv)")
+        print(f"    File will be stored in 'undated' folder: ameren-data/undated/{filename}")
+        folder = "undated"
+    else:
+        folder = date_str
+
     return f"ameren-data/{folder}/{filename}"
 
 
@@ -348,55 +359,24 @@ def ask_overwrite_permission(filename: str, s3_key: str, bucket: str) -> bool:
 # ============================================================================
 
 
-def process_single_file_with_fresh_session(
-    file_url: str, username: str, password: str, s3_client, bucket: str, force: bool
-) -> bool:
+def download_single_file_with_cookies(file_url: str, cookies: list[dict], s3_client, bucket: str) -> bool:
     """
-    Process a single file with its own browser session.
-    Creates fresh login, downloads one file, then closes browser.
+    Download one file using existing cookies. Then upload it to S3.
     """
     filename = file_url.rstrip("/").split("/")[-1]
     s3_key = get_s3_key(filename)
 
-    print(f"\n{'=' * 80}")
-    print(f"Processing: {filename}")
-    print(f"{'=' * 80}")
+    # Download using provided cookies (no browser needed)
+    local_path = download_csv(file_url, cookies, DOWNLOAD_DIR)
+    if not local_path:
+        return False
 
-    # Check if file already exists in S3
-    exists = file_exists_in_s3(s3_client, bucket, s3_key)
-    if exists and not force and not ask_overwrite_permission(filename, s3_key, bucket):
-        print(f"Skipping: {filename}")
-        return True
-    if exists:
-        print("  Will overwrite existing file")
+    upload_success = upload_to_s3(s3_client, local_path, bucket, s3_key)
 
-    # Create fresh browser session for this file
-    driver = setup_driver()
-    try:
-        print("Creating fresh session...")
-        cookies = login_and_get_cookies(driver, username, password)
+    if upload_success:
+        local_path.unlink()
 
-        # Download to local temp directory
-        local_path = download_csv(file_url, cookies, DOWNLOAD_DIR)
-        if not local_path:
-            return False
-
-        # Upload to S3
-        upload_success = upload_to_s3(s3_client, local_path, bucket, s3_key)
-
-        # Clean up local file after successful upload
-        if upload_success:
-            try:
-                local_path.unlink()
-                print("Deleted local file")
-            except Exception as e:
-                print(f"Warning: Could not delete local file: {e}")
-
-        return upload_success
-
-    finally:
-        driver.quit()
-        print("Closed browser session")
+    return upload_success
 
 
 def main():
@@ -417,16 +397,16 @@ def main():
         username, password = creds["username"], creds["password"]
     except Exception as e:
         print(f"ERROR: Failed to load credentials from {CREDENTIALS_FILE}: {e}")
-        return
+        return 1
 
-    # Initialize S3 client
+    # Initialize S3 client. If the program can't connect it exits.
     try:
         s3_client = boto3.client("s3")
         s3_client.list_buckets()
     except Exception as e:
         print(f"ERROR: Failed to connect to S3: {e}")
         print("Make sure AWS credentials are configured")
-        return
+        return 1
 
     # Get list of CSV files with initial browser session
     print("Scanning for CSV files...")
@@ -440,7 +420,7 @@ def main():
 
     if not csv_urls:
         print("ERROR: No CSV files found")
-        return
+        return 1
 
     print(f"\nFound {len(csv_urls)} file(s) to process")
     print("Each file will be downloaded in its own isolated session\n")
@@ -449,20 +429,48 @@ def main():
     successful = 0
     failed = 0
 
-    for i, file_url in enumerate(csv_urls, 1):
-        print(f"\nFile {i}/{len(csv_urls)}")
+    # Filter files already in S3
+    files_to_download = []
+    for url in csv_urls:
+        filename = url.rstrip("/").split("/")[-1]
+        s3_key = get_s3_key(filename)
 
-        if process_single_file_with_fresh_session(
-            file_url, username, password, s3_client, args.bucket_name, args.force
-        ):
-            successful += 1
-        else:
-            failed += 1
+        if file_exists_in_s3(s3_client, args.bucket_name, s3_key):
+            if not args.force:
+                print(f"Skipping {filename} - already in S3")
+                continue
+            else:
+                print(f"File {filename} exists but will re-download (--force)")
 
-        # Brief pause between files to be nice to the server
-        if i < len(csv_urls):
-            print("Waiting 5 seconds before next file...")
-            time.sleep(5)
+        files_to_download.append(url)
+
+    print(f"\nNeed to download: {len(files_to_download)} file(s)")
+
+    if not files_to_download:
+        print("Nothing to download!")
+        return 0
+
+    driver = setup_driver()
+    try:
+        print("Creating session...")
+        cookies = login_and_get_cookies(driver, username, password)
+
+        # Download all files in one session
+        for i, file_url in enumerate(files_to_download, 1):
+            print(f"\nFile {i}/{len(files_to_download)}")
+
+            if download_single_file_with_cookies(file_url, cookies, s3_client, args.bucket_name):
+                successful += 1
+            else:
+                failed += 1
+
+            # Brief pause between files to be nice to the server
+            if i < len(files_to_download):
+                print("Waiting 5 seconds before next file...")
+                time.sleep(5)
+    finally:
+        driver.quit()
+        print("Closed session")
 
     # Summary
     print(f"\n{'=' * 80}")
@@ -478,10 +486,10 @@ def main():
         print("  python scripts/data_collection/ameren_downloader.py --force")
         print("\nThe script will automatically skip files already in S3 and only")
         print("download the failed files. You may need to run 2-3 times total.")
+        return 1
     else:
         print("\nAll files successfully downloaded and uploaded to S3!")
-
-    print(f"{'=' * 80}")
+        return 0
 
 
 if __name__ == "__main__":
