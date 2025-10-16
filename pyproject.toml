@@ -43,6 +43,12 @@ DEP002 = [
 DEP003 = ["botocore"]
 DEP004 = ["botocore"]
 
+[tool.deptry.package_module_name_map]
+scripts = "scripts"
+
+[tool.deptry.per-file-ignores]
+"tests/*" = ["DEP003", "DEP004"]
+
 [dependency-groups]
 dev = [
     "pytest>=7.2.0",
