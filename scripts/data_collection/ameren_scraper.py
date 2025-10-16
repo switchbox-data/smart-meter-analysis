@@ -43,6 +43,8 @@ These limitations are handled through the idempotent design - failures are
 expected and resolved by re-running the script.
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 import time
