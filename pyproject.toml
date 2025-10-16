@@ -18,24 +18,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "boto3>=1.7.84",
     "pyyaml>=6.0.2",
     "requests>=2.32.4",
-    "selenium>=4.35.0",
-]
-
-
-[tool.deptry.per_rule_ignores]
-DEP002 = [
-  "ipykernel>=6.30.1",
-  "polars>=1.31.0",
-  "quarto>=0.1.0",
-  "beautifulsoup4>=4.12.0",
-  "webdriver-manager>=4.0.2",
-]
-
-dependencies = [
-    "requests>=2.31.0",
-    "pyyaml>=6.0",
     "selenium>=4.35.0",
 ]
 
@@ -44,9 +29,23 @@ Homepage = "https://switchbox-data.github.io/smart-meter-analysis/"
 Repository = "https://github.com/switchbox-data/smart-meter-analysis"
 Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
+[tool.deptry]
+exclude = ["archive", ".venv", "tests"]
+
+[tool.deptry.per_rule_ignores]
+DEP002 = [
+  "ipykernel>=6.30.1",
+  "quarto>=0.1.0",
+  "beautifulsoup4>=4.12.0",
+  "webdriver-manager>=4.0.2",
+]
+DEP003 = ["botocore"]
+DEP004 = ["botocore"]
+
 [dependency-groups]
 dev = [
     "pytest>=7.2.0",
+    "polars>=1.34.0",
     "pre-commit>=2.20.0",
     "tox-uv>=1.11.3",
     "deptry>=0.23.0",
@@ -56,6 +55,7 @@ dev = [
     "mkdocs-material>=8.5.10",
     "mkdocstrings[python]>=0.26.1",
 ]
+
 
 [build-system]
 requires = ["hatchling"]
@@ -81,6 +81,12 @@ testpaths = ["tests"]
 target-version = "py39"
 line-length = 120
 fix = true
+exclude = [
+    "archive/",
+    ".git",
+    ".venv",
+    "__pycache__",
+]
 
 [tool.ruff.lint]
 select = [
@@ -124,6 +130,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
+"tests/test_aws_transform.py" = ["E402"]
+"tests/test_census.py" = ["E402"]
+"scripts/data_collection/*" = ["C901"]
 
 [tool.ruff.format]
 preview = true
