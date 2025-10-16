@@ -30,7 +30,7 @@ Repository = "https://github.com/switchbox-data/smart-meter-analysis"
 Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [tool.deptry]
-exclude = ["archive"]
+exclude = ["archive", ".venv"]
 
 [tool.deptry.per_rule_ignores]
 DEP002 = [
