@@ -78,6 +78,12 @@ testpaths = ["tests"]
 target-version = "py39"
 line-length = 120
 fix = true
+exclude = [
+    "archive/",
+    ".git",
+    ".venv",
+    "__pycache__",
+]
 
 [tool.ruff.lint]
 select = [

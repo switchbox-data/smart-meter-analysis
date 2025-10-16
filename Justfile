@@ -49,17 +49,14 @@ clean:
 # -------------------- Ameren Data Collection --------------------
 
 # Download Ameren CSV files and upload to S3 (interactive mode)
-# Note: May require 2-3 runs due to server rate limiting
-# The script automatically skips files already in S3
+# Uses default bucket 'smart-meter-data-sb' unless specified with download-ameren-bucket
+# Note: Requires AWS credentials configured; script will fail without S3 access
+# May require 2-3 runs due to server rate limiting
+# Automatically skips files already in S3
+
 download-ameren:
     uv run python scripts/data_collection/ameren_scraper.py
 
 # Download Ameren files with force flag (skip all prompts, overwrite existing)
 download-ameren-force:
     uv run python scripts/data_collection/ameren_scraper.py --force
-
-# Download Ameren files to custom S3 bucket
-download-ameren-bucket BUCKET:
-    uv run python scripts/data_collection/ameren_scraper.py --bucket-name {{BUCKET}} --force
-
-echo "" >> Justfile
