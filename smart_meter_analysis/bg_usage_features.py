@@ -104,7 +104,7 @@ def _build_diurnal_features(bg_hourly: pl.DataFrame) -> pl.DataFrame:
     diurnal = (
         bg_hourly.group_by(["bg_geoid", "hour"])
         .agg(pl.mean("kwh").alias("kwh_hr"))
-        .pivot(values="kwh_hr", index="bg_geoid", columns="hour")
+        .pivot(values="kwh_hr", index="bg_geoid", on="hour")
     )
     for h in range(24):
         src = str(h)
@@ -117,7 +117,7 @@ def _build_seasonal_features(bg_hourly: pl.DataFrame) -> pl.DataFrame:
     season = (
         bg_hourly.group_by(["bg_geoid", "month"])
         .agg(pl.mean("kwh").alias("kwh_mo"))
-        .pivot(values="kwh_mo", index="bg_geoid", columns="month")
+        .pivot(values="kwh_mo", index="bg_geoid", on="month")
     )
     for m in range(1, 13):
         src = str(m)
