@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import polars as pl
@@ -27,7 +27,7 @@ class ProcessingStats:
     total_files: int = 0
     successful_files: int = 0
     failed_files: int = 0
-    failed_file_keys: list[str] | None = None
+    failed_file_keys: list[str] = field(default_factory=list)
 
     total_rows_raw: int = 0
     rows_with_zip4: int = 0
@@ -39,16 +39,10 @@ class ProcessingStats:
     unique_zip4s_unmapped: int = 0
     unique_bgs: int = 0
 
-    unmapped_zip4s: set[str] | None = None
+    unmapped_zip4s: set[str] = field(default_factory=set)
 
     bgs_below_min_days: int = 0
     bgs_above_min_days: int = 0
-
-    def __post_init__(self) -> None:
-        if self.unmapped_zip4s is None:
-            self.unmapped_zip4s = set()
-        if self.failed_file_keys is None:
-            self.failed_file_keys = []
 
     def compute_rates(self) -> dict[str, float]:
         return {
@@ -60,7 +54,7 @@ class ProcessingStats:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["unmapped_zip4s"] = list(self.unmapped_zip4s or [])[:100]
+        d["unmapped_zip4s"] = list(self.unmapped_zip4s)[:100]
         d["rates"] = self.compute_rates()
         return d
 
