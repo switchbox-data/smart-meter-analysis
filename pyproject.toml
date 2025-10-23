@@ -54,7 +54,8 @@ DEP002 = [
   "ipykernel",
   "openpyxl",
   "scikit-learn",
-  "pyarrow"
+  "pyarrow",
+  "numpy"
 ]
 DEP003 = ["botocore"]
 DEP004 = ["botocore"]
