@@ -147,8 +147,8 @@ cython_debug/
 *.kml
 *.zip
 
-# Ameren scraper files
-scripts/.secrets/
+# Passwords etc...
+.secrets/
 
 # Data files
 data/raw/
@@ -177,3 +177,8 @@ validate_*.py.bak
 archive/
 archive/
 archive/
+
+# project outputs
+out/
+# project outputs
+out/
