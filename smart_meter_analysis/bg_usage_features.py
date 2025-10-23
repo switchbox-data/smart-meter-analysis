@@ -60,7 +60,7 @@ class ProcessingStats:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["unmapped_zip4s"] = sorted(self.unmapped_zip4s)[:100]
+        d["unmapped_zip4s"] = list(self.unmapped_zip4s or [])[:100]
         d["rates"] = self.compute_rates()
         return d
 
@@ -77,7 +77,7 @@ def _add_time_features(df: pl.DataFrame) -> pl.DataFrame:
 def _build_summary_features(bg_hourly: pl.DataFrame) -> pl.DataFrame:
     daily = bg_hourly.group_by(["bg_geoid", "date"]).agg([
         pl.sum("kwh").alias("kwh_day"),
-        pl.sum(pl.when(pl.col("is_peak")).then(pl.col("kwh")).otherwise(0.0)).alias("kwh_peak"),
+        (pl.when(pl.col("is_peak")).then(pl.col("kwh")).otherwise(0.0)).sum().alias("kwh_peak"),
     ])
 
     feat = (
@@ -261,10 +261,11 @@ def build_bg_features_for_month(
     Path(out_features_parquet).parent.mkdir(parents=True, exist_ok=True)
     features.write_parquet(out_features_parquet)
     logger.info("Wrote %d BGs x %d features -> %s", *features.shape, out_features_parquet)
-
-    if out_quality_json is None:
-        out_quality_json = Path(out_features_parquet).with_suffix(".quality.json")
-    Path(out_quality_json).write_text(json.dumps(stats.to_dict(), indent=2))
+    quality_path = (
+        Path(out_quality_json) if out_quality_json else Path(out_features_parquet).with_suffix(".quality.json")
+    )
+    quality_path.write_text(json.dumps(stats.to_dict(), indent=2))
+    logger.info("Wrote quality -> %s", quality_path)
     logger.info("Wrote quality -> %s", out_quality_json)
 
     return stats
@@ -290,7 +291,6 @@ def build_bg_features_for_year(
     for m in range(1, 13):
         ym = f"{year}{m:02d}"
         keys = list_s3_files(ym, bucket=bucket, prefix=prefix, max_files=max_files_per_month)
-        stats.total_files += len(keys)
         for key in keys:
             try:
                 df_chunk = _bg_hourly_from_key(key, bucket, single_map, multi_slice, stats)
@@ -329,10 +329,11 @@ def build_bg_features_for_year(
     features.write_parquet(out_features_parquet)
     logger.info("Wrote %d BGs x %d features -> %s", *features.shape, out_features_parquet)
 
-    if out_quality_json is None:
-        out_quality_json = Path(out_features_parquet).with_suffix(".quality.json")
-    Path(out_quality_json).write_text(json.dumps(stats.to_dict(), indent=2))
-    logger.info("Wrote quality -> %s", out_quality_json)
+    quality_path = (
+        Path(out_quality_json) if out_quality_json else Path(out_features_parquet).with_suffix(".quality.json")
+    )
+    quality_path.write_text(json.dumps(stats.to_dict(), indent=2))
+    logger.info("Wrote quality -> %s", quality_path)
 
     return stats
 
