@@ -1,4 +1,4 @@
-# smart_meter_analysis/step0_aws.py
+# smart_meter_analysis/aws_loader.py
 """
 AWS S3 utilities for batch processing ComEd smart meter data.
 """
