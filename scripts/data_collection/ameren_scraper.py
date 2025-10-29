@@ -8,7 +8,11 @@ How it works:
 4) Skips files that already exist locally.
 """
 
+from __future__ import annotations
+
 import contextlib
+import logging
+import os
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -33,6 +37,9 @@ BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 
 PROGRESS_STEP_BYTES = 50 * 1024 * 1024
 
+# Module logger
+logger = logging.getLogger(__name__)
+
 
 def load_credentials(path: Path) -> dict:
     """Load YAML with keys: username, password."""
@@ -53,7 +60,7 @@ def setup_driver() -> webdriver.Chrome:
 
 def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str) -> list[dict]:
     """Open login page, submit credentials, wait for redirect, return cookies."""
-    print("Logging in…")
+    logger.info("Logging in…")
     driver.get("https://webftp.ameren.com/login")
 
     # Wait until the username input exists on the page.
@@ -68,13 +75,13 @@ def login_and_get_cookies(driver: webdriver.Chrome, username: str, password: str
 
     # Consider login successful when we leave the login URL.
     WebDriverWait(driver, 15).until(lambda d: d.current_url != "https://webftp.ameren.com/login")
-    print(f"Login successful → {driver.current_url}")
+    logger.info("Login successful → %s", driver.current_url)
     return driver.get_cookies()
 
 
 def list_csv_urls_in_folder(driver: webdriver.Chrome, folder_url: str) -> list[str]:
     """Visit folder page and collect all anchor hrefs ending with .csv."""
-    print(f"Opening folder: {folder_url}")
+    logger.info("Opening folder: %s", folder_url)
     driver.get(folder_url)
 
     # Handle lazy-loading by scrolling until page height stops changing.
@@ -98,13 +105,14 @@ def list_csv_urls_in_folder(driver: webdriver.Chrome, folder_url: str) -> list[s
             csv_urls.append(abs_url)
 
     # De-duplicate while preserving order
-    seen, unique = set(), []
+    seen: set[str] = set()
+    unique: list[str] = []
     for u in csv_urls:
         if u not in seen:
             seen.add(u)
             unique.append(u)
 
-    print(f"Found {len(unique)} CSV file(s).")
+    logger.info("Found %d CSV file(s).", len(unique))
     return unique
 
 
@@ -112,7 +120,6 @@ def make_authenticated_session(cookies: list[dict], referer: str) -> requests.Se
     """Build a requests.Session that carries Selenium cookies and headers."""
     s = requests.Session()
     for c in cookies:
-        # Domain/path can be added if needed
         s.cookies.set(c["name"], c["value"])
     s.headers.update({"User-Agent": BROWSER_USER_AGENT, "Referer": referer, "Accept": "*/*"})
     return s
@@ -123,16 +130,16 @@ def _print_content_headers(r: requests.Response) -> int | None:
     ctype = r.headers.get("content-type", "")
     clen = r.headers.get("content-length")
     if ctype:
-        print(f"Content-Type:   {ctype}")
+        logger.info("Content-Type:   %s", ctype)
     if clen:
         total_bytes = int(clen)
-        print(f"Content-Length: {total_bytes:,} bytes (~{total_bytes / 1024 / 1024 / 1024:.2f} GB)")
+        logger.info("Content-Length: %s bytes (~%.2f GB)", f"{total_bytes:,}", total_bytes / 1024 / 1024 / 1024)
         return total_bytes
     return None
 
 
 def _stream_to_file(r: requests.Response, filepath: Path, total_bytes: int | None) -> int:
-    """Write response body to `filepath` in 1 MB chunks; print 50MB progress; return size on disk."""
+    """Write response body to `filepath` in 1 MB chunks; DEBUG-log ~50MB progress; return size on disk."""
     chunk_size = 1024 * 1024  # 1 MB
     downloaded = 0
     with filepath.open("wb") as f:
@@ -141,18 +148,17 @@ def _stream_to_file(r: requests.Response, filepath: Path, total_bytes: int | Non
                 continue
             f.write(chunk)
             downloaded += len(chunk)
-            # Progress every ~50MB if total size known
             if total_bytes and downloaded % PROGRESS_STEP_BYTES == 0:
                 pct = (downloaded / total_bytes) * 100
                 downloaded_mb = downloaded // (1024 * 1024)
                 total_mb = total_bytes // (1024 * 1024)
-                print(f"Progress: {pct:5.1f}% ({downloaded_mb:,} MB / {total_mb:,} MB)")
+                logger.debug("Progress: %5.1f%% (%s MB / %s MB)", pct, f"{downloaded_mb:,}", f"{total_mb:,}")
     return filepath.stat().st_size
 
 
 def download_file_with_cookies(file_url: str, cookies: list[dict], out_dir: Path) -> bool:
     """
-    Stream one CSV to disk. Prints progress roughly every 50 MB (original behavior).
+    Stream one CSV to disk. Prints progress roughly every 50 MB.
     Returns True on success (non-empty file), False on failure (and removes partial).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -160,36 +166,32 @@ def download_file_with_cookies(file_url: str, cookies: list[dict], out_dir: Path
     filepath = out_dir / filename
 
     if filepath.exists():
-        print(f"[skip] {filename} already exists")
+        logger.info("[skip] %s already exists", filename)
         return True
 
-    print(f"Downloading: {filename}")
-    print(f"From:        {file_url}")
+    logger.info("Downloading: %s", filename)
+    logger.info("From:        %s", file_url)
 
     session = make_authenticated_session(cookies, referer=file_url.rsplit("/", 1)[0] + "/")
 
     try:
         with session.get(file_url, stream=True, timeout=60) as r:
             r.raise_for_status()
-
-            # Log headers & get total size (may be None)
             total_bytes = _print_content_headers(r)
-
-            # Stream to disk with your 50MB progress behavior
             size_on_disk = _stream_to_file(r, filepath, total_bytes)
 
-        print(f"Finished:   {filename} ({size_on_disk:,} bytes)")
+        logger.info("Finished:   %s (%s bytes)", filename, f"{size_on_disk:,}")
 
         if size_on_disk == 0:
-            print("File is empty; removing.")
+            logger.warning("File is empty; removing.")
             filepath.unlink(missing_ok=True)
             return False
         else:
             return True
 
-    except Exception as e:
-        print(f"Download failed for {filename}: {e}")
-        # Clean up partial file so future runs start cleanly
+    except Exception:
+        # .exception() already includes the exception info + traceback.
+        logger.exception("Download failed for %s", filename)
         with contextlib.suppress(Exception):
             filepath.unlink(missing_ok=True)
         return False
@@ -199,17 +201,27 @@ def download_all_csvs(cookies: list[dict], driver: webdriver.Chrome, out_dir: Pa
     """Find every .csv on the folder page and download each one."""
     urls = list_csv_urls_in_folder(driver, folder_url)
     ok, fail = 0, 0
+    failed_urls: list[str] = []
     for u in urls:
         if download_file_with_cookies(u, cookies, out_dir):
             ok += 1
         else:
             fail += 1
-    print(f"Summary: {ok} succeeded, {fail} failed.")
+            failed_urls.append(u)
+    logger.info("Summary: %d succeeded, %d failed.", ok, fail)
+    if failed_urls:
+        logger.error("Failed downloads (%d):\n%s", len(failed_urls), "\n".join(f"  • {u}" for u in failed_urls))
     return ok, fail
 
 
 def main() -> None:
     """Load credentials → login → list .csv links → download them → quit."""
+    # Basic logging config; override with LOGLEVEL=DEBUG for more detail.
+    logging.basicConfig(
+        level=os.environ.get("LOGLEVEL", "INFO"),
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+
     creds = load_credentials(CREDENTIALS_FILE)
     username, password = creds["username"], creds["password"]
 
