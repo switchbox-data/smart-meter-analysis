@@ -5,12 +5,11 @@ description = "This is the repo for the smart-meter-analysis project"
 authors = [{ name = "Switchbox", email = "hello@switch.box" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -30,7 +29,7 @@ dependencies = [
     "requests>=2.32.5",
     "scikit-learn>=1.6.1",
     "seaborn>=0.13.2",
-    "selenium>=4.32.0",
+    "selenium>=4.37.0",
 ]
 
 [project.urls]
@@ -38,9 +37,27 @@ Homepage = "https://switchbox-data.github.io/smart-meter-analysis/"
 Repository = "https://github.com/switchbox-data/smart-meter-analysis"
 Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
+[tool.deptry]
+exclude = ["archive", ".venv", "tests"]
+
+[tool.deptry.per_rule_ignores]
+DEP002 = [
+  "ipykernel",
+  "cenpy",
+  "openpyxl",
+  "scikit-learn",
+  "quarto",
+  "beautifulsoup4",
+  "webdriver-manager",
+  "pyarrow"
+]
+DEP003 = ["botocore"]
+DEP004 = ["botocore"]
+
 [dependency-groups]
 dev = [
     "pytest>=7.2.0",
+    "polars>=1.34.0",
     "pre-commit>=2.20.0",
     "tox-uv>=1.11.3",
     "deptry>=0.23.0",
@@ -51,6 +68,7 @@ dev = [
     "mkdocstrings[python]>=0.26.1",
     "boto3-stubs>=1.40.46",
 ]
+
 
 [build-system]
 requires = ["hatchling"]
@@ -82,6 +100,12 @@ markers = [
 target-version = "py39"
 line-length = 120
 fix = true
+exclude = [
+    "archive/",
+    ".git",
+    ".venv",
+    "__pycache__",
+]
 
 [tool.ruff.lint]
 select = [
@@ -94,13 +118,9 @@ ignore = ["E501", "E731"]
 "tests/*" = ["S101"]
 "scripts/diagnostics/*.py" = ["C901"]
 "smart_meter_analysis/pipeline_validator.py" = ["C901", "PGH003"]
+"tests/test_aws_transform.py" = ["E402"]
+"tests/test_census.py" = ["E402"]
+"scripts/data_collection/*" = ["C901"]
 
 [tool.ruff.format]
 preview = true
-
-[tool.deptry]
-# Ignore dependencies that will be used soon
-known_first_party = ["smart_meter_analysis"]
-
-[tool.deptry.per_rule_ignores]
-DEP002 = ["cenpy", "ipykernel", "openpyxl", "scikit-learn", "pyarrow"]

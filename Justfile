@@ -16,6 +16,25 @@ test:
     echo "🚀 Testing code: Running pytest"
     uv run python -m pytest --doctest-modules
 
+
+# =============================================================================
+# 🔍 CODE QUALITY & TESTING
+# =============================================================================
+
+check:
+    echo "🚀 Checking lock file consistency with 'pyproject.toml'"
+    uv lock --locked
+    echo "🚀 Linting code: Running pre-commit"
+    uv run pre-commit run -a
+    echo "🚀 Static type checking: Running mypy"
+    uv run mypy
+    echo "🚀 Checking for obsolete dependencies: Running deptry"
+    uv run deptry .
+
+test:
+    echo "🚀 Testing code: Running pytest"
+    uv run python -m pytest --doctest-modules
+
 # =============================================================================
 # 📚 DOCUMENTATION
 # =============================================================================
@@ -105,3 +124,19 @@ sample-city-file zips_file start end out bucket prefix target:=100 cm90:=""
 # Build visuals from a parquet you choose
 viz inp out
     python scripts/tasks/task_runner.py viz --inp "{{inp}}" --out "{{out}}"
+
+# =============================================================================
+# 🗄️  Ameren Data Collection
+# =============================================================================
+
+# Download Ameren CSV files and upload to S3 (interactive mode)
+# Uses default bucket 'smart-meter-data-sb' unless specified with download-ameren-bucket
+# Note: Requires AWS credentials configured; script will fail without S3 access
+# May require 2-3 runs due to server rate limiting
+# Automatically skips files already in S3
+download-ameren:
+    uv run python scripts/data_collection/ameren_scraper.py
+
+# Download Ameren files with force flag (skip all prompts, overwrite existing)
+download-ameren-force:
+    uv run python scripts/data_collection/ameren_scraper.py --force
