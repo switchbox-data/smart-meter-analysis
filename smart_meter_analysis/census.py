@@ -9,22 +9,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import cenpy as cen
 import polars as pl
 
 logger = logging.getLogger(__name__)
 
 # Census uses special codes for missing/suppressed data instead of nulls
 CENSUS_MISSING_CODES = [-666666666, -999999999, -888888888, -555555555, -222222222]
-
-
-def _import_cen() -> object:
-    try:
-        import cenpy as cen  # type: ignore[import-untyped]
-    except ImportError as e:
-        # TRY003 note handled below (short message)
-        raise ImportError("cenpy is required; install with: uv add cenpy") from e  # noqa: TRY003
-    else:
-        return cen
 
 
 def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
@@ -71,7 +62,6 @@ def fetch_acs_data(state_fips: str = "17", year: int = 2023) -> pl.DataFrame:
     Returns:
         DataFrame with ACS demographics by block group
     """
-    cen = _import_cen()
     logger.info(f"Fetching ACS {year} data for state {state_fips}")
 
     # Connect to ACS API
@@ -173,7 +163,6 @@ def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFra
     Returns:
         DataFrame with urban/rural classification by block group
     """
-    cen = _import_cen()
     logger.info(f"Fetching Decennial {year} data for state {state_fips}")
 
     conn_dhc = cen.remote.APIConnection(f"DECENNIALDHC{year}")  # type: ignore[attr-defined]
