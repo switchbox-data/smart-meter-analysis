@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import cenpy as cen
+import cenpy as cen  # type: ignore[import-untyped]
 import polars as pl
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def fetch_acs_data(state_fips: str = "17", year: int = 2023) -> pl.DataFrame:
     logger.info(f"Fetching ACS {year} data for state {state_fips}")
 
     # Connect to ACS API
-    conn_acs = cen.remote.APIConnection(f"ACSDP5Y{year}")  # type: ignore[attr-defined]
+    conn_acs = cen.remote.APIConnection(f"ACSDP5Y{year}")
 
     # Variable mappings
     acs_vars = {
@@ -165,7 +165,7 @@ def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFra
     """
     logger.info(f"Fetching Decennial {year} data for state {state_fips}")
 
-    conn_dhc = cen.remote.APIConnection(f"DECENNIALDHC{year}")  # type: ignore[attr-defined]
+    conn_dhc = cen.remote.APIConnection(f"DECENNIALDHC{year}")
 
     dhc_vars = {"H2_002N": "Urban_Housing_Units", "H2_003N": "Rural_Housing_Units"}
 

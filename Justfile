@@ -24,27 +24,27 @@ update:
 
 # Run pipeline on local sample data (fast, self-contained test)
 test-pipeline-local:
-    python scripts/run_comed_pipeline.py --source local
+   uv run python scripts/run_comed_pipeline.py --source local
 
 # Run full pipeline for a specific month from S3 (e.g., just pipeline 202308)
 pipeline YEAR_MONTH:
-    python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --source s3
+    uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --source s3
 
 # Test pipeline with limited S3 files (e.g., just test-pipeline 202308 10)
 test-pipeline YEAR_MONTH MAX_FILES="10":
-    python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --max-files {{MAX_FILES}} --source s3
+    uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --max-files {{MAX_FILES}} --source s3
 
 # Run pipeline skipping download step (if data already processed)
 pipeline-skip-download YEAR_MONTH:
-    python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --skip-download --source s3
+    uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --skip-download --source s3
 
 # Run pipeline with debug logging
 pipeline-debug YEAR_MONTH:
-    python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --debug --source s3
+    uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --debug --source s3
 
 # Step 1: Download and transform ComEd data from S3
 download-transform YEAR_MONTH MAX_FILES="":
-    python -m smart_meter_analysis.step0_aws {{YEAR_MONTH}} {{MAX_FILES}}
+    uv run python -m smart_meter_analysis.aws_loader {{YEAR_MONTH}} {{MAX_FILES}}
 
 # =============================================================================
 # 🧪 SAMPLE DATA (for testing)
@@ -52,23 +52,23 @@ download-transform YEAR_MONTH MAX_FILES="":
 
 # Download real sample files from S3 (default: 5 files from Aug 2023)
 download-samples YEAR_MONTH="202308" NUM_FILES="5":
-    python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files {{NUM_FILES}}
+    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files {{NUM_FILES}}
 
 # Download small sample set (3 files) - quick test
 download-samples-small YEAR_MONTH="202308":
-    python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 3
+    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 3
 
 # Download larger sample set (10 files) - thorough test
 download-samples-large YEAR_MONTH="202308":
-    python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 10
+    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 10
 
 # Generate synthetic sample data (for testing without S3 access)
 generate-samples:
-    python scripts/testing/generate_sample_data.py
+    uv run python scripts/testing/generate_sample_data.py
 
 # Generate sample data with custom parameters
 generate-samples-custom ACCOUNTS DAYS START_DATE:
-    python scripts/testing/generate_sample_data.py --num-accounts {{ACCOUNTS}} --num-days {{DAYS}} --start-date {{START_DATE}}
+    uv run python scripts/testing/generate_sample_data.py --num-accounts {{ACCOUNTS}} --num-days {{DAYS}} --start-date {{START_DATE}}
 
 # View a sample CSV file
 view-sample:
@@ -215,15 +215,15 @@ lab:
 
 # Quick data inspection (shows first N rows of a parquet file)
 inspect-data FILE N="10":
-    python -c "import polars as pl; df = pl.scan_parquet('{{FILE}}').limit({{N}}).collect(); print(df)"
+   uv run python -c "import polars as pl; df = pl.scan_parquet('{{FILE}}').limit({{N}}).collect(); print(df)"
 
 # Show schema of a parquet file
 inspect-schema FILE:
-    python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').collect_schema())"
+    uv run python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').collect_schema())"
 
 # Count rows in a parquet file
 count-rows FILE:
-    python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').select(pl.len()).collect())"
+    uv run python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').select(pl.len()).collect())"
 
 # =============================================================================
 # 🧹 UTILITIES
