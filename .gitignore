@@ -147,8 +147,8 @@ cython_debug/
 *.kml
 *.zip
 
-# Ameren scraper files
-scripts/.secrets/
+# Passwords etc...
+.secrets/
 
 # Data files
 data/raw/

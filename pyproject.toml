@@ -113,6 +113,7 @@ select = [
     "E", "W", "F", "PGH", "UP", "RUF", "TRY",
 ]
 ignore = ["E501", "E731"]
+extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
