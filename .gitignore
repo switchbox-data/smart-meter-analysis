@@ -151,14 +151,7 @@ cython_debug/
 .secrets/
 
 # Data files
-data/raw/
-data/processed/*.parquet
-data/interim/
-data/processed/*_full.parquet
-data/processed/census_*.parquet
-
-# But allow test files
-!data/processed/test_*.parquet
+data/
 
 # Temporary files
 scratch/
@@ -166,17 +159,14 @@ scratch/
 test_*.py
 debug_*.py
 
-# Data files (don't commit large data)
-data/raw/*.csv
-data/processed/*.parquet
-data/interim/
-
 # Debug files
 *_sample_*.csv
 validate_*.py.bak
 archive/
-archive/
-archive/
 
 # generated artifacts
 out/
+results/
+
+# benchmark artificats
+profiles/
