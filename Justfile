@@ -121,37 +121,32 @@ viz inp out:
     python scripts/tasks/task_runner.py viz --inp "{{inp}}" --out "{{out}}"
 
 # =============================================================================
-# 🧪 BENCHMARKING (EAGER VS LAZY)
+# 📊 BENCHMARKS (eager vs lazy)
 # =============================================================================
-# All benchmarks run through: scripts/bench/eager_vs_lazy_benchmarks.py
 
-# Run a benchmark on N files (100, 1000, 10000)
-bench-run MODE="lazy" N:
+# Run a specific benchmark: N in {100, 1000, 10000}
+bench-run N MODE="lazy":
     uv run python scripts/bench/eager_vs_lazy_benchmarks.py run \
         --mode {{MODE}} \
         --n {{N}}
 
-# Generate all S3 key manifests
-bench-manifests YEAR_MONTH:
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py build-manifests \
-        --year-month {{YEAR_MONTH}}
-
-# Generate S3 size report for Zip4
-bench-s3-size start="202101" end="202509":
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py s3-size \
-        --start {{start}} \
-        --end {{end}}
-
-# Build the summary CSV and PNG plots
+# Build summary CSV from stored profiles
 bench-summary:
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py summarize
+    uv run python scripts/bench/eager_vs_lazy_benchmarks.py summary
 
-# Clean benchmark artifacts
-bench-clean:
-    rm -rf results/manifests/*.txt
-    rm -rf results/parquet/*benchmark*
-    rm -rf profiles/mprof_*.dat
-    rm -rf profiles/cprof_*.prof
+# Plot memory curves (requires existing profiles)
+bench-plot:
+    uv run python scripts/bench/eager_vs_lazy_benchmarks.py plot
+
+# Run all benchmarks for eager + lazy
+bench-all:
+    just bench-run 100 eager
+    just bench-run 100 lazy
+    just bench-run 1000 eager
+    just bench-run 1000 lazy
+    just bench-run 10000 eager
+    # lazy 10k intentionally omitted (8+ hrs)
+    @echo "✔ Benchmark suite complete"
 
 # =============================================================================
 # 🔍 CODE QUALITY & TESTING
