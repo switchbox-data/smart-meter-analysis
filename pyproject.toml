@@ -51,7 +51,9 @@ DEP002 = [
   "quarto",
   "beautifulsoup4",
   "webdriver-manager",
-  "pyarrow"
+  "pyarrow",
+  "memory-profiler",
+  "snakeviz",
 ]
 DEP003 = ["botocore"]
 DEP004 = ["botocore"]
