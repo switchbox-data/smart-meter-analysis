@@ -1,16 +1,18 @@
 # smart_meter_analysis/census.py
 """
 Census data fetcher for demographic analysis.
-Fetches ACS 5-year and Decennial Census data at Block Group level.
+Fetches ACS 5-year (detailed tables) and Decennial Census data at Block Group level.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import cenpy as cen  # type: ignore[import-untyped]
 import polars as pl
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -53,101 +55,106 @@ def clean_census_values(df: pl.DataFrame) -> pl.DataFrame:
 
 def fetch_acs_data(state_fips: str = "17", year: int = 2023) -> pl.DataFrame:
     """
-    Fetch ACS 5-Year data at Block Group level.
+    Fetch ACS 5-Year *detailed table* data at Block Group level from the
+    official Census API.
 
     Args:
         state_fips: State FIPS code (default: '17' for Illinois)
-        year: ACS year (default: 2023)
+        year: ACS 5-year endpoint year (default: 2023)
 
     Returns:
-        DataFrame with ACS demographics by block group
+        DataFrame with ACS demographics by block group.
     """
-    logger.info(f"Fetching ACS {year} data for state {state_fips}")
+    logger.info(f"Fetching ACS {year} detailed-table data for state {state_fips}")
 
-    # Connect to ACS API
-    conn_acs = cen.remote.APIConnection(f"ACSDP5Y{year}")
-
-    # Variable mappings
-    acs_vars = {
-        "DP02_0001E": "Total_Households",
-        "DP02_0016E": "Avg_Household_Size",
-        "DP02_0017E": "Avg_Family_Size",
-        "DP02_0060E": "Less_9th_Grade",
-        "DP02_0062E": "High_School_Dip",
-        "DP02_0063E": "Some_College",
-        "DP02_0064E": "Associates_Deg",
-        "DP02_0065E": "Bachelors_Deg",
-        "DP02_0066E": "Grad_Professional_Deg",
-        "DP03_0052E": "Income_Less_10k",
-        "DP03_0053E": "Income_10k_to_15k",
-        "DP03_0054E": "Income_15k_to_25k",
-        "DP03_0055E": "Income_25k_to_35k",
-        "DP03_0056E": "Income_35k_to_50k",
-        "DP03_0057E": "Income_50k_to_75k",
-        "DP03_0058E": "Income_75k_to_100k",
-        "DP03_0059E": "Income_100k_to_150k",
-        "DP03_0060E": "Income_150k_to_200k",
-        "DP03_0061E": "Income_200k_Plus",
-        "DP03_0062E": "Median_Household_Income",
-        "DP04_0001E": "Total_Housing_Units",
-        "DP04_0002E": "Occupied_Housing_Units",
-        "DP04_0003E": "Vacant_Housing_Units",
-        "DP04_0017E": "Built_2020_After",
-        "DP04_0018E": "Built_2010_2019",
-        "DP04_0019E": "Built_2000_2009",
-        "DP04_0020E": "Built_1990_1999",
-        "DP04_0021E": "Built_1980_1989",
-        "DP04_0022E": "Built_1970_1979",
-        "DP04_0023E": "Built_1960_1969",
-        "DP04_0024E": "Built_1950_1959",
-        "DP04_0025E": "Built_1940_1949",
-        "DP04_0026E": "Built_Before_1940",
-        "DP04_0028E": "Rooms_1",
-        "DP04_0029E": "Rooms_2",
-        "DP04_0030E": "Rooms_3",
-        "DP04_0031E": "Rooms_4",
-        "DP04_0032E": "Rooms_5",
-        "DP04_0033E": "Rooms_6",
-        "DP04_0034E": "Rooms_7",
-        "DP04_0035E": "Rooms_8",
-        "DP04_0036E": "Rooms_9_Plus",
-        "DP04_0046E": "Owner_Occupied",
-        "DP04_0047E": "Renter_Occupied",
-        "DP04_0063E": "Heat_Utility_Gas",
-        "DP04_0065E": "Heat_Electric",
-        "DP05_0006E": "Age_5_to_9",
-        "DP05_0007E": "Age_10_to_14",
-        "DP05_0008E": "Age_15_to_19",
-        "DP05_0009E": "Age_20_to_24",
-        "DP05_0010E": "Age_25_to_34",
-        "DP05_0011E": "Age_35_to_44",
-        "DP05_0012E": "Age_45_to_54",
-        "DP05_0013E": "Age_55_to_59",
-        "DP05_0014E": "Age_60_to_64",
-        "DP05_0015E": "Age_65_to_74",
-        "DP05_0016E": "Age_75_to_84",
-        "DP05_0017E": "Age_85_Plus",
-        "DP04_0081E": "Value_Less_50k",
-        "DP04_0082E": "Value_50k_to_100k",
-        "DP04_0083E": "Value_100k_to_150k",
-        "DP04_0084E": "Value_150k_to_200k",
-        "DP04_0085E": "Value_200k_to_300k",
-        "DP04_0086E": "Value_300k_to_500k",
-        "DP04_0087E": "Value_500k_to_1M",
-        "DP04_0088E": "Value_1M_Plus",
+    acs_vars: dict[str, str] = {
+        # Households & income
+        # B11001_001E: Household Type (Including Living Alone) -> Total households
+        "B11001_001E": "Total_Households",
+        # B19013_001E: Median household income in the past 12 months
+        "B19013_001E": "Median_Household_Income",
+        # Housing units & tenure
+        # B25001_001E: Housing Units (total)
+        "B25001_001E": "Total_Housing_Units",
+        # B25003_001E: Occupied housing units (total)
+        "B25003_001E": "Occupied_Housing_Units",
+        # B25003_002E: Owner-occupied
+        "B25003_002E": "Owner_Occupied",
+        # B25003_003E: Renter-occupied
+        "B25003_003E": "Renter_Occupied",
+        # Year structure built (B25034)
+        # B25034_002E: Built 2020 or later
+        "B25034_002E": "Built_2020_After",
+        # B25034_003E: Built 2010 to 2019
+        "B25034_003E": "Built_2010_2019",
+        # B25034_004E: Built 2000 to 2009
+        "B25034_004E": "Built_2000_2009",
+        # B25034_005E: Built 1990 to 1999
+        "B25034_005E": "Built_1990_1999",
+        # B25034_006E: Built 1980 to 1989
+        "B25034_006E": "Built_1980_1989",
+        # B25034_007E: Built 1970 to 1979
+        "B25034_007E": "Built_1970_1979",
+        # B25034_008E: Built 1960 to 1969
+        "B25034_008E": "Built_1960_1969",
+        # B25034_009E: Built 1950 to 1959
+        "B25034_009E": "Built_1950_1959",
+        # B25034_010E: Built 1940 to 1949
+        "B25034_010E": "Built_1940_1949",
+        # B25034_011E: Built 1939 or earlier
+        "B25034_011E": "Built_1939_Earlier",
+        # Heating fuel (B25040)
+        # B25040_002E: Utility gas
+        "B25040_002E": "Heat_Utility_Gas",
+        # B25040_004E: Electricity
+        "B25040_004E": "Heat_Electric",
     }
 
-    # Query ACS data at BLOCK GROUP level
-    acs_df = conn_acs.query(
-        cols=["NAME", *list(acs_vars.keys())], geo_unit="block group", geo_filter={"state": state_fips}
-    )
+    # ------------------------------------------------------------------
+    # Call Census API directly (acs/acs5)
+    # ------------------------------------------------------------------
+    base_url = f"https://api.census.gov/data/{year}/acs/acs5"
 
-    logger.info(f"Retrieved {len(acs_df)} block groups from ACS")
+    params: dict[str, str] = {
+        "get": ",".join(["NAME", *acs_vars.keys()]),
+        "for": "block group:*",
+        "in": f"state:{state_fips} county:*",
+    }
 
-    # Convert to Polars
-    acs_df = pl.from_pandas(acs_df)
+    api_key = os.getenv("CENSUS_API_KEY")
+    if api_key:
+        params["key"] = api_key
+
+    resp = requests.get(base_url, params=params, timeout=60)
+    resp.raise_for_status()
+
+    data = resp.json()
+    if not data or len(data) < 2:
+        raise RuntimeError("ACS API returned no data")
+
+    header = data[0]
+    rows = data[1:]
+
+    # Build a Polars DataFrame directly from the raw rows.
+    acs_df = pl.DataFrame(rows, schema=header)
+
+    logger.info(f"Retrieved {acs_df.height} block groups from ACS (detailed tables)")
+
+    # GEOID + friendly names
     acs_df = build_geoid(acs_df)
-    acs_df = acs_df.rename({k: v for k, v in acs_vars.items() if k in acs_df.columns})
+
+    # Rename B-table columns to friendlier names
+    rename_map = {var: name for var, name in acs_vars.items() if var in acs_df.columns}
+    acs_df = acs_df.rename(rename_map)
+
+    # Cast numeric columns where possible (everything except identifiers)
+    non_numeric = {"NAME", "GEOID", "state", "county", "tract", "block group"}
+    numeric_cols = [c for c in acs_df.columns if c not in non_numeric]
+
+    acs_df = acs_df.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in numeric_cols])
+
+    # Clean special missing codes
+    acs_df = clean_census_values(acs_df)
 
     return acs_df
 
@@ -165,31 +172,44 @@ def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFra
     """
     logger.info(f"Fetching Decennial {year} data for state {state_fips}")
 
+    # DHC 2020 = /data/2020/dec/dhc
     conn_dhc = cen.remote.APIConnection(f"DECENNIALDHC{year}")
 
-    dhc_vars = {"H2_002N": "Urban_Housing_Units", "H2_003N": "Rural_Housing_Units"}
+    # H2 = URBAN AND RURAL table in the DHC detailed tables
+    dhc_vars = {
+        "H2_002N": "Urban_Housing_Units",  # !!Total:!!Urban
+        "H2_003N": "Rural_Housing_Units",  # !!Total:!!Rural
+    }
 
-    # Query at BLOCK GROUP level
     dhc_df = conn_dhc.query(
-        cols=["NAME", *list(dhc_vars.keys())], geo_unit="block group", geo_filter={"state": state_fips}
+        cols=["NAME", *list(dhc_vars.keys())],
+        geo_unit="block group:*",
+        geo_filter={"state": state_fips, "county": "*", "tract": "*"},
     )
 
-    logger.info(f"Retrieved {len(dhc_df)} block groups from Decennial Census")
+    logger.info(f"Retrieved {len(dhc_df)} block groups from Decennial Census (DHC H2 urban/rural)")
 
     # Convert to Polars
     dhc_df = pl.from_pandas(dhc_df)
+
+    # Build standard 12-digit GEOID from state / county / tract / block group
     dhc_df = build_geoid(dhc_df)
+
+    # Rename to friendlier column names if present
     dhc_df = dhc_df.rename({k: v for k, v in dhc_vars.items() if k in dhc_df.columns})
 
-    # Calculate urban/rural metrics
+    # Ensure numeric types
     dhc_df = dhc_df.with_columns([
-        pl.col("Urban_Housing_Units").cast(pl.Float64),
-        pl.col("Rural_Housing_Units").cast(pl.Float64),
-    ]).with_columns([
+        pl.col("Urban_Housing_Units").cast(pl.Float64, strict=False),
+        pl.col("Rural_Housing_Units").cast(pl.Float64, strict=False),
+    ])
+
+    # Calculate urban share and a simple classification
+    dhc_df = dhc_df.with_columns([
         safe_percent(
-            pl.col("Urban_Housing_Units"), pl.col("Urban_Housing_Units") + pl.col("Rural_Housing_Units")
+            pl.col("Urban_Housing_Units"),
+            pl.col("Urban_Housing_Units") + pl.col("Rural_Housing_Units"),
         ).alias("Urban_Percent"),
-        # Classify based on majority
         pl.when((pl.col("Urban_Housing_Units") + pl.col("Rural_Housing_Units")) == 0)
         .then(pl.lit("No Housing"))
         .when(pl.col("Urban_Housing_Units") > pl.col("Rural_Housing_Units"))
@@ -212,7 +232,7 @@ def fetch_census_data(
 
     Args:
         state_fips: State FIPS code (default: '17' for Illinois)
-        acs_year: ACS year (default: 2023)
+        acs_year: ACS year (default: 2023, 5-year ACS detailed tables)
         decennial_year: Decennial Census year (default: 2020)
         output_path: Optional path to save combined data as Parquet
 
@@ -225,12 +245,14 @@ def fetch_census_data(
 
     # Merge
     census_df = acs_df.join(
-        dhc_df.select(["GEOID", "Urban_Percent", "Urban_Rural_Classification"]), on="GEOID", how="left"
+        dhc_df.select(["GEOID", "Urban_Percent", "Urban_Rural_Classification"]),
+        on="GEOID",
+        how="left",
     )
 
     logger.info(f"Combined dataset: {census_df.height} block groups")
 
-    # Convert string numerics to float
+    # Convert string numerics to float (just in case anything slipped through)
     numeric_cols = [col for col in census_df.columns if col not in ["NAME", "GEOID", "Urban_Rural_Classification"]]
 
     census_df = census_df.with_columns([
