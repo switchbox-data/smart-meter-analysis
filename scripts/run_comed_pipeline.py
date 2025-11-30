@@ -342,7 +342,7 @@ class ComedPipeline:
             str(sample_zips),
         ]
 
-        logger.info(f"Preparing clustering data (sampling {sample_zips} ZIP+4s × {sample_days} days)")
+        logger.info(f"Preparing clustering data (sampling {sample_zips} ZIP+4s x {sample_days} days)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
