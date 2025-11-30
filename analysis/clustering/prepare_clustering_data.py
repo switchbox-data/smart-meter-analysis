@@ -475,7 +475,7 @@ def create_daily_profiles(
     # Get and log stats
     stats = get_output_stats(profiles_path)
     logger.info(f"  ✓ Profiles: {profiles_path}")
-    logger.info(f"    {stats['n_profiles']:,} profiles ({stats['n_zips']} ZIP+4s × {stats['n_dates']} days)")
+    logger.info(f"    {stats['n_profiles']:,} profiles ({stats['n_zips']} ZIP+4s x {stats['n_dates']} days)")
     logger.info(f"  ✓ Demographics: {demographics_path}")
 
     # -------------------------------------------------------------------------
