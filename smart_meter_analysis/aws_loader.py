@@ -166,7 +166,7 @@ def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.La
     Day attribution modes:
     - "calendar": date == datetime.date()
     - "billing":  date == datetime.date(), except 00:00 rows are shifted to the previous date
-                  (so HR2400 is attributed to the prior day).
+                (so HR2400 is attributed to the prior day).
     """
     from datetime import date as _date
 
