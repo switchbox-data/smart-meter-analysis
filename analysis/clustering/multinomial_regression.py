@@ -1,26 +1,21 @@
+#!/usr/bin/env python3
 """
-Stage 2: Multinomial Logistic Regression for Cluster Prediction
+Step 2 of the ComEd Smart Meter Clustering Pipeline: Multinomial Logistic Regression
+for Cluster Prediction
 
 Predicts energy usage cluster membership from Census demographic variables.
-This analysis identifies which demographic factors are associated with different
-electricity consumption patterns.
-
-This script handles all census data operations internally:
-    - Fetches census data from API (or uses cache)
-    - Joins with ZIP+4 crosswalk
-    - Runs multinomial logistic regression
 
 Pipeline:
-    1. Load cluster assignments from Stage 1
-    2. Aggregate to one cluster per ZIP+4 (modal cluster)
+    1. Load cluster assignments
+    2. Aggregate to one cluster per household
     3. Fetch/load Census demographics
-    4. Join with ZIP+4 crosswalk
+    4. Join households → ZIP+4 → block group → demographics
     5. Run multinomial logistic regression
     6. Output coefficients, odds ratios, and model diagnostics
 
 Usage:
-    python multinomial_regression.py \\
-        --clusters data/clustering/results/cluster_assignments.parquet \\
+    python multinomial_regression.py \
+        --clusters data/clustering/results/cluster_assignments.parquet \
         --output-dir data/clustering/results/stage2
 """
 
@@ -49,60 +44,100 @@ logger = logging.getLogger(__name__)
 
 def load_cluster_assignments(path: Path) -> pl.DataFrame:
     """
-    Load cluster assignments and aggregate to one cluster per ZIP+4.
+    Load cluster assignments and aggregate to one cluster per household (or ZIP+4).
 
-    Each ZIP+4 may have multiple daily profiles assigned to different clusters.
-    We take the modal cluster as the ZIP+4's characteristic pattern.
+    Each household may have multiple daily profiles assigned to different clusters.
+    We take the modal cluster as the household's characteristic pattern.
+
+    For legacy ZIP+4-level clustering, the same logic is applied at the ZIP+4 level.
 
     Args:
         path: Path to cluster_assignments.parquet
 
     Returns:
-        DataFrame with one row per ZIP+4 and its dominant cluster
-        Columns: zip_code, cluster, n_profiles, confidence_pct
+        DataFrame with one row per household/ZIP+4 and its dominant cluster
+
+        Household-level:
+            Columns: account_identifier, zip_code, cluster, n_profiles, confidence_pct
+
+        ZIP+4-level (legacy):
+            Columns: zip_code, cluster, n_profiles, confidence_pct
     """
     logger.info(f"Loading cluster assignments from {path}")
 
     # Lazy scan for scalability
     assignments = pl.scan_parquet(path)
+    schema = assignments.collect_schema()
 
-    # Count profiles per (zip_code, cluster)
-    counts = assignments.group_by(["zip_code", "cluster"]).agg(pl.len().alias("n_profiles"))
+    if "cluster" not in schema.names():
+        raise ValueError("Cluster assignments file must contain a 'cluster' column.")
 
-    # After aggregation, collect (this is now much smaller than raw assignments)
+    if "account_identifier" in schema.names():
+        # Household-level clustering
+        group_col = "account_identifier"
+        logger.info("  Detected household-level cluster assignments")
+    else:
+        # Legacy ZIP+4-level clustering
+        group_col = "zip_code"
+        logger.info("  Detected ZIP+4-level cluster assignments (legacy)")
+
+    # Count profiles per (group, cluster)
+    group_cols = [group_col, "zip_code", "cluster"] if group_col == "account_identifier" else [group_col, "cluster"]
+
+    counts = assignments.group_by(group_cols).agg(pl.len().alias("n_profiles"))
+
+    # After aggregation, collect (much smaller than raw assignments)
     counts_df = counts.collect(engine="streaming")
 
+    if counts_df.is_empty():
+        raise ValueError(f"No cluster assignments found in {path}")
+
     total_profiles = int(counts_df["n_profiles"].sum())
-    n_zip_codes = counts_df["zip_code"].n_unique()
+    n_groups = counts_df[group_col].n_unique()
     n_clusters = counts_df["cluster"].n_unique()
 
     logger.info(f"  {total_profiles:,} profile assignments")
-    logger.info(f"  {n_zip_codes} unique ZIP+4 codes")
+    logger.info(f"  {n_groups:,} unique {group_col}s")
     logger.info(f"  {n_clusters} clusters")
 
-    # Total profiles per ZIP+4
-    totals = counts_df.group_by("zip_code").agg(pl.col("n_profiles").sum().alias("total_profiles"))
+    # Total profiles per group
+    totals = counts_df.group_by(group_col).agg(pl.col("n_profiles").sum().alias("total_profiles"))
 
-    # Modal cluster per ZIP+4 (cluster with max n_profiles)
-    modal = (
-        counts_df.sort(["zip_code", "n_profiles"], descending=[False, True])
-        .group_by("zip_code")
-        .agg(
-            pl.col("cluster").first().alias("cluster"),
-            pl.col("n_profiles").first().alias("n_profiles"),
+    # Modal cluster per group (cluster with max n_profiles)
+    if group_col == "account_identifier":
+        modal = (
+            counts_df.sort([group_col, "n_profiles"], descending=[False, True])
+            .group_by(group_col)
+            .agg(
+                pl.col("cluster").first().alias("cluster"),
+                pl.col("zip_code").first().alias("zip_code"),
+                pl.col("n_profiles").first().alias("n_profiles"),
+            )
         )
+    else:
+        modal = (
+            counts_df.sort([group_col, "n_profiles"], descending=[False, True])
+            .group_by(group_col)
+            .agg(
+                pl.col("cluster").first().alias("cluster"),
+                pl.col("n_profiles").first().alias("n_profiles"),
+            )
+        )
+
+    result = modal.join(totals, on=group_col).with_columns(
+        (pl.col("n_profiles") / pl.col("total_profiles") * 100.0).alias("confidence_pct")
     )
 
-    zip_clusters = (
-        modal.join(totals, on="zip_code")
-        .with_columns((pl.col("n_profiles") / pl.col("total_profiles") * 100.0).alias("confidence_pct"))
-        .select(["zip_code", "cluster", "n_profiles", "confidence_pct"])
-    )
+    # Select final columns
+    if group_col == "account_identifier":
+        result = result.select(["account_identifier", "zip_code", "cluster", "n_profiles", "confidence_pct"])
+    else:
+        result = result.select(["zip_code", "cluster", "n_profiles", "confidence_pct"])
 
-    logger.info(f"  Aggregated to {len(zip_clusters)} ZIP+4 codes")
-    logger.info(f"  Mean cluster confidence: {zip_clusters['confidence_pct'].mean():.1f}%")
+    logger.info(f"  Aggregated to {len(result):,} {group_col}s")
+    logger.info(f"  Mean cluster confidence: {result['confidence_pct'].mean():.1f}%")
 
-    return zip_clusters
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +153,9 @@ def fetch_or_load_census(
 ) -> pl.DataFrame:
     """
     Fetch census data from API or load from cache.
+
+    Expects the census DataFrame to include a 'GEOID' column that identifies
+    block groups as 12-digit strings.
 
     Args:
         cache_path: Path to cache file
@@ -143,6 +181,9 @@ def fetch_or_load_census(
 
     census_df = fetch_census_data(state_fips=state_fips, acs_year=acs_year)
 
+    if "GEOID" not in census_df.columns:
+        raise ValueError("Census DataFrame must contain a 'GEOID' column.")
+
     # Cache for future use
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     census_df.write_parquet(cache_path)
@@ -157,7 +198,7 @@ def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
 
     Args:
         crosswalk_path: Path to crosswalk file (tab-separated)
-        zip_codes: List of ZIP+4 codes to filter to
+        zip_codes: List of ZIP+4 codes (may contain duplicates)
 
     Returns:
         DataFrame with zip_code and block_group_geoid columns
@@ -181,8 +222,9 @@ def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
         .select(["zip_code", "block_group_geoid"])
     )
 
+    unique_zip4s = len(set(zip_codes))
     n_matched = crosswalk["zip_code"].n_unique()
-    logger.info(f"  Matched {n_matched} of {len(zip_codes)} ZIP+4 codes")
+    logger.info(f"  Matched {n_matched} of {unique_zip4s} unique ZIP+4 codes")
 
     return crosswalk
 
@@ -193,6 +235,10 @@ def join_census_to_zip4(
 ) -> pl.DataFrame:
     """
     Join census demographics to ZIP+4 codes via crosswalk.
+
+    NOTE:
+        If a ZIP+4 maps to multiple block groups in the crosswalk, this join
+        will produce multiple rows per ZIP+4 (one per block group).
 
     Args:
         crosswalk: ZIP+4 to block group mapping
@@ -206,12 +252,12 @@ def join_census_to_zip4(
     # Standardize census GEOID
     census_df = census_df.with_columns(pl.col("GEOID").cast(pl.Utf8).str.zfill(12).alias("block_group_geoid"))
 
-    # Join
+    # Join lazily for scalability
     demographics = (
         crosswalk.lazy().join(census_df.lazy(), on="block_group_geoid", how="left").collect(engine="streaming")
     )
 
-    logger.info(f"  Joined {demographics['zip_code'].n_unique()} ZIP+4 codes")
+    logger.info(f"  Joined {demographics['zip_code'].n_unique()} unique ZIP+4 codes")
 
     return demographics
 
@@ -220,7 +266,7 @@ def get_numeric_census_columns(census_df: pl.DataFrame) -> list[str]:
     """
     Get all numeric columns from census data that can be used as predictors.
 
-    Excludes ID columns, geographic identifiers, and cluster assignment columns.
+    Excludes ID columns, geographic identifiers, and cluster / ZIP code columns.
 
     Args:
         census_df: Census DataFrame
@@ -233,15 +279,28 @@ def get_numeric_census_columns(census_df: pl.DataFrame) -> list[str]:
     # Also exclude cluster assignment columns (not census data)
     exclude_exact = ["cluster", "n_profiles", "confidence_pct", "total_profiles", "zip_code"]
 
-    numeric_cols = []
+    numeric_types = {
+        pl.Float64,
+        pl.Float32,
+        pl.Int64,
+        pl.Int32,
+        pl.Int16,
+        pl.Int8,
+        pl.UInt64,
+        pl.UInt32,
+        pl.UInt16,
+        pl.UInt8,
+    }
+
+    numeric_cols: list[str] = []
     for col in census_df.columns:
         # Skip exact matches
         if col in exclude_exact:
             continue
         # Skip non-numeric
-        if census_df[col].dtype not in [pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.Int8]:
+        if census_df[col].dtype not in numeric_types:
             continue
-        # Skip ID/geographic columns
+        # Skip ID/geographic columns by pattern
         if any(pattern.lower() in col.lower() for pattern in exclude_patterns):
             continue
         numeric_cols.append(col)
@@ -265,19 +324,27 @@ def prepare_regression_data(
     dynamically from the census data.
 
     Args:
-        zip_clusters: ZIP+4 cluster assignments
-        demographics: ZIP+4 demographics
+        zip_clusters: Household/ZIP+4 cluster assignments (must include 'zip_code' and 'cluster')
+        demographics: ZIP+4 demographics from join_census_to_zip4
 
     Returns:
         Tuple of (regression DataFrame, list of predictor column names)
     """
     logger.info("Preparing regression dataset...")
 
-    # Join clusters with demographics
+    if "zip_code" not in zip_clusters.columns:
+        raise ValueError("zip_clusters DataFrame must contain a 'zip_code' column.")
+    if "cluster" not in zip_clusters.columns:
+        raise ValueError("zip_clusters DataFrame must contain a 'cluster' column.")
+
+    # Join clusters with demographics on ZIP+4
     data = zip_clusters.join(demographics, on="zip_code", how="left")
 
     # Check match rate
-    matched = data.filter(pl.col("block_group_geoid").is_not_null()).height
+    if "block_group_geoid" in data.columns:
+        matched = data.filter(pl.col("block_group_geoid").is_not_null()).height
+    else:
+        matched = 0
     match_rate = matched / len(data) * 100 if len(data) > 0 else 0.0
     logger.info(f"  Demographic match rate: {match_rate:.1f}%")
 
@@ -291,11 +358,11 @@ def prepare_regression_data(
     if not predictors:
         raise ValueError("No numeric predictor columns found in census data.")
 
-    # Filter to rows with valid cluster and at least some predictor data
+    # Filter to rows with valid cluster
     data = data.filter(pl.col("cluster").is_not_null())
 
     # Drop predictors that are mostly null (>50% missing)
-    valid_predictors = []
+    valid_predictors: list[str] = []
     for pred in predictors:
         null_rate = data[pred].null_count() / len(data)
         if null_rate < 0.5:
@@ -306,6 +373,9 @@ def prepare_regression_data(
     predictors = valid_predictors
     logger.info(f"  Using {len(predictors)} predictor variables after filtering")
     logger.info(f"  Final dataset: {len(data)} observations")
+
+    if not predictors:
+        raise ValueError("No predictors left after filtering for missingness.")
 
     return data, predictors
 
@@ -361,6 +431,7 @@ def run_multinomial_regression(
 
     # Fit multinomial logistic regression
     model = LogisticRegression(
+        multi_class="multinomial",
         solver="lbfgs",
         max_iter=1000,
         random_state=42,
@@ -469,7 +540,6 @@ def generate_report(
     for cluster in results["clusters"]:
         cluster_key = f"cluster_{cluster}"
         lines.append(f"\nCluster {cluster}:")
-
         for pred_info in key_predictors[cluster_key]:
             direction = "↑" if pred_info["direction"] == "positive" else "↓"
             lines.append(
@@ -513,12 +583,12 @@ def main() -> None:
         epilog="""
 Examples:
     # Basic usage (auto-fetches census if needed)
-    python multinomial_regression.py \\
+    python multinomial_regression.py \
         --clusters data/clustering/results/cluster_assignments.parquet
 
     # Force re-fetch of census data
-    python multinomial_regression.py \\
-        --clusters data/clustering/results/cluster_assignments.parquet \\
+    python multinomial_regression.py \
+        --clusters data/clustering/results/cluster_assignments.parquet \
         --fetch-census
         """,
     )
@@ -575,7 +645,7 @@ Examples:
     # Validate inputs
     if not args.clusters.exists():
         logger.error(f"Cluster assignments not found: {args.clusters}")
-        logger.error("Run Stage 1 (dtw_clustering.py) first")
+        logger.error("Run Stage 1 (euclidean_clustering.py) first")
         return
 
     if not args.crosswalk.exists():

@@ -3,7 +3,8 @@
 ComEd Smart Meter Analysis Pipeline
 
 Main entry point for the ComEd smart meter clustering analysis. This script
-handles the complete workflow from raw S3 data to clustered load profiles.
+handles the complete workflow from raw S3 data to clustered household load
+profiles and (optionally) demographic regression.
 
 ================================================================================
 PIPELINE OVERVIEW
@@ -12,12 +13,12 @@ PIPELINE OVERVIEW
 Stage 1: Usage Pattern Clustering (this script)
     1. Download    - Fetch CSV files from S3
     2. Process     - Transform wide→long, add time features, write parquet
-    3. Aggregate   - Create daily load profiles per ZIP+4
-    4. Cluster     - DTW k-means to identify usage patterns
+    3. Profile     - Create daily 48-point load profiles per HOUSEHOLD
+    4. Cluster     - K-means (Euclidean) to identify usage patterns
     5. Validate    - Check data quality at each step
 
-Stage 2: Demographic Analysis (separate script: stage2_regression.py)
-    - Join clusters with Census demographics
+Stage 2: Demographic Analysis (separate script: multinomial_regression.py)
+    - Join household clusters with Census demographics via ZIP+4 → block group
     - Run multinomial logistic regression
     - Identify demographic predictors of usage patterns
 
@@ -43,30 +44,34 @@ OUTPUT STRUCTURE
 ================================================================================
 
 data/validation_runs/{run_name}/
-├── samples/                    # Raw CSV files from S3
+├── samples/                       # Raw CSV files from S3
 ├── processed/
-│   └── comed_{year_month}.parquet   # Interval-level data (long format)
+│   └── comed_{year_month}.parquet      # Interval-level data (long format)
 ├── clustering/
-│   ├── sampled_profiles.parquet     # Daily load profiles for clustering
-│   ├── zip4_demographics.parquet    # ZIP+4 list (demographics added in Stage 2)
+│   ├── sampled_profiles.parquet        # Household daily profiles for clustering
+│   ├── household_zip4_map.parquet      # account_identifier → ZIP+4 map
 │   └── results/
 │       ├── cluster_assignments.parquet
 │       ├── cluster_centroids.parquet
-│       ├── clustering_metrics.json
-│       └── centroid_plot.png
+│       ├── clustering_metadata.json
+│       ├── k_evaluation.json           # If k-range evaluation was used
+│       ├── elbow_curve.png
+│       ├── cluster_centroids.png
+│       └── cluster_samples.png
+
+Stage 2 (separate script) writes to:
+    data/validation_runs/{run_name}/clustering/results/stage2/
 
 ================================================================================
 EXAMPLES
 ================================================================================
 
-# Quick test with 100 files
-python run_comed_pipeline.py --from-s3 --num-files 100 --sample-zips 100 --sample-days 10
+# Quick test with 100 files and 2,000 households
+python run_comed_pipeline.py --from-s3 --num-files 100 \
+    --sample-households 2000 --sample-days 10
 
-# Standard analysis (1000 files, ~30min clustering)
+# Standard analysis (1000 files)
 python run_comed_pipeline.py --from-s3 --num-files 1000
-
-# Large scale (will take hours)
-python run_comed_pipeline.py --from-s3 --num-files 10000 --sample-zips 1000
 
 # Just validate existing results
 python run_comed_pipeline.py --validate-only --run-name 202308_1000
@@ -75,6 +80,7 @@ python run_comed_pipeline.py --validate-only --run-name 202308_1000
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -94,7 +100,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PATHS = {
     "processed": Path("data/processed/comed_202308.parquet"),
-    "enriched": Path("data/enriched_test/enriched.parquet"),
     "clustering_dir": Path("data/clustering"),
     "crosswalk": Path("data/reference/2023_comed_zip4_census_crosswalk.txt"),
 }
@@ -106,16 +111,10 @@ DEFAULT_S3_CONFIG = {
 
 DEFAULT_CLUSTERING_CONFIG = {
     "sample_days": 20,
-    "sample_zips": 500,
+    "sample_households": 5000,
     "k_min": 3,
-    "k_max": 5,  # Reduced from 6 - faster evaluation
-    "day_strategy": "stratified",
-    # DTW performance parameters
-    "max_eval_samples": 2000,  # Subsample for k evaluation
-    "eval_max_iter": 10,
-    "eval_n_init": 3,
-    "final_max_iter": 10,
-    "final_n_init": 3,
+    "k_max": 5,
+    "day_strategy": "stratified",  # 70% weekday / 30% weekend
 }
 
 
@@ -129,7 +128,7 @@ class ComedPipeline:
     Orchestrates the ComEd smart meter analysis pipeline.
 
     This class manages the complete workflow from raw S3 data to clustered
-    load profiles, with validation at each step.
+    household load profiles, with validation at each step.
 
     Attributes:
         base_dir: Project root directory
@@ -276,7 +275,11 @@ class ComedPipeline:
                 logger.info(f"  Scanned {i}/{len(csv_files)} files")
 
             try:
-                lf = pl.scan_csv(str(csv_path), schema_overrides=COMED_SCHEMA, ignore_errors=True)
+                lf = pl.scan_csv(
+                    str(csv_path),
+                    schema_overrides=COMED_SCHEMA,
+                    ignore_errors=True,
+                )
                 lf = transform_wide_to_long_lazy(lf)
                 lf = add_time_columns_lazy(lf, day_mode="calendar")
                 lazy_frames.append(lf)
@@ -301,18 +304,22 @@ class ComedPipeline:
     def prepare_clustering_data(
         self,
         sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
-        sample_zips: int = DEFAULT_CLUSTERING_CONFIG["sample_zips"],
+        sample_households: int | None = DEFAULT_CLUSTERING_CONFIG["sample_households"],
         day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
     ) -> bool:
         """
-        Prepare daily load profiles for clustering.
+        Prepare daily load profiles for clustering (household level).
 
-        Aggregates interval data to ZIP+4 level and creates daily profiles.
+        Aggregates interval data to per-household daily 48-point profiles and
+        writes:
+            - sampled_profiles.parquet
+            - household_zip4_map.parquet
+
         Uses chunked processing to manage memory.
 
         Args:
             sample_days: Number of days to sample
-            sample_zips: Number of ZIP+4 codes to sample
+            sample_households: Number of households to sample (None = all)
             day_strategy: 'stratified' (70/30 weekday/weekend) or 'random'
 
         Returns:
@@ -329,7 +336,7 @@ class ComedPipeline:
 
         cmd = [
             sys.executable,
-            str(self.base_dir / "analysis" / "clustering" / "prepare_clustering_data.py"),
+            str(self.base_dir / "analysis" / "clustering" / "prepare_clustering_data_households.py"),
             "--input",
             str(input_path),
             "--output-dir",
@@ -338,15 +345,22 @@ class ComedPipeline:
             day_strategy,
             "--sample-days",
             str(sample_days),
-            "--sample-zips",
-            str(sample_zips),
         ]
 
-        logger.info(f"Preparing clustering data (sampling {sample_zips} ZIP+4s x {sample_days} days)")
+        if sample_households is not None:
+            cmd.extend(["--sample-households", str(sample_households)])
+
+        household_label = "ALL" if sample_households is None else sample_households
+        logger.info(
+            f"Preparing clustering data "
+            f"(sampling {household_label} households x {sample_days} days, "
+            f"day_strategy={day_strategy})"
+        )
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            logger.error(f"Clustering prep failed: {result.stderr}")
+            logger.error("Clustering prep failed")
+            logger.error(result.stderr)
             return False
 
         logger.info("Clustering data prepared")
@@ -356,23 +370,15 @@ class ComedPipeline:
         self,
         k_min: int = DEFAULT_CLUSTERING_CONFIG["k_min"],
         k_max: int = DEFAULT_CLUSTERING_CONFIG["k_max"],
-        max_eval_samples: int = DEFAULT_CLUSTERING_CONFIG["max_eval_samples"],
-        eval_max_iter: int = DEFAULT_CLUSTERING_CONFIG["eval_max_iter"],
-        eval_n_init: int = DEFAULT_CLUSTERING_CONFIG["eval_n_init"],
-        final_max_iter: int = DEFAULT_CLUSTERING_CONFIG["final_max_iter"],
-        final_n_init: int = DEFAULT_CLUSTERING_CONFIG["final_n_init"],
+        normalize: bool = True,
     ) -> bool:
         """
-        Run DTW k-means clustering on prepared profiles.
+        Run Euclidean k-means clustering on prepared profiles.
 
         Args:
             k_min: Minimum number of clusters to test
             k_max: Maximum number of clusters to test
-            max_eval_samples: Max profiles for k evaluation (subsample)
-            eval_max_iter: Max iterations for evaluation runs
-            eval_n_init: Number of initializations for evaluation
-            final_max_iter: Max iterations for final clustering
-            final_n_init: Number of initializations for final clustering
+            normalize: Whether to apply z-score normalization before clustering
 
         Returns:
             True if clustering successful, False otherwise
@@ -389,7 +395,7 @@ class ComedPipeline:
 
         cmd = [
             sys.executable,
-            str(self.base_dir / "analysis" / "clustering" / "dtw_clustering.py"),
+            str(self.base_dir / "analysis" / "clustering" / "euclidean_clustering.py"),
             "--input",
             str(profiles_path),
             "--output-dir",
@@ -398,32 +404,27 @@ class ComedPipeline:
             str(k_min),
             str(k_max),
             "--find-optimal-k",
-            "--normalize",
-            "--max-eval-samples",
-            str(max_eval_samples),
-            "--eval-max-iter",
-            str(eval_max_iter),
-            "--eval-n-init",
-            str(eval_n_init),
-            "--final-max-iter",
-            str(final_max_iter),
-            "--final-n-init",
-            str(final_n_init),
         ]
 
-        logger.info(f"Running DTW clustering (k={k_min}-{k_max}, eval on {max_eval_samples} samples)...")
+        if normalize:
+            cmd.append("--normalize")
+            cmd.extend(["--normalize-method", "zscore"])
+
+        logger.info(f"Running Euclidean k-means clustering (k={k_min}-{k_max}, normalize={normalize})...")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
+        if result.stdout:
+            print(result.stdout)
+
         if result.returncode != 0:
-            logger.error(f"Clustering failed: {result.stderr}")
-            if result.stdout:
-                logger.error(f"stdout: {result.stdout}")
+            logger.error("Clustering failed")
+            logger.error(result.stderr)
             return False
 
         logger.info("Clustering complete")
         return True
 
-    def run_stage2_regression(
+    def run_multinomial_regression(
         self,
         crosswalk_path: Path | None = None,
         census_cache_path: Path | None = None,
@@ -431,7 +432,7 @@ class ComedPipeline:
         """
         Run Stage 2: Multinomial regression to predict clusters from demographics.
 
-        stage2_regression.py handles census fetching internally if cache doesn't exist.
+        multinomial_regression.py handles census fetching internally if cache doesn't exist.
 
         Args:
             crosswalk_path: Path to ZIP+4 crosswalk file
@@ -460,7 +461,6 @@ class ComedPipeline:
             logger.error(f"Crosswalk not found: {crosswalk_path}")
             return False
 
-        # stage2_regression.py handles census fetching internally if cache missing
         cmd = [
             sys.executable,
             str(self.base_dir / "analysis" / "clustering" / "multinomial_regression.py"),
@@ -477,12 +477,13 @@ class ComedPipeline:
         logger.info("Running Stage 2 regression...")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Print output (report goes to stdout)
+        # Print report (multinomial_regression prints its own summary)
         if result.stdout:
             print(result.stdout)
 
         if result.returncode != 0:
-            logger.error(f"Stage 2 regression failed: {result.stderr}")
+            logger.error("Stage 2 regression failed")
+            logger.error(result.stderr)
             return False
 
         logger.info(f"Stage 2 complete: {output_dir}")
@@ -501,8 +502,8 @@ class ComedPipeline:
 
         logger.info(f"Validating processed data: {path}")
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         try:
             lf = pl.scan_parquet(path)
@@ -511,7 +512,14 @@ class ComedPipeline:
             return self._fail("processed", f"Failed to read: {e}")
 
         # Check required columns
-        required = ["zip_code", "account_identifier", "datetime", "kwh", "date", "hour"]
+        required = [
+            "zip_code",
+            "account_identifier",
+            "datetime",
+            "kwh",
+            "date",
+            "hour",
+        ]
         missing = [c for c in required if c not in schema.names()]
         if missing:
             errors.append(f"Missing columns: {missing}")
@@ -537,7 +545,7 @@ class ComedPipeline:
                 null_pct = stats_dict["kwh_nulls"] / stats_dict["rows"] * 100
                 if null_pct > 5:
                     errors.append(f"kwh: {null_pct:.1f}% null")
-                elif null_pct > 0:
+                else:
                     warnings.append(f"kwh: {null_pct:.1f}% null")
 
             # Check kWh range
@@ -569,25 +577,26 @@ class ComedPipeline:
         except Exception as e:
             return self._fail("clustering_inputs", f"Failed to read: {e}")
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         # Check required columns
-        required = ["zip_code", "date", "profile"]
+        required = ["account_identifier", "zip_code", "date", "profile"]
         missing = [c for c in required if c not in df.columns]
         if missing:
             errors.append(f"Missing columns: {missing}")
 
         # Check profile lengths
         if "profile" in df.columns:
-            lengths = df.select(pl.col("profile").list.len()).unique()["profile"].to_list()
+            lengths = df.select(pl.col("profile").list.len().alias("len")).select("len").unique()["len"].to_list()
             if len(lengths) > 1:
                 errors.append(f"Inconsistent profile lengths: {lengths}")
-            elif lengths[0] != 48:
+            elif lengths and lengths[0] != 48:
                 errors.append(f"Expected 48-point profiles, got {lengths[0]}")
 
         stats = {
             "profiles": len(df),
+            "households": df["account_identifier"].n_unique() if "account_identifier" in df.columns else 0,
             "zip_codes": df["zip_code"].n_unique() if "zip_code" in df.columns else 0,
             "dates": df["date"].n_unique() if "date" in df.columns else 0,
         }
@@ -609,8 +618,8 @@ class ComedPipeline:
         except Exception as e:
             return self._fail("clustering_outputs", f"Failed to read: {e}")
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         # Check required columns
         if "cluster" not in assignments.columns:
@@ -619,25 +628,34 @@ class ComedPipeline:
         # Check cluster distribution
         if "cluster" in assignments.columns:
             cluster_counts = assignments["cluster"].value_counts()
-
-            # Check for empty clusters
             if cluster_counts["count"].min() == 0:
                 warnings.append("Some clusters have no assignments")
 
-        stats = {
+        stats: dict[str, float | int | None] = {
             "n_assigned": len(assignments),
             "k": assignments["cluster"].n_unique() if "cluster" in assignments.columns else 0,
         }
 
-        # Load metrics if available
-        metrics_path = results_dir / "clustering_metrics.json"
-        if metrics_path.exists():
-            import json
+        # Load metadata (inertia) and k evaluation (silhouette) if available
+        metadata_path = results_dir / "clustering_metadata.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    metadata = json.load(f)
+                stats["inertia"] = metadata.get("inertia")
+            except Exception as e:
+                warnings.append(f"Failed to read clustering_metadata.json: {e}")
 
-            with open(metrics_path) as f:
-                metrics = json.load(f)
-                stats["silhouette"] = metrics.get("silhouette_score")
-                stats["inertia"] = metrics.get("inertia")
+        k_eval_path = results_dir / "k_evaluation.json"
+        if k_eval_path.exists():
+            try:
+                with open(k_eval_path) as f:
+                    k_eval = json.load(f)
+                silhouettes = k_eval.get("silhouette") or []
+                if silhouettes:
+                    stats["silhouette"] = max(silhouettes)
+            except Exception as e:
+                warnings.append(f"Failed to read k_evaluation.json: {e}")
 
         return self._result("clustering_outputs", errors, warnings, stats)
 
@@ -650,13 +668,12 @@ class ComedPipeline:
         year_month: str,
         num_files: int,
         sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
-        sample_zips: int = DEFAULT_CLUSTERING_CONFIG["sample_zips"],
+        sample_households: int | None = DEFAULT_CLUSTERING_CONFIG["sample_households"],
         k_min: int = DEFAULT_CLUSTERING_CONFIG["k_min"],
         k_max: int = DEFAULT_CLUSTERING_CONFIG["k_max"],
-        max_eval_samples: int = DEFAULT_CLUSTERING_CONFIG["max_eval_samples"],
-        eval_max_iter: int = DEFAULT_CLUSTERING_CONFIG["eval_max_iter"],
         skip_clustering: bool = False,
-        run_stage2: bool = False,
+        run_multinomial: bool = False,
+        day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
     ) -> bool:
         """
         Execute the complete pipeline.
@@ -665,13 +682,12 @@ class ComedPipeline:
             year_month: Target month (YYYYMM format)
             num_files: Number of S3 files to download
             sample_days: Days to sample for clustering
-            sample_zips: ZIP codes to sample for clustering
+            sample_households: Households to sample for clustering (None = all)
             k_min: Minimum clusters to test
             k_max: Maximum clusters to test
-            max_eval_samples: Max profiles for k evaluation subsample
-            eval_max_iter: Max iterations for k evaluation
             skip_clustering: If True, stop after preparing data
-            run_stage2: If True, run demographic regression after clustering
+            run_multinomial: If True, run demographic regression after clustering
+            day_strategy: 'stratified' or 'random' sampling of days
 
         Returns:
             True if all steps succeed, False otherwise
@@ -680,10 +696,9 @@ class ComedPipeline:
         print(f"Year-Month: {year_month}")
         print(f"Files: {num_files}")
         print(f"Output: {self.run_dir}")
-        print(
-            f"Clustering: {'Skipped' if skip_clustering else f'k={k_min}-{k_max}, eval on {max_eval_samples} samples'}"
-        )
-        print(f"Stage 2: {'Yes' if run_stage2 else 'No'}")
+        print(f"Clustering: {'Skipped' if skip_clustering else f'k={k_min}-{k_max} (Euclidean, normalized)'}")
+        print(f"Day strategy: {day_strategy}")
+        print(f"Stage 2: {'Yes' if run_multinomial else 'No'}")
 
         self.setup_directories()
 
@@ -697,26 +712,25 @@ class ComedPipeline:
         if not self.process_raw_data(year_month):
             return False
 
-        # Step 3: Prepare clustering
-        self._print_step("PREPARING CLUSTERING DATA")
-        if not self.prepare_clustering_data(sample_days, sample_zips):
+        # Step 3: Prepare clustering data (household-level profiles)
+        self._print_step("PREPARING HOUSEHOLD-LEVEL CLUSTERING DATA")
+        if not self.prepare_clustering_data(
+            sample_days=sample_days,
+            sample_households=sample_households,
+            day_strategy=day_strategy,
+        ):
             return False
 
         # Step 4: Cluster (optional)
         if not skip_clustering:
-            self._print_step("RUNNING DTW CLUSTERING")
-            if not self.run_clustering(
-                k_min=k_min,
-                k_max=k_max,
-                max_eval_samples=max_eval_samples,
-                eval_max_iter=eval_max_iter,
-            ):
+            self._print_step("RUNNING EUCLIDEAN K-MEANS CLUSTERING")
+            if not self.run_clustering(k_min=k_min, k_max=k_max, normalize=True):
                 return False
 
         # Step 5: Stage 2 regression (optional)
-        if run_stage2 and not skip_clustering:
+        if run_multinomial and not skip_clustering:
             self._print_step("RUNNING STAGE 2: DEMOGRAPHIC REGRESSION")
-            if not self.run_stage2_regression():
+            if not self.run_multinomial_regression():
                 logger.warning("Stage 2 regression failed, but Stage 1 completed successfully")
 
         logger.info("Pipeline execution complete")
@@ -774,7 +788,12 @@ class ComedPipeline:
         for w in warnings:
             print(f"   ⚠️  {w}")
 
-        return {"status": status, "errors": errors, "warnings": warnings, "stats": stats}
+        return {
+            "status": status,
+            "errors": errors,
+            "warnings": warnings,
+            "stats": stats,
+        }
 
     def _fail(self, stage: str, message: str) -> dict:
         print(f"\n❌ {stage.upper()}: FAILED - {message}")
@@ -802,8 +821,10 @@ class ComedPipeline:
             if stats.get("k"):
                 print("\nClustering Results:")
                 print(f"  • {stats.get('n_assigned', '?')} profiles → {stats.get('k')} clusters")
-                if stats.get("silhouette"):
-                    print(f"  • Silhouette score: {stats['silhouette']:.3f}")
+                if stats.get("silhouette") is not None:
+                    print(f"  • Best silhouette score: {stats['silhouette']:.3f}")
+                if stats.get("inertia") is not None:
+                    print(f"  • Inertia: {stats['inertia']:.2f}")
 
         print()
         return all_passed
@@ -830,8 +851,8 @@ Examples:
   python run_comed_pipeline.py --validate-only --run-name 202308_1000
 
   # Custom clustering parameters
-  python run_comed_pipeline.py --from-s3 --num-files 1000 \\
-      --sample-zips 200 --sample-days 15 --k-range 3 5
+  python run_comed_pipeline.py --from-s3 --num-files 1000 \
+      --sample-households 3000 --sample-days 15 --k-range 3 5
         """,
     )
 
@@ -853,7 +874,7 @@ Examples:
         help="Run pipeline but skip clustering step (useful for testing)",
     )
     mode_group.add_argument(
-        "--run-stage2",
+        "--run-multinomial",
         action="store_true",
         help="Run Stage 2 regression after clustering (requires census data)",
     )
@@ -875,10 +896,10 @@ Examples:
     # Clustering parameters
     cluster_group = parser.add_argument_group("Clustering Parameters")
     cluster_group.add_argument(
-        "--sample-zips",
+        "--sample-households",
         type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["sample_zips"],
-        help=f"ZIP+4 codes to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_zips']})",
+        default=DEFAULT_CLUSTERING_CONFIG["sample_households"],
+        help=(f"Households to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_households']})"),
     )
     cluster_group.add_argument(
         "--sample-days",
@@ -892,33 +913,25 @@ Examples:
         nargs=2,
         metavar=("MIN", "MAX"),
         default=[DEFAULT_CLUSTERING_CONFIG["k_min"], DEFAULT_CLUSTERING_CONFIG["k_max"]],
-        help=f"Cluster range to test (default: {DEFAULT_CLUSTERING_CONFIG['k_min']} {DEFAULT_CLUSTERING_CONFIG['k_max']})",
+        help=(
+            f"Cluster range to test (default: "
+            f"{DEFAULT_CLUSTERING_CONFIG['k_min']} "
+            f"{DEFAULT_CLUSTERING_CONFIG['k_max']})"
+        ),
     )
     cluster_group.add_argument(
         "--day-strategy",
         choices=["stratified", "random"],
         default=DEFAULT_CLUSTERING_CONFIG["day_strategy"],
-        help="Day sampling strategy (default: stratified = 70%% weekday, 30%% weekend)",
+        help="Day sampling strategy (default: stratified = 70% weekday, 30% weekend)",
     )
 
-    # Performance tuning
+    # Performance / convenience
     perf_group = parser.add_argument_group("Performance Tuning")
-    perf_group.add_argument(
-        "--max-eval-samples",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["max_eval_samples"],
-        help=f"Max profiles for k evaluation subsample (default: {DEFAULT_CLUSTERING_CONFIG['max_eval_samples']})",
-    )
-    perf_group.add_argument(
-        "--eval-max-iter",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["eval_max_iter"],
-        help=f"Max iterations for k evaluation (default: {DEFAULT_CLUSTERING_CONFIG['eval_max_iter']})",
-    )
     perf_group.add_argument(
         "--fast",
         action="store_true",
-        help="Fast mode: k=3-4, 1000 eval samples, 5 iterations (for testing)",
+        help="Fast mode: k=3-4 (for testing)",
     )
 
     # Output options
@@ -945,12 +958,10 @@ Examples:
     # Handle --fast mode
     if args.fast:
         args.k_range = [3, 4]
-        args.max_eval_samples = 1000
-        args.eval_max_iter = 5
-        logger.info("Fast mode enabled: k=3-4, 1000 eval samples, 5 iterations")
+        logger.info("Fast mode enabled: k=3-4")
 
     # Determine run name
-    run_name = args.run_name or f"{args.year_month}_{args.num_files}" if args.from_s3 else args.run_name
+    run_name = args.run_name or (f"{args.year_month}_{args.num_files}" if args.from_s3 else args.run_name)
 
     # Create pipeline
     pipeline = ComedPipeline(args.base_dir, run_name)
@@ -961,13 +972,12 @@ Examples:
             year_month=args.year_month,
             num_files=args.num_files,
             sample_days=args.sample_days,
-            sample_zips=args.sample_zips,
+            sample_households=args.sample_households,
             k_min=args.k_range[0],
             k_max=args.k_range[1],
-            max_eval_samples=args.max_eval_samples,
-            eval_max_iter=args.eval_max_iter,
             skip_clustering=args.skip_clustering,
-            run_stage2=args.run_stage2,
+            run_multinomial=args.run_multinomial,
+            day_strategy=args.day_strategy,
         )
         if success:
             pipeline.validate_all()
