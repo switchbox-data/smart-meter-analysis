@@ -8,7 +8,7 @@ then aggregates to hourly averages in local (Chicago) time.
 API Documentation: https://hourlypricing.comed.com/hp-api/
 
 Typical output (for 2023):
-    data/reference/comed_hourly_prices_2023.parquet
+data/reference/comed_hourly_prices_2023.parquet
 """
 
 import json
