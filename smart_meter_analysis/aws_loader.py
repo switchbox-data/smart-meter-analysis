@@ -89,21 +89,16 @@ def list_s3_files(
     return s3_uris
 
 
-def scan_single_csv_lazy(s3_uri: str, schema: dict[str, DType] | None = None) -> pl.LazyFrame:
+def scan_single_csv_lazy(
+    s3_uri: str, schema: dict[str, DType] | None = None, day_mode: str = "calendar"
+) -> pl.LazyFrame:
     """
     Lazily scan a single CSV from S3 and apply transformations using a fixed schema.
     """
     schema = COMED_SCHEMA if schema is None else schema
-
-    lf = pl.scan_csv(
-        s3_uri,
-        schema_overrides=schema,  # keep overrides-based approach as-is
-        ignore_errors=True,
-    )
-
+    lf = pl.scan_csv(s3_uri, schema_overrides=schema, ignore_errors=True)
     lf_long = transform_wide_to_long_lazy(lf)
-    lf_time = add_time_columns_lazy(lf_long)
-    return lf_time
+    return add_time_columns_lazy(lf_long, day_mode=day_mode)
 
 
 def transform_wide_to_long_lazy(
@@ -125,15 +120,13 @@ def transform_wide_to_long_lazy(
         "NSPL_VALUE",
     ]
 
-    schema = lf.collect_schema()
-    keep_ids = [c for c in id_cols if c in schema.names()]
-    interval_cols = [c for c in COMED_INTERVAL_COLUMNS if c in schema.names()]
+    requested_cols = id_cols + COMED_INTERVAL_COLUMNS
 
     lf_long = (
-        lf.select(keep_ids + interval_cols)
+        lf.select(requested_cols)
         .unpivot(
-            index=keep_ids,
-            on=interval_cols,
+            index=id_cols,
+            on=COMED_INTERVAL_COLUMNS,
             variable_name="interval_col",
             value_name="kwh",
         )
@@ -155,16 +148,10 @@ def transform_wide_to_long_lazy(
             ).alias("datetime")
         ])
         .select([
-            pl.col("ZIP_CODE").alias("zip_code") if "ZIP_CODE" in schema.names() else pl.lit(None).alias("zip_code"),
-            pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class")
-            if "DELIVERY_SERVICE_CLASS" in schema.names()
-            else pl.lit(None).alias("delivery_service_class"),
-            pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name")
-            if "DELIVERY_SERVICE_NAME" in schema.names()
-            else pl.lit(None).alias("delivery_service_name"),
-            pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier")
-            if "ACCOUNT_IDENTIFIER" in schema.names()
-            else pl.lit(None).alias("account_identifier"),
+            pl.col("ZIP_CODE").alias("zip_code"),
+            pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class"),
+            pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name"),
+            pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier"),
             pl.col("datetime"),
             pl.col("kwh").cast(pl.Float64),
         ])
@@ -172,25 +159,51 @@ def transform_wide_to_long_lazy(
     return lf_long
 
 
-def add_time_columns_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
+def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.LazyFrame:
     """
-    Add date/hour/weekday/is_weekend columns and DST flags.
+    Add derived time columns and day-attribution flags.
+
+    Day attribution modes:
+    - "calendar": date == datetime.date()
+    - "billing":  date == datetime.date(), except 00:00 rows are shifted to the previous date
+                (so HR2400 is attributed to the prior day).
     """
-    from datetime import date
+    from datetime import date as _date
 
-    DST_SPRING_2023 = date(2023, 3, 12)
-    DST_FALL_2023 = date(2023, 11, 5)
+    if day_mode not in {"calendar", "billing"}:
+        raise ValueError("day_mode must be 'calendar' or 'billing'")
 
-    return lf.with_columns([
-        pl.col("datetime").dt.date().alias("date"),
-        pl.col("datetime").dt.hour().alias("hour"),
-        pl.col("datetime").dt.weekday().alias("weekday"),
-        (pl.col("datetime").dt.weekday() >= 5).alias("is_weekend"),
-    ]).with_columns([
-        (pl.col("date") == DST_SPRING_2023).alias("is_spring_forward_day"),
-        (pl.col("date") == DST_FALL_2023).alias("is_fall_back_day"),
-        ((pl.col("date") == DST_SPRING_2023) | (pl.col("date") == DST_FALL_2023)).alias("is_dst_day"),
-    ])
+    # Fixed DST dates currently encoded
+    DST_SPRING_2023 = _date(2023, 3, 12)
+    DST_FALL_2023 = _date(2023, 11, 5)
+
+    dt = pl.col("datetime")
+
+    if day_mode == "calendar":
+        date_expr = dt.dt.date()
+    else:
+        # Billing day: assign midnight rows (00:00) back to the previous date
+        date_expr = (
+            pl.when((dt.dt.hour() == 0) & (dt.dt.minute() == 0))
+            .then((dt - pl.duration(days=1)).dt.date())
+            .otherwise(dt.dt.date())
+        )
+
+    return (
+        lf.with_columns([
+            date_expr.alias("date"),
+            dt.dt.hour().alias("hour"),
+        ])
+        .with_columns([
+            pl.col("date").dt.weekday().alias("weekday"),
+            (pl.col("date").dt.weekday() >= 5).alias("is_weekend"),
+        ])
+        .with_columns([
+            (pl.col("date") == DST_SPRING_2023).alias("is_spring_forward_day"),
+            (pl.col("date") == DST_FALL_2023).alias("is_fall_back_day"),
+            ((pl.col("date") == DST_SPRING_2023) | (pl.col("date") == DST_FALL_2023)).alias("is_dst_day"),
+        ])
+    )
 
 
 def process_month_batch(
@@ -200,9 +213,19 @@ def process_month_batch(
     bucket: str = S3_BUCKET,
     prefix: str = S3_PREFIX,
     sort_output: bool = False,
+    day_mode: str = "calendar",
 ) -> None:
     """
     Process all CSVs for a month and save as a single Parquet file.
+
+    Args:
+        year_month: Month in 'YYYYMM' format.
+        output_path: Path to the Parquet file to write.
+        max_files: Optional limit for testing.
+        bucket: S3 bucket name.
+        prefix: S3 prefix path.
+        sort_output: Whether to sort by datetime before writing.
+        day_mode: Day attribution mode ('calendar' or 'billing').
     """
     logger.info(f"Processing month: {year_month}")
 
@@ -217,7 +240,7 @@ def process_month_batch(
         filename = s3_uri.split("/")[-1]
         logger.debug(f"Scanning {i}/{len(s3_uris)}: {filename}")
         try:
-            lf = scan_single_csv_lazy(s3_uri)
+            lf = scan_single_csv_lazy(s3_uri, day_mode=day_mode)
             lazy_frames.append(lf)
         except Exception:
             logger.exception(f"Failed to scan {s3_uri}")
@@ -240,44 +263,8 @@ def process_month_batch(
     logger.info(f"Successfully wrote data to {output_path}")
 
 
-def process_month_batch_streaming(
-    year_month: str,
-    output_path: Path,
-    max_files: int | None = None,
-    bucket: str = S3_BUCKET,
-    prefix: str = S3_PREFIX,
-) -> None:
-    """
-    Alternative implementation using sink_parquet for streaming to disk.
-    """
-    logger.info(f"Processing month (streaming mode): {year_month}")
-
-    s3_uris = list_s3_files(year_month, bucket, prefix, max_files)
-    if not s3_uris:
-        raise ValueError(ERR_NO_FILES_FOUND.format(year_month))
-
-    lazy_frames: list[pl.LazyFrame] = []
-    for s3_uri in s3_uris:
-        try:
-            lf = scan_single_csv_lazy(s3_uri)
-            lazy_frames.append(lf)
-        except Exception:
-            logger.exception(f"Failed to scan {s3_uri}")
-            continue
-
-    if not lazy_frames:
-        raise ValueError(ERR_NO_SUCCESSFUL_PROCESS)
-
-    lf_combined = pl.concat(lazy_frames, how="diagonal_relaxed")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Streaming to Parquet...")
-    lf_combined.sink_parquet(output_path)
-    logger.info(f"Successfully streamed data to {output_path}")
-
-
 def main() -> None:
-    """Example usage - can be called from command line."""
+    """Command-line entry point for processing ComEd smart meter data from S3."""
     import sys
 
     logging.basicConfig(
@@ -286,11 +273,17 @@ def main() -> None:
     )
 
     if len(sys.argv) < 2:
-        print("Usage: python step0_aws.py YYYYMM [max_files]")
+        print("Usage: python -m smart_meter_analysis.aws_loader YYYYMM [max_files] [calendar|billing]")
         sys.exit(1)
 
     year_month = sys.argv[1]
-    max_files = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    max_files = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+    day_mode = sys.argv[3] if len(sys.argv) > 3 else "calendar"
+
+    if day_mode not in {"calendar", "billing"}:
+        print("Error: day_mode must be either 'calendar' or 'billing'")
+        sys.exit(1)
+
     output_path = Path(f"data/processed/comed_{year_month}.parquet")
 
     process_month_batch(
@@ -298,8 +291,7 @@ def main() -> None:
         output_path=output_path,
         max_files=max_files,
         sort_output=False,
+        day_mode=day_mode,
     )
 
-
-if __name__ == "__main__":
-    main()
+    logger.info(f"✓ Successfully processed {year_month} in '{day_mode}' mode")
