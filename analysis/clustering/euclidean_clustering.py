@@ -1,31 +1,33 @@
-#!/usr/bin/env python3
 """
-Step 1, Part 2 of the ComEd Smart Meter Clustering Pipeline: K-Means Clustering
-for Load Profile Analysis.
+Phase 2: K-Means Clustering for Load Profile Analysis.
 
 Clusters daily electricity usage profiles using standard Euclidean distance
 to identify distinct consumption patterns.
 
+Note: DTW (Dynamic Time Warping) is unnecessary here because all profiles
+are aligned to the same 48 half-hourly time grid. Euclidean distance is
+appropriate and much faster.
+
 Pipeline:
     1. Load daily profiles from Phase 1
-    2. Normalize profiles
+    2. Normalize profiles (optional but recommended)
     3. Evaluate k values to find optimal k (via silhouette score)
     4. Run final clustering with optimal k
     5. Output assignments, centroids, and visualizations
 
 Usage:
     # Standard run (evaluates k=3-6)
-    python euclidean_clustering.py \
-        --input data/clustering/sampled_profiles.parquet \
-        --output-dir data/clustering/results \
-        --k-range 3 6 \
-        --find-optimal-k \
+    python euclidean_clustering.py \\
+        --input data/clustering/sampled_profiles.parquet \\
+        --output-dir data/clustering/results \\
+        --k-range 3 6 \\
+        --find-optimal-k \\
         --normalize
 
     # Fixed k (no evaluation)
-    python euclidean_clustering.py \
-        --input data/clustering/sampled_profiles.parquet \
-        --output-dir data/clustering/results \
+    python euclidean_clustering.py \\
+        --input data/clustering/sampled_profiles.parquet \\
+        --output-dir data/clustering/results \\
         --k 4 --normalize
 """
 
@@ -35,7 +37,6 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -50,17 +51,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 1. LOAD & NORMALIZE PROFILES
-# ---------------------------------------------------------------------------
-
-
 def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
     """
     Load profiles from parquet file.
-
-    Expects a list column named 'profile' where each element is a sequence
-    of equal length (e.g., 48 half-hourly kWh values in chronological order).
 
     Args:
         path: Path to sampled_profiles.parquet
@@ -72,24 +65,12 @@ def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
 
     df = pl.read_parquet(path)
 
-    if df.is_empty():
-        raise ValueError(f"No profiles found in {path}")
-
-    if "profile" not in df.columns:
-        raise ValueError("Input file must contain a 'profile' column of lists.")
-
-    profiles_list = df["profile"].to_list()
-
-    # Robustness: ensure all profiles have the same length
-    lengths = {len(p) for p in profiles_list}
-    if len(lengths) != 1:
-        raise ValueError(f"Inconsistent profile lengths found: {lengths}")
-
-    profiles = np.array(profiles_list, dtype=np.float64)
+    # Extract profiles as numpy array
+    profiles = np.array(df["profile"].to_list(), dtype=np.float64)
 
     logger.info(f"  Loaded {len(profiles):,} profiles with {profiles.shape[1]} time points each")
     logger.info(f"  Data shape: {profiles.shape}")
-    logger.info(f"  Data range: [{profiles.min():.4f}, {profiles.max():.4f}]")
+    logger.info(f"  Data range: [{profiles.min():.2f}, {profiles.max():.2f}]")
 
     return profiles, df
 
@@ -99,10 +80,7 @@ def normalize_profiles(
     method: str = "zscore",
 ) -> np.ndarray:
     """
-    Normalize profiles for clustering (per-profile normalization).
-
-    Per-profile normalization emphasizes the *shape* of each household's
-    daily profile relative to its own level, rather than absolute kWh.
+    Normalize profiles for clustering.
 
     Args:
         X: Profile array of shape (n_samples, n_timepoints)
@@ -112,7 +90,6 @@ def normalize_profiles(
         Normalized array
     """
     if method == "none":
-        logger.info("Skipping normalization (method='none').")
         return X
 
     logger.info(f"Normalizing profiles using {method} method...")
@@ -133,14 +110,9 @@ def normalize_profiles(
     else:
         raise ValueError(f"Unknown normalization method: {method}")
 
-    logger.info(f"  Normalized data range: [{X_norm.min():.4f}, {X_norm.max():.4f}]")
+    logger.info(f"  Normalized data range: [{X_norm.min():.2f}, {X_norm.max():.2f}]")
 
     return X_norm
-
-
-# ---------------------------------------------------------------------------
-# 2. K SELECTION & K-MEANS
-# ---------------------------------------------------------------------------
 
 
 def evaluate_clustering(
@@ -148,14 +120,14 @@ def evaluate_clustering(
     k_range: range,
     n_init: int = 10,
     random_state: int = 42,
-) -> dict[str, Any]:
+) -> dict:
     """
     Evaluate clustering for different values of k.
 
     Args:
         X: Profile array of shape (n_samples, n_timepoints)
         k_range: Range of k values to test
-        n_init: Number of random initializations for KMeans
+        n_init: Number of random initializations
         random_state: Random seed for reproducibility
 
     Returns:
@@ -164,7 +136,7 @@ def evaluate_clustering(
     logger.info(f"Evaluating clustering for k in {list(k_range)}...")
     logger.info(f"  Dataset size: {X.shape[0]:,} profiles")
 
-    results: dict[str, Any] = {
+    results = {
         "k_values": [],
         "inertia": [],
         "silhouette": [],
@@ -181,7 +153,6 @@ def evaluate_clustering(
 
         labels = model.fit_predict(X)
 
-        # Silhouette with Euclidean distance (default)
         sil_score = silhouette_score(X, labels, metric="euclidean")
 
         results["k_values"].append(k)
@@ -194,7 +165,7 @@ def evaluate_clustering(
     return results
 
 
-def find_optimal_k(eval_results: dict[str, Any]) -> int:
+def find_optimal_k(eval_results: dict) -> int:
     """
     Find optimal k based on silhouette score.
 
@@ -207,11 +178,8 @@ def find_optimal_k(eval_results: dict[str, Any]) -> int:
     k_values = eval_results["k_values"]
     silhouettes = eval_results["silhouette"]
 
-    if not k_values:
-        raise ValueError("No k values found in evaluation results.")
-
-    best_idx = int(np.argmax(silhouettes))
-    best_k = int(k_values[best_idx])
+    best_idx = np.argmax(silhouettes)
+    best_k = k_values[best_idx]
 
     logger.info(f"\nOptimal k={best_k} (silhouette={silhouettes[best_idx]:.3f})")
 
@@ -228,7 +196,7 @@ def run_clustering(
     Run k-means clustering.
 
     Args:
-        X: Profile array of shape (n_samples, n_timepoints)
+        X: Profile array
         k: Number of clusters
         n_init: Number of random initializations
         random_state: Random seed
@@ -258,31 +226,6 @@ def run_clustering(
     return labels, centroids, float(model.inertia_)
 
 
-# ---------------------------------------------------------------------------
-# 3. PLOTTING UTILITIES
-# ---------------------------------------------------------------------------
-
-
-def _make_time_axis(n_timepoints: int) -> tuple[np.ndarray, str]:
-    """
-    Helper to build a time axis given number of timepoints.
-
-    Returns:
-        (x_values, x_label)
-    """
-    if n_timepoints == 48:
-        # 48 half-hourly intervals from 00:00-24:00, centered at 00:30, 01:00, ...
-        hours = np.arange(0.5, 24.5, 0.5)
-        xlabel = "Hour of Day"
-    elif n_timepoints == 24:
-        hours = np.arange(1, 25)
-        xlabel = "Hour of Day"
-    else:
-        hours = np.arange(n_timepoints)
-        xlabel = "Time Interval"
-    return hours, xlabel
-
-
 def plot_centroids(
     centroids: np.ndarray,
     output_path: Path,
@@ -297,18 +240,26 @@ def plot_centroids(
     k = len(centroids)
     n_timepoints = centroids.shape[1]
 
-    hours, xlabel = _make_time_axis(n_timepoints)
+    # Create hour labels (assuming 48 half-hourly intervals)
+    if n_timepoints == 48:
+        hours = np.arange(0.5, 24.5, 0.5)
+        xlabel = "Hour of Day"
+    elif n_timepoints == 24:
+        hours = np.arange(1, 25)
+        xlabel = "Hour of Day"
+    else:
+        hours = np.arange(n_timepoints)
+        xlabel = "Time Interval"
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    colors = plt.cm.tab10(np.linspace(0, 1, min(k, 10)))
+    colors = plt.cm.tab10(np.linspace(0, 1, k))
 
-    for i, centroid in enumerate(centroids):
-        color = colors[i % len(colors)]
+    for i, (centroid, color) in enumerate(zip(centroids, colors)):
         ax.plot(hours, centroid, label=f"Cluster {i}", color=color, linewidth=2)
 
     ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel("Normalized Usage" if np.any(centroids < 0) else "Usage", fontsize=12)
+    ax.set_ylabel("Normalized Usage", fontsize=12)
     ax.set_title("Cluster Centroids (Average Load Profiles)", fontsize=14)
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
@@ -336,7 +287,7 @@ def plot_cluster_samples(
     Plot sample profiles from each cluster with centroid overlay.
 
     Args:
-        X: Profile array of shape (n_samples, n_timepoints)
+        X: Profile array
         labels: Cluster assignments
         centroids: Cluster centroids
         output_path: Path to save plot
@@ -346,27 +297,27 @@ def plot_cluster_samples(
     k = len(centroids)
     n_timepoints = X.shape[1]
 
-    hours, _ = _make_time_axis(n_timepoints)
+    # Create hour labels
+    if n_timepoints == 48:
+        hours = np.arange(0.5, 24.5, 0.5)
+    elif n_timepoints == 24:
+        hours = np.arange(1, 25)
+    else:
+        hours = np.arange(n_timepoints)
 
     fig, axes = plt.subplots(1, k, figsize=(5 * k, 4), sharey=True)
     if k == 1:
         axes = [axes]
 
     rng = np.random.default_rng(random_state)
-    colors = plt.cm.tab10(np.linspace(0, 1, min(k, 10)))
+    colors = plt.cm.tab10(np.linspace(0, 1, k))
 
-    for i, ax in enumerate(axes):
-        color = colors[i % len(colors)]
+    for i, (ax, color) in enumerate(zip(axes, colors)):
         cluster_mask = labels == i
         cluster_profiles = X[cluster_mask]
-        n_available = len(cluster_profiles)
-
-        if n_available == 0:
-            ax.set_title(f"Cluster {i} (n=0)")
-            ax.axis("off")
-            continue
 
         # Sample profiles
+        n_available = len(cluster_profiles)
         n_plot = min(n_samples, n_available)
         idx = rng.choice(n_available, size=n_plot, replace=False)
 
@@ -380,7 +331,7 @@ def plot_cluster_samples(
         ax.set_title(f"Cluster {i} (n={n_available:,})")
         ax.set_xlabel("Hour")
         if i == 0:
-            ax.set_ylabel("Normalized Usage" if np.any(X < 0) else "Usage")
+            ax.set_ylabel("Normalized Usage")
         ax.grid(True, alpha=0.3)
 
         if n_timepoints == 48:
@@ -395,7 +346,7 @@ def plot_cluster_samples(
 
 
 def plot_elbow_curve(
-    eval_results: dict[str, Any],
+    eval_results: dict,
     output_path: Path,
 ) -> None:
     """
@@ -428,7 +379,7 @@ def plot_elbow_curve(
     ax2.set_xticks(k_values)
 
     # Mark optimal k
-    best_idx = int(np.argmax(silhouette))
+    best_idx = np.argmax(silhouette)
     ax2.axvline(x=k_values[best_idx], color="red", linestyle="--", alpha=0.7)
     ax2.scatter(
         [k_values[best_idx]],
@@ -447,17 +398,12 @@ def plot_elbow_curve(
     logger.info(f"  Saved elbow curve: {output_path}")
 
 
-# ---------------------------------------------------------------------------
-# 4. SAVE RESULTS
-# ---------------------------------------------------------------------------
-
-
 def save_results(
     df: pl.DataFrame,
     labels: np.ndarray,
     centroids: np.ndarray,
-    eval_results: dict[str, Any] | None,
-    metadata: dict[str, Any],
+    eval_results: dict | None,
+    metadata: dict,
     output_dir: Path,
 ) -> None:
     """
@@ -513,11 +459,6 @@ def save_results(
     logger.info(f"  Saved metadata: {metadata_path}")
 
 
-# ---------------------------------------------------------------------------
-# 5. CLI ENTRYPOINT
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="K-Means Clustering for Load Profiles (Euclidean Distance)",
@@ -525,15 +466,15 @@ def main() -> None:
         epilog="""
 Examples:
     # Standard run with k evaluation
-    python euclidean_clustering.py \
-        --input data/clustering/sampled_profiles.parquet \
-        --output-dir data/clustering/results \
+    python euclidean_clustering.py \\
+        --input data/clustering/sampled_profiles.parquet \\
+        --output-dir data/clustering/results \\
         --k-range 3 6 --find-optimal-k --normalize
 
     # Fixed k (no evaluation)
-    python euclidean_clustering.py \
-        --input data/clustering/sampled_profiles.parquet \
-        --output-dir data/clustering/results \
+    python euclidean_clustering.py \\
+        --input data/clustering/sampled_profiles.parquet \\
+        --output-dir data/clustering/results \\
         --k 4 --normalize
         """,
     )
@@ -570,7 +511,7 @@ Examples:
     k_group.add_argument(
         "--find-optimal-k",
         action="store_true",
-        help="Evaluate k range and use optimal k based on silhouette score",
+        help="Evaluate k range and use optimal k",
     )
 
     # Clustering parameters
@@ -578,27 +519,27 @@ Examples:
         "--n-init",
         type=int,
         default=10,
-        help="Number of KMeans initializations (default: 10)",
+        help="Number of k-means initializations (default: 10)",
     )
 
     # Preprocessing
     parser.add_argument(
         "--normalize",
         action="store_true",
-        help="Apply per-profile normalization to profiles (see --normalize-method)",
+        help="Apply z-score normalization to profiles",
     )
     parser.add_argument(
         "--normalize-method",
         choices=["zscore", "minmax", "none"],
         default="zscore",
-        help="Normalization method (default: zscore). Only used if --normalize is specified.",
+        help="Normalization method (default: zscore)",
     )
 
     parser.add_argument(
         "--random-state",
         type=int,
         default=42,
-        help="Random seed for reproducibility (default: 42)",
+        help="Random seed for reproducibility",
     )
 
     args = parser.parse_args()
@@ -615,7 +556,7 @@ Examples:
         X = normalize_profiles(X, method=args.normalize_method)
 
     # Determine k
-    eval_results: dict[str, Any] | None = None
+    eval_results = None
 
     if args.k is not None:
         # Fixed k
@@ -638,7 +579,7 @@ Examples:
 
         k = find_optimal_k(eval_results)
     else:
-        # Neither fixed k nor evaluation requested: default to lower bound of k-range
+        # Default to min of k_range
         k = args.k_range[0]
         logger.info(f"\nUsing default k={k}")
 
@@ -660,15 +601,15 @@ Examples:
     # Save results
     logger.info("\nSaving results...")
 
-    metadata: dict[str, Any] = {
+    metadata = {
         "k": k,
         "n_profiles": len(X),
-        "n_timepoints": int(X.shape[1]),
-        "normalized": bool(args.normalize),
-        "normalize_method": args.normalize_method if args.normalize else "none",
-        "n_init": int(args.n_init),
-        "random_state": int(args.random_state),
-        "inertia": float(inertia),
+        "n_timepoints": X.shape[1],
+        "normalized": args.normalize,
+        "normalize_method": args.normalize_method if args.normalize else None,
+        "n_init": args.n_init,
+        "random_state": args.random_state,
+        "inertia": inertia,
         "distance_metric": "euclidean",
     }
 
