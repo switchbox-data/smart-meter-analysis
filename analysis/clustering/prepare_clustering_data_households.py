@@ -15,9 +15,9 @@ Pipeline:
 Design notes:
     - Minimizes full-file scans (summary + unique accounts + unique dates only)
     - Standard mode: single filtered collect() for selected households/dates
-      * good for up to ~50k households sampled
+    * good for up to ~50k households sampled
     - Streaming mode: sink_parquet() pre-filter, then aggregate
-      * safer for 100k+ households
+    * safer for 100k+ households
     - Profiles are 48 half-hourly kWh values in chronological order (00:30-24:00)
 
 Output files:
@@ -111,10 +111,10 @@ def get_metadata_and_samples(
     Get summary statistics and sample households + dates using minimal scans.
 
     This function performs:
-      - Summary stats (row counts, unique counts, date range)
-      - Unique households
-      - Unique dates with weekend flags
-      - Sampling of households and dates
+    - Summary stats (row counts, unique counts, date range)
+    - Unique households
+    - Unique dates with weekend flags
+    - Sampling of households and dates
 
     Args:
         input_path: Path to input parquet file.
