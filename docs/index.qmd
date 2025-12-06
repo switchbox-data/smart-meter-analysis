@@ -1,0 +1,45 @@
+# TK Title
+
+## Data
+
+### Load profiles
+
+Our ComEd and Ameren Illinois data consists of kWh load profiles in 30-minute increments for the complete set of households across the entire Chicago metro area. To preserve anonymity, TK.
+
+As a result, we only get consistent household identifiers for a given calendar month. Since Chicago's grid is summer-peaking, we choose load profiles for the month of TK. We denote load profiles as $L_i$ (for each $i$ household). Each $L_i$ is a TK point time series, for every 30 minutes in the month.
+
+### Demographic information
+
+The highest spatial resolution demographic data available for our analysis is the 5-year TK (2024?) US Census Bureau American Community Survey (2024 ACS) at the block group level. From this, we derive a number of block-group level demographic features:
+
+* TK
+
+### Geographical crosswalk
+
+Load profiles are identified by ZIP+4. Our demographic information from the TK (2024?) ACS is available at the Census block group level. To join the two, we use a crosswalk from Melissa. TK details of crosswalk.
+
+TK ZIP+4 and Census Block group spaital overlap to show that it's a reasonable mapping.
+
+### Clusters
+
+We cluster the load profiles into clusters via k-means. We use Euclidean distance on normalized load profiles, to focus on load shape rather than overall levels. We are aiming for a small number of clusters (4-10) to aid in interpretation. We chose $k=\textrm{TK}$ via the gap statistic [@tibshiraniEstimatingNumberClusters2001], using the `GapStatistics` package(TK citation).
+
+TK details on each cluster, and brief description of each shape.
+
+TK selection of cluster 1 as baseline.
+
+## Demographic predictors of load profile mix
+
+We begin by aggregating load profile clusters at the block group level. If $j$ is the block group, and $q$ is the cluster $(q\in\{1,\ldots,k\})$, then
+
+$$C_{jq} = \sum_{i\in \textrm{bg(j)}}\textrm{I}(c_i = q)$$
+
+is the count of households per cluster in each block group. We further normalize these to $\pi_{jq} = \frac{C_{jq}}{\sum_qC_{jq}}$, the proportion of cluster assignments in each block group.
+
+Our aim is to understand how block group level demographics predict the load cluster mix. To that end, we fit a series of multinomial logistic regression models, estimating the log probabilty of a cluster assignment relative to our baseline cluster 1,
+
+$$
+\log\left(\frac{\pi_{jq}}{\pi_{jK}}\right) = \beta_{0q} + \beta_{1q} \cdot \textrm{median\_income}_q + \beta_{2q} \textrm{pct\_hispanic}_q + \ldots
+$$
+
+for each $q\in\{1,\ldots,k\}$. We use the `MNLogit` function in the Python package `statsmodels` to fit these models.

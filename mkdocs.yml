@@ -8,7 +8,7 @@ repo_name: switchbox-data/smart-meter-analysis
 copyright: Maintained by <a href="https://switchbox-data.com">switchbox-data</a>.
 
 nav:
-  - Home: index.md
+  - Home: index.qmd
   - Modules: modules.md
 plugins:
   - search
