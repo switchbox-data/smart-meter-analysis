@@ -44,6 +44,8 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from smart_meter_analysis.census import fetch_census_data
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -237,16 +239,10 @@ def fetch_or_load_census(
 ) -> pl.DataFrame:
     """Fetch Census data from API or load from cache."""
     if cache_path.exists() and not force_fetch:
-        logger.info(f"Loading Census data from cache: {cache_path}")
+        logger.info("Loading Census data from cache: %s", cache_path)
         return pl.read_parquet(cache_path)
 
     logger.info("Fetching Census data from API (state=%s, year=%s)...", state_fips, acs_year)
-
-    try:
-        from smart_meter_analysis.census import fetch_census_data
-    except ImportError:
-        logger.error("Could not import fetch_census_data from smart_meter_analysis.census.")
-        raise
 
     census_df = fetch_census_data(state_fips=state_fips, acs_year=acs_year)
 
