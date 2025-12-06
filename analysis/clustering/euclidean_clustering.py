@@ -77,41 +77,45 @@ def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
 
 def normalize_profiles(
     X: np.ndarray,
-    method: str = "zscore",
+    method: str = "minmax",
 ) -> np.ndarray:
     """
-    Normalize profiles for clustering.
+    Normalize daily load profiles for clustering.
+
+    Two modes:
+
+    - "minmax": per-profile minmax scaling to [0, 1]. This is the
+      recommended and default method for nonstationary daily load
+      profiles, because it preserves the intraday shape and interprets
+      each value as "fraction of that day's peak load."
+
+    - "none": return the raw profiles without any scaling.
 
     Args:
-        X: Profile array of shape (n_samples, n_timepoints)
-        method: Normalization method ('zscore', 'minmax', 'none')
+        X: Profile array of shape (n_samples, n_timepoints).
+        method: "minmax" or "none".
 
     Returns:
-        Normalized array
+        Normalized array with the same shape as X.
     """
     if method == "none":
+        logger.info("Skipping profile normalization (method='none').")
         return X
 
-    logger.info(f"Normalizing profiles using {method} method...")
+    if method != "minmax":
+        raise ValueError(f"Unknown normalization method: {method!r}. Supported methods are 'minmax' and 'none'.")
 
-    if method == "zscore":
-        # Per-profile z-score normalization
-        means = X.mean(axis=1, keepdims=True)
-        stds = X.std(axis=1, keepdims=True)
-        stds[stds == 0] = 1  # Avoid division by zero
-        X_norm = (X - means) / stds
-    elif method == "minmax":
-        # Per-profile min-max normalization
-        mins = X.min(axis=1, keepdims=True)
-        maxs = X.max(axis=1, keepdims=True)
-        ranges = maxs - mins
-        ranges[ranges == 0] = 1
-        X_norm = (X - mins) / ranges
-    else:
-        raise ValueError(f"Unknown normalization method: {method}")
+    logger.info("Normalizing profiles using per-profile min-max scaling...")
 
-    logger.info(f"  Normalized data range: [{X_norm.min():.2f}, {X_norm.max():.2f}]")
+    # Per-profile min-max normalization
+    mins = X.min(axis=1, keepdims=True)
+    maxs = X.max(axis=1, keepdims=True)
+    ranges = maxs - mins
+    ranges[ranges == 0] = 1.0  # Avoid division by zero for flat profiles
 
+    X_norm = (X - mins) / ranges
+
+    logger.info("  Normalized data range: [%.2f, %.2f]", X_norm.min(), X_norm.max())
     return X_norm
 
 
@@ -120,7 +124,8 @@ def evaluate_clustering(
     k_range: range,
     n_init: int = 10,
     random_state: int = 42,
-) -> dict:
+    keep_best: bool = False,
+) -> tuple[dict, dict | None]:
     """
     Evaluate clustering for different values of k.
 
@@ -129,9 +134,18 @@ def evaluate_clustering(
         k_range: Range of k values to test
         n_init: Number of random initializations
         random_state: Random seed for reproducibility
+        keep_best: If True, also return labels/centroids for the
+                   best k (by silhouette).
 
     Returns:
-        Dictionary with k_values, inertia, and silhouette scores
+        eval_results: dict with k_values, inertia, and silhouette scores
+        best_info: dict with keys
+            - "k"
+            - "labels"
+            - "centroids"
+            - "inertia"
+            - "silhouette"
+          or None if keep_best=False.
     """
     logger.info(f"Evaluating clustering for k in {list(k_range)}...")
     logger.info(f"  Dataset size: {X.shape[0]:,} profiles")
@@ -141,6 +155,8 @@ def evaluate_clustering(
         "inertia": [],
         "silhouette": [],
     }
+
+    best_info: dict | None = None
 
     for k in k_range:
         logger.info(f"\n  Testing k={k}...")
@@ -152,17 +168,26 @@ def evaluate_clustering(
         )
 
         labels = model.fit_predict(X)
-
-        sil_score = silhouette_score(X, labels, metric="euclidean")
+        inertia = float(model.inertia_)
+        sil_score = float(silhouette_score(X, labels, metric="euclidean"))
 
         results["k_values"].append(k)
-        results["inertia"].append(float(model.inertia_))
-        results["silhouette"].append(float(sil_score))
+        results["inertia"].append(inertia)
+        results["silhouette"].append(sil_score)
 
-        logger.info(f"    Inertia: {model.inertia_:,.2f}")
+        logger.info(f"    Inertia: {inertia:,.2f}")
         logger.info(f"    Silhouette: {sil_score:.3f}")
 
-    return results
+        if keep_best and (best_info is None or sil_score > best_info["silhouette"]):
+            best_info = {
+                "k": k,
+                "labels": labels,
+                "centroids": model.cluster_centers_,
+                "inertia": inertia,
+                "silhouette": sil_score,
+            }
+
+    return results, best_info
 
 
 def find_optimal_k(eval_results: dict) -> int:
@@ -251,7 +276,7 @@ def plot_centroids(
         hours = np.arange(n_timepoints)
         xlabel = "Time Interval"
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
 
     colors = plt.cm.tab10(np.linspace(0, 1, k))
 
@@ -305,7 +330,7 @@ def plot_cluster_samples(
     else:
         hours = np.arange(n_timepoints)
 
-    fig, axes = plt.subplots(1, k, figsize=(5 * k, 4), sharey=True)
+    _fig, axes = plt.subplots(1, k, figsize=(5 * k, 4), sharey=True)
     if k == 1:
         axes = [axes]
 
@@ -360,7 +385,7 @@ def plot_elbow_curve(
     inertia = eval_results["inertia"]
     silhouette = eval_results["silhouette"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    _fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
     # Inertia (elbow curve)
     ax1.plot(k_values, inertia, "b-o", linewidth=2, markersize=8)
@@ -402,7 +427,7 @@ def save_results(
     df: pl.DataFrame,
     labels: np.ndarray,
     centroids: np.ndarray,
-    eval_results: dict | None,
+    eval_results: dict,
     metadata: dict,
     output_dir: Path,
 ) -> None:
@@ -528,11 +553,16 @@ Examples:
         action="store_true",
         help="Apply z-score normalization to profiles",
     )
+
     parser.add_argument(
         "--normalize-method",
-        choices=["zscore", "minmax", "none"],
-        default="zscore",
-        help="Normalization method (default: zscore)",
+        choices=["minmax", "none"],
+        default="minmax",
+        help=(
+            "Normalization method (default: minmax). "
+            "Use 'minmax' for per-profile scaling to [0, 1], or 'none' "
+            "to use raw kWh values."
+        ),
     )
 
     parser.add_argument(
@@ -558,38 +588,64 @@ Examples:
     # Determine k
     eval_results = None
 
+    # Determine k and (if available) reuse best model from evaluation
+    eval_results: dict | None = None
+    labels: np.ndarray | None = None
+    centroids: np.ndarray | None = None
+    inertia: float | None = None
+
     if args.k is not None:
         # Fixed k
         k = args.k
         logger.info(f"\nUsing fixed k={k}")
+
+        labels, centroids, inertia = run_clustering(
+            X,
+            k=k,
+            n_init=args.n_init,
+            random_state=args.random_state,
+        )
+
     elif args.find_optimal_k:
-        # Evaluate k range
+        # Evaluate k range and keep best model
         k_range = range(args.k_range[0], args.k_range[1] + 1)
 
-        eval_results = evaluate_clustering(
+        eval_results, best_info = evaluate_clustering(
             X,
             k_range=k_range,
             n_init=args.n_init,
             random_state=args.random_state,
+            keep_best=True,
         )
 
         # Save elbow curve
         args.output_dir.mkdir(parents=True, exist_ok=True)
         plot_elbow_curve(eval_results, args.output_dir / "elbow_curve.png")
 
-        k = find_optimal_k(eval_results)
+        if best_info is None:
+            raise RuntimeError("No best model found during k evaluation.")
+
+        k = best_info["k"]
+        labels = best_info["labels"]
+        centroids = best_info["centroids"]
+        inertia = best_info["inertia"]
+
+        logger.info(f"\nOptimal k={k} (silhouette={best_info['silhouette']:.3f})")
+
     else:
         # Default to min of k_range
         k = args.k_range[0]
         logger.info(f"\nUsing default k={k}")
 
-    # Run final clustering
-    labels, centroids, inertia = run_clustering(
-        X,
-        k=k,
-        n_init=args.n_init,
-        random_state=args.random_state,
-    )
+        labels, centroids, inertia = run_clustering(
+            X,
+            k=k,
+            n_init=args.n_init,
+            random_state=args.random_state,
+        )
+
+    # At this point we must have labels/centroids/inertia
+    assert labels is not None and centroids is not None and inertia is not None  # noqa: S101
 
     # Create visualizations
     logger.info("\nGenerating visualizations...")
