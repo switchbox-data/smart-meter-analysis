@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Phase 2: K-Means Clustering for Load Profile Analysis.
 
@@ -12,23 +13,26 @@ Pipeline:
     1. Load daily profiles from Phase 1
     2. Normalize profiles (optional but recommended)
     3. Evaluate k values to find optimal k (via silhouette score)
-    4. Run final clustering with optimal k
-    5. Output assignments, centroids, and visualizations
+    4. Run final clustering with optimal k (or a fixed k)
+    5. Output assignments, centroids, diagnostics, and visualizations
 
 Usage:
-    # Standard run (evaluates k=3-6)
-    python euclidean_clustering.py \\
-        --input data/clustering/sampled_profiles.parquet \\
-        --output-dir data/clustering/results \\
-        --k-range 3 6 \\
-        --find-optimal-k \\
-        --normalize
+    # Standard run (evaluates k=3-6, uses best k by silhouette)
+    python euclidean_clustering.py \
+        --input data/clustering/sampled_profiles.parquet \
+        --output-dir data/clustering/results \
+        --k-range 3 6 \
+        --find-optimal-k \
+        --normalize \
+        --normalize-method minmax
 
     # Fixed k (no evaluation)
-    python euclidean_clustering.py \\
-        --input data/clustering/sampled_profiles.parquet \\
-        --output-dir data/clustering/results \\
-        --k 4 --normalize
+    python euclidean_clustering.py \
+        --input data/clustering/sampled_profiles.parquet \
+        --output-dir data/clustering/results \
+        --k 4 \
+        --normalize \
+        --normalize-method minmax
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,6 +56,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# 1. DATA LOADING & NORMALIZATION
+# =============================================================================
+
+
 def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
     """
     Load profiles from parquet file.
@@ -61,16 +71,19 @@ def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
     Returns:
         Tuple of (profile_array, metadata_df)
     """
-    logger.info(f"Loading profiles from {path}")
+    logger.info("Loading profiles from %s", path)
 
     df = pl.read_parquet(path)
 
-    # Extract profiles as numpy array
+    if "profile" not in df.columns:
+        raise ValueError("Expected a 'profile' column containing the daily load vector.")
+
+    # Extract profiles as numpy array (shape: n_profiles x n_timepoints)
     profiles = np.array(df["profile"].to_list(), dtype=np.float64)
 
-    logger.info(f"  Loaded {len(profiles):,} profiles with {profiles.shape[1]} time points each")
-    logger.info(f"  Data shape: {profiles.shape}")
-    logger.info(f"  Data range: [{profiles.min():.2f}, {profiles.max():.2f}]")
+    logger.info("  Loaded %s profiles with %s time points each", f"{len(profiles):,}", profiles.shape[1])
+    logger.info("  Data shape: %s", (profiles.shape[0], profiles.shape[1]))
+    logger.info("  Data range: [%.2f, %.2f]", profiles.min(), profiles.max())
 
     return profiles, df
 
@@ -84,7 +97,7 @@ def normalize_profiles(
 
     Two modes:
 
-    - "minmax": per-profile minmax scaling to [0, 1]. This is the
+    - "minmax": per-profile min-max scaling to [0, 1]. This is the
       recommended and default method for nonstationary daily load
       profiles, because it preserves the intraday shape and interprets
       each value as "fraction of that day's peak load."
@@ -119,13 +132,18 @@ def normalize_profiles(
     return X_norm
 
 
+# =============================================================================
+# 2. K SELECTION & CLUSTERING
+# =============================================================================
+
+
 def evaluate_clustering(
     X: np.ndarray,
     k_range: range,
     n_init: int = 10,
     random_state: int = 42,
     keep_best: bool = False,
-) -> tuple[dict, dict | None]:
+) -> tuple[dict[str, list[float]], dict[str, Any] | None]:
     """
     Evaluate clustering for different values of k.
 
@@ -138,7 +156,10 @@ def evaluate_clustering(
                    best k (by silhouette).
 
     Returns:
-        eval_results: dict with k_values, inertia, and silhouette scores
+        eval_results: dict with keys
+            - "k_values"
+            - "inertia"
+            - "silhouette"
         best_info: dict with keys
             - "k"
             - "labels"
@@ -147,19 +168,19 @@ def evaluate_clustering(
             - "silhouette"
           or None if keep_best=False.
     """
-    logger.info(f"Evaluating clustering for k in {list(k_range)}...")
-    logger.info(f"  Dataset size: {X.shape[0]:,} profiles")
+    logger.info("Evaluating clustering for k in %s...", list(k_range))
+    logger.info("  Dataset size: %s profiles", f"{X.shape[0]:,}")
 
-    results = {
+    results: dict[str, list[float]] = {
         "k_values": [],
         "inertia": [],
         "silhouette": [],
     }
 
-    best_info: dict | None = None
+    best_info: dict[str, Any] | None = None
 
     for k in k_range:
-        logger.info(f"\n  Testing k={k}...")
+        logger.info("\n  Testing k=%s...", k)
 
         model = KMeans(
             n_clusters=k,
@@ -175,8 +196,8 @@ def evaluate_clustering(
         results["inertia"].append(inertia)
         results["silhouette"].append(sil_score)
 
-        logger.info(f"    Inertia: {inertia:,.2f}")
-        logger.info(f"    Silhouette: {sil_score:.3f}")
+        logger.info("    Inertia: %s", f"{inertia:,.2f}")
+        logger.info("    Silhouette: %.3f", sil_score)
 
         if keep_best and (best_info is None or sil_score > best_info["silhouette"]):
             best_info = {
@@ -190,7 +211,7 @@ def evaluate_clustering(
     return results, best_info
 
 
-def find_optimal_k(eval_results: dict) -> int:
+def find_optimal_k(eval_results: dict[str, list[float]]) -> int:
     """
     Find optimal k based on silhouette score.
 
@@ -203,10 +224,10 @@ def find_optimal_k(eval_results: dict) -> int:
     k_values = eval_results["k_values"]
     silhouettes = eval_results["silhouette"]
 
-    best_idx = np.argmax(silhouettes)
-    best_k = k_values[best_idx]
+    best_idx = int(np.argmax(silhouettes))
+    best_k = int(k_values[best_idx])
 
-    logger.info(f"\nOptimal k={best_k} (silhouette={silhouettes[best_idx]:.3f})")
+    logger.info("\nOptimal k=%s (silhouette=%.3f)", best_k, silhouettes[best_idx])
 
     return best_k
 
@@ -229,7 +250,7 @@ def run_clustering(
     Returns:
         Tuple of (labels, centroids, inertia)
     """
-    logger.info(f"\nRunning k-means with k={k} on {X.shape[0]:,} profiles...")
+    logger.info("\nRunning k-means with k=%s on %s profiles...", k, f"{X.shape[0]:,}")
 
     model = KMeans(
         n_clusters=k,
@@ -239,16 +260,36 @@ def run_clustering(
 
     labels = model.fit_predict(X)
     centroids = model.cluster_centers_
+    inertia = float(model.inertia_)
 
-    logger.info(f"  Inertia: {model.inertia_:,.2f}")
+    logger.info("  Inertia: %s", f"{inertia:,.2f}")
 
     # Log cluster distribution
     unique, counts = np.unique(labels, return_counts=True)
     for cluster, count in zip(unique, counts):
         pct = count / len(labels) * 100
-        logger.info(f"  Cluster {cluster}: {count:,} profiles ({pct:.1f}%)")
+        logger.info("  Cluster %s: %s profiles (%.1f%%)", cluster, f"{count:,}", pct)
 
-    return labels, centroids, float(model.inertia_)
+    return labels, centroids, inertia
+
+
+# =============================================================================
+# 3. PLOTTING
+# =============================================================================
+
+
+def _infer_hours(n_timepoints: int) -> tuple[np.ndarray, str]:
+    """Infer x-axis values and label based on number of timepoints."""
+    if n_timepoints == 48:
+        hours = np.arange(0.5, 24.5, 0.5)
+        xlabel = "Hour of Day"
+    elif n_timepoints == 24:
+        hours = np.arange(1, 25)
+        xlabel = "Hour of Day"
+    else:
+        hours = np.arange(n_timepoints)
+        xlabel = "Time Interval"
+    return hours, xlabel
 
 
 def plot_centroids(
@@ -265,16 +306,7 @@ def plot_centroids(
     k = len(centroids)
     n_timepoints = centroids.shape[1]
 
-    # Create hour labels (assuming 48 half-hourly intervals)
-    if n_timepoints == 48:
-        hours = np.arange(0.5, 24.5, 0.5)
-        xlabel = "Hour of Day"
-    elif n_timepoints == 24:
-        hours = np.arange(1, 25)
-        xlabel = "Hour of Day"
-    else:
-        hours = np.arange(n_timepoints)
-        xlabel = "Time Interval"
+    hours, xlabel = _infer_hours(n_timepoints)
 
     _fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -297,7 +329,7 @@ def plot_centroids(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved centroids plot: {output_path}")
+    logger.info("  Saved centroids plot: %s", output_path)
 
 
 def plot_cluster_samples(
@@ -322,13 +354,7 @@ def plot_cluster_samples(
     k = len(centroids)
     n_timepoints = X.shape[1]
 
-    # Create hour labels
-    if n_timepoints == 48:
-        hours = np.arange(0.5, 24.5, 0.5)
-    elif n_timepoints == 24:
-        hours = np.arange(1, 25)
-    else:
-        hours = np.arange(n_timepoints)
+    hours, _xlabel = _infer_hours(n_timepoints)
 
     _fig, axes = plt.subplots(1, k, figsize=(5 * k, 4), sharey=True)
     if k == 1:
@@ -341,8 +367,12 @@ def plot_cluster_samples(
         cluster_mask = labels == i
         cluster_profiles = X[cluster_mask]
 
-        # Sample profiles
         n_available = len(cluster_profiles)
+        if n_available == 0:
+            ax.set_title(f"Cluster {i} (n=0)")
+            ax.grid(True, alpha=0.3)
+            continue
+
         n_plot = min(n_samples, n_available)
         idx = rng.choice(n_available, size=n_plot, replace=False)
 
@@ -367,11 +397,11 @@ def plot_cluster_samples(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved cluster samples plot: {output_path}")
+    logger.info("  Saved cluster samples plot: %s", output_path)
 
 
 def plot_elbow_curve(
-    eval_results: dict,
+    eval_results: dict[str, list[float]],
     output_path: Path,
 ) -> None:
     """
@@ -388,7 +418,7 @@ def plot_elbow_curve(
     _fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
     # Inertia (elbow curve)
-    ax1.plot(k_values, inertia, "b-o", linewidth=2, markersize=8)
+    ax1.plot(k_values, inertia, "o-", linewidth=2, markersize=8)
     ax1.set_xlabel("Number of Clusters (k)", fontsize=12)
     ax1.set_ylabel("Inertia", fontsize=12)
     ax1.set_title("Elbow Curve", fontsize=14)
@@ -396,7 +426,7 @@ def plot_elbow_curve(
     ax1.set_xticks(k_values)
 
     # Silhouette score
-    ax2.plot(k_values, silhouette, "g-o", linewidth=2, markersize=8)
+    ax2.plot(k_values, silhouette, "o-", linewidth=2, markersize=8)
     ax2.set_xlabel("Number of Clusters (k)", fontsize=12)
     ax2.set_ylabel("Silhouette Score", fontsize=12)
     ax2.set_title("Silhouette Score", fontsize=14)
@@ -404,8 +434,8 @@ def plot_elbow_curve(
     ax2.set_xticks(k_values)
 
     # Mark optimal k
-    best_idx = np.argmax(silhouette)
-    ax2.axvline(x=k_values[best_idx], color="red", linestyle="--", alpha=0.7)
+    best_idx = int(np.argmax(silhouette))
+    ax2.axvline(x=k_values[best_idx], linestyle="--", alpha=0.7)
     ax2.scatter(
         [k_values[best_idx]],
         [silhouette[best_idx]],
@@ -420,15 +450,96 @@ def plot_elbow_curve(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved elbow curve: {output_path}")
+    logger.info("  Saved elbow curve: %s", output_path)
+
+
+# =============================================================================
+# 4. WEEKDAY/WEEKEND DIAGNOSTICS
+# =============================================================================
+
+
+def compute_cluster_time_diagnostics(assignments: pl.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    """
+    Compute weekday/weekend and day-of-week breakdowns for each cluster.
+
+    This is aimed at answering:
+      - Do we effectively have a "weekday cluster" and a "weekend cluster"?
+      - How balanced are clusters across days of week?
+
+    The function expects:
+      - a 'cluster' column
+      - some date column, preferably 'date_local', otherwise 'date'
+
+    Returns:
+        A dict with two lists of dicts, suitable for JSON serialization:
+        {
+          "cluster_weekend_breakdown": [...],
+          "cluster_day_of_week_breakdown": [...]
+        }
+    """
+    if "cluster" not in assignments.columns:
+        logger.warning("No 'cluster' column in assignments; skipping weekday/weekend diagnostics.")
+        return {}
+
+    date_col = None
+    if "date_local" in assignments.columns:
+        date_col = "date_local"
+    elif "date" in assignments.columns:
+        date_col = "date"
+
+    if date_col is None:
+        logger.warning("No 'date_local' or 'date' column in assignments; skipping weekday/weekend diagnostics.")
+        return {}
+
+    # Add weekday and weekend flags
+    df = assignments.with_columns(
+        pl.col(date_col).dt.weekday().alias("day_of_week"),
+        (pl.col(date_col).dt.weekday() >= 5).alias("is_weekend"),
+    )
+
+    # 1) Cluster x weekday/weekend breakdown (by number of days)
+    weekday_mix = (
+        df.group_by(["cluster", "is_weekend"])
+        .agg(pl.len().alias("n_days"))
+        .with_columns(
+            (pl.col("n_days") / pl.col("n_days").sum().over("cluster") * 100).round(1).alias("pct_of_cluster_days")
+        )
+        .sort(["cluster", "is_weekend"])
+    )
+
+    logger.info("Cluster x weekend breakdown (by days):\n%s", weekday_mix)
+
+    # 2) Cluster x full day-of-week breakdown (0=Mon, 6=Sun)
+    dow_mix = (
+        df.group_by(["cluster", "day_of_week"])
+        .agg(pl.len().alias("n_days"))
+        .with_columns(
+            (pl.col("n_days") / pl.col("n_days").sum().over("cluster") * 100).round(1).alias("pct_of_cluster_days")
+        )
+        .sort(["cluster", "day_of_week"])
+    )
+
+    logger.info("Cluster x day_of_week breakdown:\n%s", dow_mix)
+
+    # Convert to plain Python for JSON serialization
+    diagnostics = {
+        "cluster_weekend_breakdown": weekday_mix.to_dicts(),
+        "cluster_day_of_week_breakdown": dow_mix.to_dicts(),
+    }
+    return diagnostics
+
+
+# =============================================================================
+# 5. SAVING RESULTS
+# =============================================================================
 
 
 def save_results(
     df: pl.DataFrame,
     labels: np.ndarray,
     centroids: np.ndarray,
-    eval_results: dict,
-    metadata: dict,
+    eval_results: dict[str, list[float]] | None,
+    metadata: dict[str, Any],
     output_dir: Path,
 ) -> None:
     """
@@ -439,27 +550,49 @@ def save_results(
         labels: Cluster assignments
         centroids: Cluster centroids
         eval_results: K evaluation results (if any)
-        metadata: Clustering metadata
+        metadata: Clustering metadata (will be augmented with diagnostics)
         output_dir: Output directory
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine which ID columns are present (household vs ZIP+4 level)
-    id_cols = []
+    # Determine which ID/date columns are present (household vs ZIP+4 level)
+    id_cols: list[str] = []
     if "account_identifier" in df.columns:
         id_cols.append("account_identifier")
     if "zip_code" in df.columns:
         id_cols.append("zip_code")
-    id_cols.extend(["date", "is_weekend", "weekday"])
 
-    # Only include columns that exist
+    # Prefer the more explicit date_local, fall back to date if needed
+    date_cols = []
+    if "date_local" in df.columns:
+        date_cols.append("date_local")
+    if "date" in df.columns:
+        date_cols.append("date")
+
+    # Additional flags if already present
+    extra_cols = [c for c in ["is_weekend", "weekday"] if c in df.columns]
+
+    id_cols.extend(date_cols)
+    id_cols.extend(extra_cols)
+
     available_cols = [c for c in id_cols if c in df.columns]
 
-    # Save cluster assignments
+    # Save cluster assignments (one row per profile/day)
     assignments = df.select(available_cols).with_columns(pl.Series("cluster", labels))
     assignments_path = output_dir / "cluster_assignments.parquet"
     assignments.write_parquet(assignments_path)
-    logger.info(f"  Saved assignments: {assignments_path}")
+    logger.info("  Saved assignments: %s", assignments_path)
+
+    # Compute and save weekday/weekend diagnostics
+    diagnostics = compute_cluster_time_diagnostics(assignments)
+    if diagnostics:
+        # Attach to metadata
+        metadata["cluster_time_diagnostics"] = diagnostics
+
+        diag_path = output_dir / "cluster_time_diagnostics.json"
+        with open(diag_path, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, indent=2)
+        logger.info("  Saved weekday/weekend diagnostics: %s", diag_path)
 
     # Save centroids as parquet
     centroids_df = pl.DataFrame({
@@ -468,20 +601,25 @@ def save_results(
     })
     centroids_path = output_dir / "cluster_centroids.parquet"
     centroids_df.write_parquet(centroids_path)
-    logger.info(f"  Saved centroids: {centroids_path}")
+    logger.info("  Saved centroids: %s", centroids_path)
 
     # Save k evaluation results
     if eval_results:
         eval_path = output_dir / "k_evaluation.json"
-        with open(eval_path, "w") as f:
+        with open(eval_path, "w", encoding="utf-8") as f:
             json.dump(eval_results, f, indent=2)
-        logger.info(f"  Saved k evaluation: {eval_path}")
+        logger.info("  Saved k evaluation: %s", eval_path)
 
-    # Save metadata
+    # Save metadata (including diagnostics if computed)
     metadata_path = output_dir / "clustering_metadata.json"
-    with open(metadata_path, "w") as f:
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-    logger.info(f"  Saved metadata: {metadata_path}")
+    logger.info("  Saved metadata: %s", metadata_path)
+
+
+# =============================================================================
+# 6. CLI
+# =============================================================================
 
 
 def main() -> None:
@@ -491,16 +629,16 @@ def main() -> None:
         epilog="""
 Examples:
     # Standard run with k evaluation
-    python euclidean_clustering.py \\
-        --input data/clustering/sampled_profiles.parquet \\
-        --output-dir data/clustering/results \\
-        --k-range 3 6 --find-optimal-k --normalize
+    python euclidean_clustering.py \
+        --input data/clustering/sampled_profiles.parquet \
+        --output-dir data/clustering/results \
+        --k-range 3 6 --find-optimal-k --normalize --normalize-method minmax
 
     # Fixed k (no evaluation)
-    python euclidean_clustering.py \\
-        --input data/clustering/sampled_profiles.parquet \\
-        --output-dir data/clustering/results \\
-        --k 4 --normalize
+    python euclidean_clustering.py \
+        --input data/clustering/sampled_profiles.parquet \
+        --output-dir data/clustering/results \
+        --k 4 --normalize --normalize-method minmax
         """,
     )
 
@@ -536,7 +674,7 @@ Examples:
     k_group.add_argument(
         "--find-optimal-k",
         action="store_true",
-        help="Evaluate k range and use optimal k",
+        help="Evaluate k range and use optimal k (by silhouette score)",
     )
 
     # Clustering parameters
@@ -551,9 +689,8 @@ Examples:
     parser.add_argument(
         "--normalize",
         action="store_true",
-        help="Apply z-score normalization to profiles",
+        help="Apply normalization to profiles (see --normalize-method).",
     )
-
     parser.add_argument(
         "--normalize-method",
         choices=["minmax", "none"],
@@ -565,6 +702,7 @@ Examples:
         ),
     )
 
+    # Misc
     parser.add_argument(
         "--random-state",
         type=int,
@@ -585,11 +723,8 @@ Examples:
     if args.normalize:
         X = normalize_profiles(X, method=args.normalize_method)
 
-    # Determine k
-    eval_results = None
-
-    # Determine k and (if available) reuse best model from evaluation
-    eval_results: dict | None = None
+    # Determine k and, if applicable, reuse best model from evaluation
+    eval_results: dict[str, list[float]] | None = None
     labels: np.ndarray | None = None
     centroids: np.ndarray | None = None
     inertia: float | None = None
@@ -597,7 +732,7 @@ Examples:
     if args.k is not None:
         # Fixed k
         k = args.k
-        logger.info(f"\nUsing fixed k={k}")
+        logger.info("\nUsing fixed k=%s", k)
 
         labels, centroids, inertia = run_clustering(
             X,
@@ -625,17 +760,17 @@ Examples:
         if best_info is None:
             raise RuntimeError("No best model found during k evaluation.")
 
-        k = best_info["k"]
+        k = int(best_info["k"])
         labels = best_info["labels"]
         centroids = best_info["centroids"]
-        inertia = best_info["inertia"]
+        inertia = float(best_info["inertia"])
 
-        logger.info(f"\nOptimal k={k} (silhouette={best_info['silhouette']:.3f})")
+        logger.info("\nOptimal k=%s (silhouette=%.3f)", k, best_info["silhouette"])
 
     else:
         # Default to min of k_range
-        k = args.k_range[0]
-        logger.info(f"\nUsing default k={k}")
+        k = int(args.k_range[0])
+        logger.info("\nUsing default k=%s", k)
 
         labels, centroids, inertia = run_clustering(
             X,
@@ -650,22 +785,21 @@ Examples:
     # Create visualizations
     logger.info("\nGenerating visualizations...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
     plot_centroids(centroids, args.output_dir / "cluster_centroids.png")
     plot_cluster_samples(X, labels, centroids, args.output_dir / "cluster_samples.png")
 
-    # Save results
+    # Save results (+ diagnostics)
     logger.info("\nSaving results...")
 
-    metadata = {
-        "k": k,
+    metadata: dict[str, Any] = {
+        "k": int(k),
         "n_profiles": len(X),
-        "n_timepoints": X.shape[1],
-        "normalized": args.normalize,
+        "n_timepoints": int(X.shape[1]),
+        "normalized": bool(args.normalize),
         "normalize_method": args.normalize_method if args.normalize else None,
-        "n_init": args.n_init,
-        "random_state": args.random_state,
-        "inertia": inertia,
+        "n_init": int(args.n_init),
+        "random_state": int(args.random_state),
+        "inertia": float(inertia),
         "distance_metric": "euclidean",
     }
 
