@@ -154,7 +154,12 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
 
 
 def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
-    """Load ZIP+4 → Census block-group crosswalk."""
+    """Load ZIP+4 → Census block-group crosswalk for the ZIP+4s in our data.
+
+    Also runs a small diagnostic to detect fan-out (ZIP+4 mapping to
+    multiple block groups), which would imply potential over-counting
+    if we don't re-weight.
+    """
     logger.info(f"Loading crosswalk from {crosswalk_path}")
 
     crosswalk = (
@@ -175,6 +180,30 @@ def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
         f"{crosswalk['zip_code'].n_unique():,}",
         f"{len(set(zip_codes)):,}",
     )
+
+    # ------------------------------------------------------------------
+    # Fan-out diagnostic: do any ZIP+4s map to multiple block groups?
+    # ------------------------------------------------------------------
+    if crosswalk.is_empty():
+        logger.warning("  Crosswalk is empty after filtering for sample ZIP+4s.")
+        return crosswalk
+
+    fanout = crosswalk.group_by("zip_code").agg(pl.n_unique("block_group_geoid").alias("n_block_groups"))
+
+    max_fanout = int(fanout["n_block_groups"].max())
+
+    if max_fanout > 1:
+        fanout_summary = fanout.group_by("n_block_groups").agg(pl.len().alias("n_zip4")).sort("n_block_groups")
+        logger.warning(
+            "  WARNING: ZIP+4 → block-group crosswalk has fan-out for the "
+            "current sample (some ZIP+4s map to multiple block groups). "
+            "Distribution of mappings:\n%s",
+            fanout_summary,
+        )
+    else:
+        logger.info(
+            "  Crosswalk is 1-to-1 for the current sample: each ZIP+4 maps to exactly one block group (no fan-out)."
+        )
 
     return crosswalk
 
