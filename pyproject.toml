@@ -5,12 +5,11 @@ description = "This is the repo for the smart-meter-analysis project"
 authors = [{ name = "Switchbox", email = "hello@switch.box" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -18,10 +17,24 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "boto3>=1.7.84",
-    "pyyaml>=6.0.2",
-    "requests>=2.32.4",
-    "selenium>=4.35.0",
+    "boto3>=1.40.46",
+    "botocore>=1.40.47",
+    "cenpy>=1.0.1",
+    "ipykernel>=6.30.1",
+    "matplotlib>=3.9.4",
+    "memory-profiler>=0.61.0",
+    "numpy>=2.2.6",
+    "openpyxl>=3.1.5",
+    "polars>=1.31.0",
+    "pyarrow>=14.0.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+    "scikit-learn>=1.6.1",
+    "seaborn>=0.13.2",
+    "selenium>=4.37.0",
+    "snakeviz>=2.2.2",
+    "statsmodels>=0.14.5",
+    "tslearn>=0.7.0",
 ]
 
 [project.urls]
@@ -34,10 +47,16 @@ exclude = ["archive", ".venv", "tests"]
 
 [tool.deptry.per_rule_ignores]
 DEP002 = [
-  "ipykernel>=6.30.1",
-  "quarto>=0.1.0",
-  "beautifulsoup4>=4.12.0",
-  "webdriver-manager>=4.0.2",
+  "ipykernel",
+  "cenpy",
+  "openpyxl",
+  "scikit-learn",
+  "quarto",
+  "beautifulsoup4",
+  "webdriver-manager",
+  "pyarrow",
+  "memory-profiler",
+  "snakeviz",
 ]
 DEP003 = ["botocore"]
 DEP004 = ["botocore"]
@@ -54,6 +73,8 @@ dev = [
     "mkdocs>=1.4.2",
     "mkdocs-material>=8.5.10",
     "mkdocstrings[python]>=0.26.1",
+    "boto3-stubs>=1.40.46",
+    "types-requests>=2.32.4.20250913",
 ]
 
 
@@ -74,8 +95,14 @@ warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 
+[[tool.mypy.overrides]]
+module = "boto3.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+]
 
 [tool.ruff]
 target-version = "py39"
@@ -90,49 +117,24 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-    # flake8-2020
-    "YTT",
-    # flake8-bandit
-    "S",
-    # flake8-bugbear
-    "B",
-    # flake8-builtins
-    "A",
-    # flake8-comprehensions
-    "C4",
-    # flake8-debugger
-    "T10",
-    # flake8-simplify
-    "SIM",
-    # isort
-    "I",
-    # mccabe
-    "C90",
-    # pycodestyle
-    "E", "W",
-    # pyflakes
-    "F",
-    # pygrep-hooks
-    "PGH",
-    # pyupgrade
-    "UP",
-    # ruff
-    "RUF",
-    # tryceratops
-    "TRY",
+    "YTT", "S", "B", "A", "C4", "T10", "SIM", "I", "C90",
+    "E", "W", "F", "PGH", "UP", "RUF", "TRY",
 ]
-ignore = [
-    # LineTooLong
-    "E501",
-    # DoNotAssignLambda
-    "E731",
-]
+ignore = ["E501", "E731"]
+extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+"scripts/run_comed_pipeline.py" = ["C901", "S603"]
+"scripts/diagnostics/*.py" = ["C901"]
+"smart_meter_analysis/pipeline_validator.py" = ["C901", "PGH003"]
 "tests/test_aws_transform.py" = ["E402"]
 "tests/test_census.py" = ["E402"]
 "scripts/data_collection/*" = ["C901"]
+"analysis/clustering/clustering_validation.py" = ["C901", "F841", "RUF015"]
+"tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
+"scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
+"tests/*" = ["S101", "RUF001"]
+
 
 [tool.ruff.format]
 preview = true
