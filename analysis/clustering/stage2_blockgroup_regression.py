@@ -54,18 +54,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Default predictors
+# Default predictors (leaner set to help with convergence and interpretability)
 DEFAULT_PREDICTORS = [
     "Median_Household_Income",
     "Median_Age",
+    "Urban_Percent",
     "Total_Households",
     "Owner_Occupied",
     "Renter_Occupied",
-    "Heat_Electric",
-    "Heat_Utility_Gas",
-    "Urban_Percent",
-    "Built_2020_After",
-    "Built_1939_Earlier",
 ]
 
 
@@ -79,7 +75,7 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
     Load household-day cluster assignments and aggregate to household level.
 
     Each household is assigned to their DOMINANT cluster (most frequent).
-    I track how confident this assignment is (what % of days fell into that cluster).
+    We also compute a dominance metric: fraction of sampled days in that cluster.
 
     Returns
     -------
@@ -95,7 +91,7 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
     confidence_stats : dict
         Summary statistics on assignment confidence
     """
-    logger.info(f"Loading cluster assignments from {path}")
+    logger.info("Loading cluster assignments from %s", path)
     raw = pl.read_parquet(path)
 
     required = ["account_identifier", "zip_code", "cluster"]
@@ -156,12 +152,7 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
 
 
 def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
-    """Load ZIP+4 → Census block-group crosswalk for the ZIP+4s in our data.
-
-    Also runs a small diagnostic to detect fan-out (ZIP+4 mapping to
-    multiple block groups), which would imply potential over-counting
-    if we don't re-weight.
-    """
+    """Load ZIP+4 → Census block-group crosswalk."""
     logger.info(f"Loading crosswalk from {crosswalk_path}")
 
     crosswalk = (
@@ -182,30 +173,6 @@ def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
         f"{crosswalk['zip_code'].n_unique():,}",
         f"{len(set(zip_codes)):,}",
     )
-
-    # ------------------------------------------------------------------
-    # Fan-out diagnostic: do any ZIP+4s map to multiple block groups?
-    # ------------------------------------------------------------------
-    if crosswalk.is_empty():
-        logger.warning("  Crosswalk is empty after filtering for sample ZIP+4s.")
-        return crosswalk
-
-    fanout = crosswalk.group_by("zip_code").agg(pl.n_unique("block_group_geoid").alias("n_block_groups"))
-
-    max_fanout = int(fanout["n_block_groups"].max())
-
-    if max_fanout > 1:
-        fanout_summary = fanout.group_by("n_block_groups").agg(pl.len().alias("n_zip4")).sort("n_block_groups")
-        logger.warning(
-            "  WARNING: ZIP+4 → block-group crosswalk has fan-out for the "
-            "current sample (some ZIP+4s map to multiple block groups). "
-            "Distribution of mappings:\n%s",
-            fanout_summary,
-        )
-    else:
-        logger.info(
-            "  Crosswalk is 1-to-1 for the current sample: each ZIP+4 maps to exactly one block group (no fan-out)."
-        )
 
     return crosswalk
 
@@ -336,8 +303,8 @@ def prepare_regression_dataset(
 
     logger.info("  After cluster diversity filter: %s block groups", f"{df['block_group_geoid'].n_unique():,}")
 
-    # Filter predictors to those that exist and have data
-    available_predictors = []
+    # Filter predictors to those that exist and have acceptable missingness
+    available_predictors: list[str] = []
     for p in predictors:
         if p not in df.columns:
             logger.warning("  Predictor not found: %s", p)
@@ -405,7 +372,6 @@ def run_multinomial_regression(
     if len(X) == 0:
         raise ValueError("No observations remaining after dropping NaN rows.")
 
-    # Count block groups with complete predictor data
     n_block_groups = reg_df.filter(~pl.any_horizontal(pl.col(predictors).is_null()))["block_group_geoid"].n_unique()
 
     # Optional standardization
@@ -492,6 +458,9 @@ def generate_report(
     """Generate human-readable summary."""
     conf = results.get("cluster_assignment_confidence", {})
 
+    n_households = conf.get("n_households")
+    households_line = "  Households: N/A" if n_households is None else f"  Households: {n_households:,}"
+
     lines = [
         "=" * 70,
         "STAGE 2: BLOCK-GROUP MULTINOMIAL REGRESSION RESULTS",
@@ -513,7 +482,7 @@ def generate_report(
         "Each household assigned to their most frequent (dominant) cluster.",
         "Dominance = fraction of household's days in their assigned cluster.",
         "",
-        f"  Households: {conf.get('n_households', 'N/A'):,}",
+        households_line,
         f"  Mean dominance: {conf.get('dominance_mean', 0) * 100:.1f}%",
         f"  Median dominance: {conf.get('dominance_median', 0) * 100:.1f}%",
         f"  Households >50% in one cluster: {conf.get('pct_above_50', 0):.1f}%",
@@ -577,27 +546,30 @@ def main() -> int:
 
     parser.add_argument("--clusters", type=Path, required=True, help="cluster_assignments.parquet")
     parser.add_argument("--crosswalk", type=Path, required=True, help="ZIP+4 → block-group crosswalk")
-    parser.add_argument("--census-cache", type=Path, default=Path("data/reference/census_17_2023.parquet"))
-    parser.add_argument("--fetch-census", action="store_true", help="Force re-fetch Census data")
+    parser.add_argument(
+        "--census-cache",
+        type=Path,
+        default=Path("data/reference/census_17_2023.parquet"),
+    )
+    parser.add_argument(
+        "--fetch-census",
+        action="store_true",
+        help="Force re-fetch Census data",
+    )
     parser.add_argument("--state-fips", default="17")
     parser.add_argument("--acs-year", type=int, default=2023)
     parser.add_argument("--min-households-per-bg", type=int, default=10)
     parser.add_argument("--min-nonzero-clusters-per-bg", type=int, default=2)
     parser.add_argument("--predictors", nargs="+", default=DEFAULT_PREDICTORS, help="Predictor columns")
     parser.add_argument("--output-dir", type=Path, default=Path("data/clustering/results/stage2_blockgroups"))
-    parser.add_argument(
-        "--standardize",
-        action="store_true",
-        help="Standardize predictors before regression.Default is to use raw units (easier to interpret).",
-    )
 
     args = parser.parse_args()
 
     if not args.clusters.exists():
-        logger.error(f"Cluster assignments not found: {args.clusters}")
+        logger.error("Cluster assignments not found: %s", args.clusters)
         return 1
     if not args.crosswalk.exists():
-        logger.error(f"Crosswalk not found: {args.crosswalk}")
+        logger.error("Crosswalk not found: %s", args.crosswalk)
         return 1
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -612,27 +584,36 @@ def main() -> int:
     clusters_bg = attach_block_groups(clusters, crosswalk)
     bg_counts = aggregate_blockgroup_cluster_counts(clusters_bg)
 
-    census_df = fetch_or_load_census(args.census_cache, args.state_fips, args.acs_year, args.fetch_census)
-    logger.info("  Census: %s block groups, %s columns", f"{len(census_df):,}", len(census_df.columns))
+    census_df = fetch_or_load_census(
+        cache_path=args.census_cache,
+        state_fips=args.state_fips,
+        acs_year=args.acs_year,
+        force_fetch=args.fetch_census,
+    )
+    logger.info(
+        "  Census: %s block groups, %s columns",
+        f"{len(census_df):,}",
+        len(census_df.columns),
+    )
 
     demo_df = attach_census_to_blockgroups(bg_counts, census_df)
 
     reg_df, predictors = prepare_regression_dataset(
-        demo_df,
-        args.predictors,
-        args.min_households_per_bg,
-        args.min_nonzero_clusters_per_bg,
+        demo_df=demo_df,
+        predictors=args.predictors,
+        min_households_per_bg=args.min_households_per_bg,
+        min_nonzero_clusters_per_bg=args.min_nonzero_clusters_per_bg,
     )
 
     if reg_df.is_empty():
         logger.error("No data after filtering")
         return 1
 
-    # Save dataset
+    # Save dataset used for regression
     reg_df.write_parquet(args.output_dir / "regression_data_blockgroups.parquet")
 
     # Run regression
-    results = run_multinomial_regression(reg_df, predictors, standardize=args.standardize)
+    results = run_multinomial_regression(reg_df, predictors)
 
     # Add confidence stats to results
     results["cluster_assignment_confidence"] = confidence_stats
