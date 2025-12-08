@@ -43,6 +43,10 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import statsmodels.api as sm
+from sklearn.preprocessing import StandardScaler
+
+from smart_meter_analysis.census import fetch_census_data
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -50,18 +54,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Default predictors
+# Default predictors (leaner set to help with convergence and interpretability)
 DEFAULT_PREDICTORS = [
     "Median_Household_Income",
     "Median_Age",
+    "Urban_Percent",
     "Total_Households",
     "Owner_Occupied",
     "Renter_Occupied",
-    "Heat_Electric",
-    "Heat_Utility_Gas",
-    "Urban_Percent",
-    "Built_2020_After",
-    "Built_1939_Earlier",
 ]
 
 
@@ -75,7 +75,7 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
     Load household-day cluster assignments and aggregate to household level.
 
     Each household is assigned to their DOMINANT cluster (most frequent).
-    I track how confident this assignment is (what % of days fell into that cluster).
+    We also compute a dominance metric: fraction of sampled days in that cluster.
 
     Returns
     -------
@@ -91,7 +91,7 @@ def load_cluster_assignments(path: Path) -> tuple[pl.DataFrame, dict]:
     confidence_stats : dict
         Summary statistics on assignment confidence
     """
-    logger.info(f"Loading cluster assignments from {path}")
+    logger.info("Loading cluster assignments from %s", path)
     raw = pl.read_parquet(path)
 
     required = ["account_identifier", "zip_code", "cluster"]
@@ -237,16 +237,10 @@ def fetch_or_load_census(
 ) -> pl.DataFrame:
     """Fetch Census data from API or load from cache."""
     if cache_path.exists() and not force_fetch:
-        logger.info(f"Loading Census data from cache: {cache_path}")
+        logger.info("Loading Census data from cache: %s", cache_path)
         return pl.read_parquet(cache_path)
 
     logger.info("Fetching Census data from API (state=%s, year=%s)...", state_fips, acs_year)
-
-    try:
-        from smart_meter_analysis.census import fetch_census_data
-    except ImportError:
-        logger.error("Could not import fetch_census_data from smart_meter_analysis.census.")
-        raise
 
     census_df = fetch_census_data(state_fips=state_fips, acs_year=acs_year)
 
@@ -309,8 +303,8 @@ def prepare_regression_dataset(
 
     logger.info("  After cluster diversity filter: %s block groups", f"{df['block_group_geoid'].n_unique():,}")
 
-    # Filter predictors to those that exist and have data
-    available_predictors = []
+    # Filter predictors to those that exist and have acceptable missingness
+    available_predictors: list[str] = []
     for p in predictors:
         if p not in df.columns:
             logger.warning("  Predictor not found: %s", p)
@@ -346,19 +340,30 @@ def run_multinomial_regression(
     predictors: list[str],
     outcome: str = "cluster",
     weight_col: str = "n_households",
+    standardize: bool = False,
 ) -> dict[str, object]:
-    """Run multinomial logistic regression with statsmodels."""
-    logger.info("Running multinomial logistic regression...")
+    """Run multinomial logistic regression with statsmodels.
 
-    import statsmodels.api as sm
-    from sklearn.preprocessing import StandardScaler
+    Args:
+        reg_df: Block-group x cluster dataset.
+        predictors: List of predictor column names.
+        outcome: Name of outcome column (cluster index).
+        weight_col: Column giving number of households in each row.
+        standardize: If True, z-score predictors before fitting. If False,
+                     use raw units (easier to interpret).
+
+    Returns:
+        Dictionary of regression results, coefficients, and metadata.
+    """
+    logger.info("Running multinomial logistic regression...")
+    logger.info("  Standardize predictors: %s", standardize)
 
     # Extract arrays
     X = reg_df.select(predictors).to_numpy().astype(np.float64)
     y = reg_df.get_column(outcome).to_numpy()
     weights = reg_df.get_column(weight_col).to_numpy().astype(np.float64)
 
-    # Drop rows with NaN
+    # Drop rows with NaN in predictors
     nan_mask = np.isnan(X).any(axis=1)
     if nan_mask.sum() > 0:
         logger.warning("  Dropping %s rows with NaN predictors", f"{nan_mask.sum():,}")
@@ -369,17 +374,28 @@ def run_multinomial_regression(
 
     n_block_groups = reg_df.filter(~pl.any_horizontal(pl.col(predictors).is_null()))["block_group_geoid"].n_unique()
 
-    # Standardize and add intercept
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_with_const = sm.add_constant(X_scaled)
+    # Optional standardization
+    scaler: StandardScaler | None
+    if standardize:
+        scaler = StandardScaler()
+        X_proc = scaler.fit_transform(X)
+    else:
+        scaler = None
+        X_proc = X
 
-    # Expand rows by weights for proper frequency weighting
+    # Add intercept
+    X_with_const = sm.add_constant(X_proc)
+
+    # Expand rows by weights for household-weighted likelihood
     weight_ints = np.maximum(np.round(weights).astype(int), 1)
     X_expanded = np.repeat(X_with_const, weight_ints, axis=0)
     y_expanded = np.repeat(y, weight_ints)
 
-    logger.info("  Training on %s expanded rows (%s block groups)", f"{len(X_expanded):,}", n_block_groups)
+    logger.info(
+        "  Training on %s expanded rows (%s block groups)",
+        f"{len(X_expanded):,}",
+        n_block_groups,
+    )
 
     model = sm.MNLogit(y_expanded, X_expanded)
     result = model.fit(method="newton", maxiter=100, disp=False)
@@ -389,10 +405,10 @@ def run_multinomial_regression(
     baseline = classes[0]
     param_names = ["const", *predictors]
 
-    coefficients = {}
-    std_errors = {}
-    p_values = {}
-    odds_ratios = {}
+    coefficients: dict[str, dict[str, float]] = {}
+    std_errors: dict[str, dict[str, float]] = {}
+    p_values: dict[str, dict[str, float]] = {}
+    odds_ratios: dict[str, dict[str, float]] = {}
 
     for i, cls in enumerate(classes[1:]):
         key = f"cluster_{cls}"
@@ -401,7 +417,7 @@ def run_multinomial_regression(
         p_values[key] = {name: float(result.pvalues[j, i]) for j, name in enumerate(param_names)}
         odds_ratios[key] = {name: float(np.exp(result.params[j, i])) for j, name in enumerate(param_names)}
 
-    # Baseline cluster
+    # Baseline cluster: zeros and ones by construction
     baseline_key = f"cluster_{baseline}"
     coefficients[baseline_key] = dict.fromkeys(param_names, 0.0)
     std_errors[baseline_key] = dict.fromkeys(param_names, 0.0)
@@ -426,6 +442,10 @@ def run_multinomial_regression(
         "converged": bool(result.mle_retvals.get("converged", True)),
         "pseudo_r2": float(result.prsquared),
         "llf": float(result.llf),
+        "standardized_predictors": bool(standardize),
+        # These let us back out “per SD” interpretations later if we ever do turn standardization on.
+        "scaler_means": scaler.mean_.tolist() if scaler is not None else None,
+        "scaler_scales": scaler.scale_.tolist() if scaler is not None else None,
         "model_summary": result.summary().as_text(),
     }
 
@@ -437,6 +457,9 @@ def generate_report(
 ) -> None:
     """Generate human-readable summary."""
     conf = results.get("cluster_assignment_confidence", {})
+
+    n_households = conf.get("n_households")
+    households_line = "  Households: N/A" if n_households is None else f"  Households: {n_households:,}"
 
     lines = [
         "=" * 70,
@@ -459,7 +482,7 @@ def generate_report(
         "Each household assigned to their most frequent (dominant) cluster.",
         "Dominance = fraction of household's days in their assigned cluster.",
         "",
-        f"  Households: {conf.get('n_households', 'N/A'):,}",
+        households_line,
         f"  Mean dominance: {conf.get('dominance_mean', 0) * 100:.1f}%",
         f"  Median dominance: {conf.get('dominance_median', 0) * 100:.1f}%",
         f"  Households >50% in one cluster: {conf.get('pct_above_50', 0):.1f}%",
@@ -523,8 +546,16 @@ def main() -> int:
 
     parser.add_argument("--clusters", type=Path, required=True, help="cluster_assignments.parquet")
     parser.add_argument("--crosswalk", type=Path, required=True, help="ZIP+4 → block-group crosswalk")
-    parser.add_argument("--census-cache", type=Path, default=Path("data/reference/census_17_2023.parquet"))
-    parser.add_argument("--fetch-census", action="store_true", help="Force re-fetch Census data")
+    parser.add_argument(
+        "--census-cache",
+        type=Path,
+        default=Path("data/reference/census_17_2023.parquet"),
+    )
+    parser.add_argument(
+        "--fetch-census",
+        action="store_true",
+        help="Force re-fetch Census data",
+    )
     parser.add_argument("--state-fips", default="17")
     parser.add_argument("--acs-year", type=int, default=2023)
     parser.add_argument("--min-households-per-bg", type=int, default=10)
@@ -535,10 +566,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.clusters.exists():
-        logger.error(f"Cluster assignments not found: {args.clusters}")
+        logger.error("Cluster assignments not found: %s", args.clusters)
         return 1
     if not args.crosswalk.exists():
-        logger.error(f"Crosswalk not found: {args.crosswalk}")
+        logger.error("Crosswalk not found: %s", args.crosswalk)
         return 1
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -553,23 +584,32 @@ def main() -> int:
     clusters_bg = attach_block_groups(clusters, crosswalk)
     bg_counts = aggregate_blockgroup_cluster_counts(clusters_bg)
 
-    census_df = fetch_or_load_census(args.census_cache, args.state_fips, args.acs_year, args.fetch_census)
-    logger.info("  Census: %s block groups, %s columns", f"{len(census_df):,}", len(census_df.columns))
+    census_df = fetch_or_load_census(
+        cache_path=args.census_cache,
+        state_fips=args.state_fips,
+        acs_year=args.acs_year,
+        force_fetch=args.fetch_census,
+    )
+    logger.info(
+        "  Census: %s block groups, %s columns",
+        f"{len(census_df):,}",
+        len(census_df.columns),
+    )
 
     demo_df = attach_census_to_blockgroups(bg_counts, census_df)
 
     reg_df, predictors = prepare_regression_dataset(
-        demo_df,
-        args.predictors,
-        args.min_households_per_bg,
-        args.min_nonzero_clusters_per_bg,
+        demo_df=demo_df,
+        predictors=args.predictors,
+        min_households_per_bg=args.min_households_per_bg,
+        min_nonzero_clusters_per_bg=args.min_nonzero_clusters_per_bg,
     )
 
     if reg_df.is_empty():
         logger.error("No data after filtering")
         return 1
 
-    # Save dataset
+    # Save dataset used for regression
     reg_df.write_parquet(args.output_dir / "regression_data_blockgroups.parquet")
 
     # Run regression
