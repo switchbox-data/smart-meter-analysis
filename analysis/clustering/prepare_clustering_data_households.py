@@ -554,7 +554,7 @@ Examples:
         "--day-strategy",
         choices=["stratified", "random"],
         default="stratified",
-        help="Day sampling: stratified (70% weekday) or random.",
+        help="Day sampling: stratified (70%% weekday) or random.",
     )
     parser.add_argument(
         "--seed",
