@@ -113,7 +113,7 @@ def ensure_account_manifest(input_path: Path) -> Path:
         .filter(pl.col("account_identifier").is_not_null())
         .group_by("account_identifier")
         .agg(pl.first("zip_code").alias("zip_code"))
-        .collect(streaming=True)
+        .collect(engine="streaming")
         .sort("account_identifier")
     )
 
@@ -175,7 +175,7 @@ def ensure_date_manifest(input_path: Path) -> Path:
             pl.first("is_weekend").alias("is_weekend"),
             pl.first("weekday").alias("weekday"),
         )
-        .collect(streaming=True)
+        .collect(engine="streaming")
         .sort("date")
     )
 
