@@ -11,18 +11,19 @@ appropriate and much faster.
 Pipeline:
     1. Load daily profiles from Phase 1
     2. Normalize profiles (optional but recommended)
-    3. Evaluate k values to find optimal k (via silhouette score)
+    3. Evaluate k values to find optimal k (via silhouette score on a sample)
     4. Run final clustering with optimal k
     5. Output assignments, centroids, and visualizations
 
 Usage:
-    # Standard run (evaluates k=3-6)
+    # Standard run (evaluates k=3-6 using silhouette on up to 10k samples)
     python euclidean_clustering.py \\
         --input data/clustering/sampled_profiles.parquet \\
         --output-dir data/clustering/results \\
         --k-range 3 6 \\
         --find-optimal-k \\
-        --normalize
+        --normalize \\
+        --silhouette-sample-size 10000
 
     # Fixed k (no evaluation)
     python euclidean_clustering.py \\
@@ -68,9 +69,13 @@ def load_profiles(path: Path) -> tuple[np.ndarray, pl.DataFrame]:
     # Extract profiles as numpy array
     profiles = np.array(df["profile"].to_list(), dtype=np.float64)
 
-    logger.info(f"  Loaded {len(profiles):,} profiles with {profiles.shape[1]} time points each")
-    logger.info(f"  Data shape: {profiles.shape}")
-    logger.info(f"  Data range: [{profiles.min():.2f}, {profiles.max():.2f}]")
+    logger.info(
+        "  Loaded %s profiles with %s time points each",
+        f"{len(profiles):,}",
+        profiles.shape[1],
+    )
+    logger.info("  Data shape: %s", (profiles.shape[0], profiles.shape[1]))
+    logger.info("  Data range: [%.2f, %.2f]", profiles.min(), profiles.max())
 
     return profiles, df
 
@@ -92,7 +97,7 @@ def normalize_profiles(
     if method == "none":
         return X
 
-    logger.info(f"Normalizing profiles using {method} method...")
+    logger.info("Normalizing profiles using %s method...", method)
 
     if method == "zscore":
         # Per-profile z-score normalization
@@ -110,7 +115,11 @@ def normalize_profiles(
     else:
         raise ValueError(f"Unknown normalization method: {method}")
 
-    logger.info(f"  Normalized data range: [{X_norm.min():.2f}, {X_norm.max():.2f}]")
+    logger.info(
+        "  Normalized data range: [%.2f, %.2f]",
+        X_norm.min(),
+        X_norm.max(),
+    )
 
     return X_norm
 
@@ -120,21 +129,41 @@ def evaluate_clustering(
     k_range: range,
     n_init: int = 10,
     random_state: int = 42,
+    silhouette_sample_size: int | None = 10_000,
 ) -> dict:
     """
     Evaluate clustering for different values of k.
+
+    Uses inertia on the full dataset and silhouette score computed on a
+    subsample (to avoid O(n^2) cost when n is large).
 
     Args:
         X: Profile array of shape (n_samples, n_timepoints)
         k_range: Range of k values to test
         n_init: Number of random initializations
         random_state: Random seed for reproducibility
+        silhouette_sample_size: Max number of samples for silhouette.
+            If None, uses full dataset (NOT recommended for very large n).
 
     Returns:
         Dictionary with k_values, inertia, and silhouette scores
     """
-    logger.info(f"Evaluating clustering for k in {list(k_range)}...")
-    logger.info(f"  Dataset size: {X.shape[0]:,} profiles")
+    n_samples = X.shape[0]
+    logger.info("Evaluating clustering for k in %s...", list(k_range))
+    logger.info("  Dataset size: %s profiles", f"{n_samples:,}")
+
+    if silhouette_sample_size is None:
+        logger.info("  Silhouette: using FULL dataset (may be very slow).")
+    elif n_samples > silhouette_sample_size:
+        logger.info(
+            "  Silhouette: using a random subsample of %s profiles.",
+            f"{silhouette_sample_size:,}",
+        )
+    else:
+        logger.info(
+            "  Silhouette: using all %s profiles (<= sample size).",
+            f"{n_samples:,}",
+        )
 
     results = {
         "k_values": [],
@@ -143,7 +172,8 @@ def evaluate_clustering(
     }
 
     for k in k_range:
-        logger.info(f"\n  Testing k={k}...")
+        logger.info("")
+        logger.info("  Testing k=%d...", k)
 
         model = KMeans(
             n_clusters=k,
@@ -153,14 +183,23 @@ def evaluate_clustering(
 
         labels = model.fit_predict(X)
 
-        sil_score = silhouette_score(X, labels, metric="euclidean")
+        # Inertia on full data
+        inertia = float(model.inertia_)
+
+        # Silhouette on sample (or full data if silhouette_sample_size is None)
+        sil_kwargs: dict = {"metric": "euclidean"}
+        if silhouette_sample_size is not None and n_samples > silhouette_sample_size:
+            sil_kwargs["sample_size"] = silhouette_sample_size
+            sil_kwargs["random_state"] = random_state
+
+        sil_score = silhouette_score(X, labels, **sil_kwargs)
 
         results["k_values"].append(k)
-        results["inertia"].append(float(model.inertia_))
+        results["inertia"].append(inertia)
         results["silhouette"].append(float(sil_score))
 
-        logger.info(f"    Inertia: {model.inertia_:,.2f}")
-        logger.info(f"    Silhouette: {sil_score:.3f}")
+        logger.info("    Inertia: %s", f"{inertia:,.2f}")
+        logger.info("    Silhouette: %.3f", sil_score)
 
     return results
 
@@ -178,10 +217,15 @@ def find_optimal_k(eval_results: dict) -> int:
     k_values = eval_results["k_values"]
     silhouettes = eval_results["silhouette"]
 
-    best_idx = np.argmax(silhouettes)
-    best_k = k_values[best_idx]
+    best_idx = int(np.argmax(silhouettes))
+    best_k = int(k_values[best_idx])
 
-    logger.info(f"\nOptimal k={best_k} (silhouette={silhouettes[best_idx]:.3f})")
+    logger.info("")
+    logger.info(
+        "Optimal k=%d (silhouette=%.3f)",
+        best_k,
+        silhouettes[best_idx],
+    )
 
     return best_k
 
@@ -204,7 +248,12 @@ def run_clustering(
     Returns:
         Tuple of (labels, centroids, inertia)
     """
-    logger.info(f"\nRunning k-means with k={k} on {X.shape[0]:,} profiles...")
+    logger.info("")
+    logger.info(
+        "Running k-means with k=%d on %s profiles...",
+        k,
+        f"{X.shape[0]:,}",
+    )
 
     model = KMeans(
         n_clusters=k,
@@ -214,16 +263,22 @@ def run_clustering(
 
     labels = model.fit_predict(X)
     centroids = model.cluster_centers_
+    inertia = float(model.inertia_)
 
-    logger.info(f"  Inertia: {model.inertia_:,.2f}")
+    logger.info("  Inertia: %s", f"{inertia:,.2f}")
 
     # Log cluster distribution
     unique, counts = np.unique(labels, return_counts=True)
     for cluster, count in zip(unique, counts):
         pct = count / len(labels) * 100
-        logger.info(f"  Cluster {cluster}: {count:,} profiles ({pct:.1f}%)")
+        logger.info(
+            "  Cluster %d: %s profiles (%.1f%%)",
+            cluster,
+            f"{count:,}",
+            pct,
+        )
 
-    return labels, centroids, float(model.inertia_)
+    return labels, centroids, inertia
 
 
 def plot_centroids(
@@ -272,7 +327,7 @@ def plot_centroids(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved centroids plot: {output_path}")
+    logger.info("  Saved centroids plot: %s", output_path)
 
 
 def plot_cluster_samples(
@@ -316,8 +371,12 @@ def plot_cluster_samples(
         cluster_mask = labels == i
         cluster_profiles = X[cluster_mask]
 
-        # Sample profiles
         n_available = len(cluster_profiles)
+        if n_available == 0:
+            ax.set_title(f"Cluster {i} (n=0)")
+            ax.grid(True, alpha=0.3)
+            continue
+
         n_plot = min(n_samples, n_available)
         idx = rng.choice(n_available, size=n_plot, replace=False)
 
@@ -342,7 +401,7 @@ def plot_cluster_samples(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved cluster samples plot: {output_path}")
+    logger.info("  Saved cluster samples plot: %s", output_path)
 
 
 def plot_elbow_curve(
@@ -379,7 +438,7 @@ def plot_elbow_curve(
     ax2.set_xticks(k_values)
 
     # Mark optimal k
-    best_idx = np.argmax(silhouette)
+    best_idx = int(np.argmax(silhouette))
     ax2.axvline(x=k_values[best_idx], color="red", linestyle="--", alpha=0.7)
     ax2.scatter(
         [k_values[best_idx]],
@@ -395,7 +454,7 @@ def plot_elbow_curve(
     plt.savefig(output_path, dpi=150)
     plt.close()
 
-    logger.info(f"  Saved elbow curve: {output_path}")
+    logger.info("  Saved elbow curve: %s", output_path)
 
 
 def save_results(
@@ -420,7 +479,7 @@ def save_results(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine which ID columns are present (household vs ZIP+4 level)
-    id_cols = []
+    id_cols: list[str] = []
     if "account_identifier" in df.columns:
         id_cols.append("account_identifier")
     if "zip_code" in df.columns:
@@ -431,10 +490,12 @@ def save_results(
     available_cols = [c for c in id_cols if c in df.columns]
 
     # Save cluster assignments
-    assignments = df.select(available_cols).with_columns(pl.Series("cluster", labels))
+    assignments = df.select(available_cols).with_columns(
+        pl.Series("cluster", labels),
+    )
     assignments_path = output_dir / "cluster_assignments.parquet"
     assignments.write_parquet(assignments_path)
-    logger.info(f"  Saved assignments: {assignments_path}")
+    logger.info("  Saved assignments: %s", assignments_path)
 
     # Save centroids as parquet
     centroids_df = pl.DataFrame({
@@ -443,20 +504,20 @@ def save_results(
     })
     centroids_path = output_dir / "cluster_centroids.parquet"
     centroids_df.write_parquet(centroids_path)
-    logger.info(f"  Saved centroids: {centroids_path}")
+    logger.info("  Saved centroids: %s", centroids_path)
 
     # Save k evaluation results
     if eval_results:
         eval_path = output_dir / "k_evaluation.json"
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2)
-        logger.info(f"  Saved k evaluation: {eval_path}")
+        logger.info("  Saved k evaluation: %s", eval_path)
 
     # Save metadata
     metadata_path = output_dir / "clustering_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
-    logger.info(f"  Saved metadata: {metadata_path}")
+    logger.info("  Saved metadata: %s", metadata_path)
 
 
 def main() -> None:
@@ -465,11 +526,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Standard run with k evaluation
+    # Standard run with k evaluation (silhouette on sample)
     python euclidean_clustering.py \\
         --input data/clustering/sampled_profiles.parquet \\
         --output-dir data/clustering/results \\
-        --k-range 3 6 --find-optimal-k --normalize
+        --k-range 3 6 --find-optimal-k --normalize \\
+        --silhouette-sample-size 10000
 
     # Fixed k (no evaluation)
     python euclidean_clustering.py \\
@@ -513,6 +575,15 @@ Examples:
         action="store_true",
         help="Evaluate k range and use optimal k",
     )
+    k_group.add_argument(
+        "--silhouette-sample-size",
+        type=int,
+        default=10_000,
+        help=(
+            "Max number of samples for silhouette evaluation "
+            "(default: 10000; use -1 to use full dataset, not recommended for large n)."
+        ),
+    )
 
     # Clustering parameters
     parser.add_argument(
@@ -526,7 +597,7 @@ Examples:
     parser.add_argument(
         "--normalize",
         action="store_true",
-        help="Apply z-score normalization to profiles",
+        help="Apply normalization to profiles",
     )
     parser.add_argument(
         "--normalize-method",
@@ -561,16 +632,21 @@ Examples:
     if args.k is not None:
         # Fixed k
         k = args.k
-        logger.info(f"\nUsing fixed k={k}")
+        logger.info("")
+        logger.info("Using fixed k=%d", k)
     elif args.find_optimal_k:
         # Evaluate k range
         k_range = range(args.k_range[0], args.k_range[1] + 1)
+
+        silhouette_sample_size: int | None
+        silhouette_sample_size = None if args.silhouette_sample_size < 0 else args.silhouette_sample_size
 
         eval_results = evaluate_clustering(
             X,
             k_range=k_range,
             n_init=args.n_init,
             random_state=args.random_state,
+            silhouette_sample_size=silhouette_sample_size,
         )
 
         # Save elbow curve
@@ -581,7 +657,8 @@ Examples:
     else:
         # Default to min of k_range
         k = args.k_range[0]
-        logger.info(f"\nUsing default k={k}")
+        logger.info("")
+        logger.info("Using default k=%d", k)
 
     # Run final clustering
     labels, centroids, inertia = run_clustering(
@@ -592,25 +669,28 @@ Examples:
     )
 
     # Create visualizations
-    logger.info("\nGenerating visualizations...")
+    logger.info("")
+    logger.info("Generating visualizations...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     plot_centroids(centroids, args.output_dir / "cluster_centroids.png")
     plot_cluster_samples(X, labels, centroids, args.output_dir / "cluster_samples.png")
 
     # Save results
-    logger.info("\nSaving results...")
+    logger.info("")
+    logger.info("Saving results...")
 
     metadata = {
-        "k": k,
-        "n_profiles": len(X),
-        "n_timepoints": X.shape[1],
-        "normalized": args.normalize,
+        "k": int(k),
+        "n_profiles": int(X.shape[0]),
+        "n_timepoints": int(X.shape[1]),
+        "normalized": bool(args.normalize),
         "normalize_method": args.normalize_method if args.normalize else None,
-        "n_init": args.n_init,
-        "random_state": args.random_state,
-        "inertia": inertia,
+        "n_init": int(args.n_init),
+        "random_state": int(args.random_state),
+        "inertia": float(inertia),
         "distance_metric": "euclidean",
+        "silhouette_sample_size": (None if args.silhouette_sample_size < 0 else int(args.silhouette_sample_size)),
     }
 
     save_results(df, labels, centroids, eval_results, metadata, args.output_dir)
@@ -620,7 +700,7 @@ Examples:
     print("CLUSTERING COMPLETE")
     print("=" * 70)
     print(f"\nResults saved to: {args.output_dir}")
-    print(f"  • {len(X):,} profiles clustered into {k} groups")
+    print(f"  • {X.shape[0]:,} profiles clustered into {k} groups")
     print(f"  • Inertia: {inertia:,.2f}")
     if eval_results:
         best_sil = max(eval_results["silhouette"])

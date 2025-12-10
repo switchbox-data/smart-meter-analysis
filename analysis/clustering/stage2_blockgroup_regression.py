@@ -43,6 +43,10 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import statsmodels.api as sm
+from sklearn.preprocessing import StandardScaler
+
+from smart_meter_analysis.census import fetch_census_data
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -56,8 +60,6 @@ DEFAULT_PREDICTORS = [
     "Median_Age",
     "Urban_Percent",
     "Total_Households",
-    "Owner_Occupied",
-    "Renter_Occupied",
 ]
 
 
@@ -264,12 +266,6 @@ def fetch_or_load_census(
 
     logger.info("Fetching Census data from API (state=%s, year=%s)...", state_fips, acs_year)
 
-    try:
-        from smart_meter_analysis.census import fetch_census_data
-    except ImportError:
-        logger.error("Could not import fetch_census_data from smart_meter_analysis.census.")
-        raise
-
     census_df = fetch_census_data(state_fips=state_fips, acs_year=acs_year)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,19 +364,33 @@ def run_multinomial_regression(
     predictors: list[str],
     outcome: str = "cluster",
     weight_col: str = "n_households",
+    standardize: bool = False,
 ) -> dict[str, object]:
-    """Run multinomial logistic regression with statsmodels."""
-    logger.info("Running multinomial logistic regression...")
+    """Run multinomial logistic regression with statsmodels.
 
-    import statsmodels.api as sm
-    from sklearn.preprocessing import StandardScaler
+    Parameters
+    ----------
+    reg_df : pl.DataFrame
+        Long-form data, one row per (block_group_geoid, cluster) with
+        columns including predictors, outcome, and weights.
+    predictors : list[str]
+        Names of predictor columns.
+    outcome : str, default "cluster"
+        Name of the outcome column (cluster index).
+    weight_col : str, default "n_households"
+        Column providing frequency weights (households per BG x cluster).
+    standardize : bool, default False
+        If True, standardize predictors before regression. If False,
+        use raw units (easier to interpret coefficients and ORs).
+    """
+    logger.info("Running multinomial logistic regression...")
 
     # Extract arrays
     X = reg_df.select(predictors).to_numpy().astype(np.float64)
     y = reg_df.get_column(outcome).to_numpy()
     weights = reg_df.get_column(weight_col).to_numpy().astype(np.float64)
 
-    # Drop rows with NaN
+    # Drop rows with NaN in predictors
     nan_mask = np.isnan(X).any(axis=1)
     if nan_mask.sum() > 0:
         logger.warning("  Dropping %s rows with NaN predictors", f"{nan_mask.sum():,}")
@@ -390,19 +400,31 @@ def run_multinomial_regression(
         raise ValueError("No observations remaining after dropping NaN rows.")
 
     # Count block groups with complete predictor data (for reporting)
+    # (This is approximate, but good enough for a summary line.)
     n_block_groups = reg_df.filter(~pl.any_horizontal(pl.col(predictors).is_null()))["block_group_geoid"].n_unique()
 
-    # Standardize and add intercept
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_with_const = sm.add_constant(X_scaled)
+    # Standardize or leave in raw units
+    if standardize:
+        logger.info("  Standardizing predictors (mean 0, sd 1)...")
+        scaler = StandardScaler()
+        X_transformed = scaler.fit_transform(X)
+    else:
+        logger.info("  Using raw predictor units (no standardization).")
+        X_transformed = X
 
-    # Expand rows by weights for proper frequency weighting
+    # Add intercept
+    X_with_const = sm.add_constant(X_transformed)
+
+    # Expand rows by integer weights for frequency weighting
     weight_ints = np.maximum(np.round(weights).astype(int), 1)
     X_expanded = np.repeat(X_with_const, weight_ints, axis=0)
     y_expanded = np.repeat(y, weight_ints)
 
-    logger.info("  Training on %s expanded rows (%s block groups)", f"{len(X_expanded):,}", n_block_groups)
+    logger.info(
+        "  Training on %s expanded rows (%s block groups)",
+        f"{len(X_expanded):,}",
+        n_block_groups,
+    )
 
     model = sm.MNLogit(y_expanded, X_expanded)
     result = model.fit(method="newton", maxiter=100, disp=False)
