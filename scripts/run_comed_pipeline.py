@@ -3,7 +3,8 @@
 ComEd Smart Meter Analysis Pipeline
 
 Main entry point for the ComEd smart meter clustering analysis. This script
-handles the complete workflow from raw S3 data to clustered load profiles.
+handles the complete workflow from raw S3 data to clustered household-day
+load profiles and (optionally) Stage 2 block-group regression.
 
 ================================================================================
 PIPELINE OVERVIEW
@@ -12,67 +13,83 @@ PIPELINE OVERVIEW
 Stage 1: Usage Pattern Clustering (this script)
     1. Download    - Fetch CSV files from S3
     2. Process     - Transform wide→long, add time features, write parquet
-    3. Prepare     - Create daily load profiles per HOUSEHOLD (not ZIP+4)
-    4. Cluster     - K-means (Euclidean) to identify usage patterns
+    3. Prepare     - Create daily load profiles per HOUSEHOLD-DAY
+                     (one 48-point profile per (household, date))
+    4. Cluster     - K-means (Euclidean) on household-day profiles
     5. Validate    - Check data quality at each step
 
 Stage 2: Block-Group Demographic Regression (stage2_blockgroup_regression.py)
-    - Aggregate households to block-group X cluster counts
+    - Aggregate household-day observations to (block_group x cluster) counts
     - Join with Census demographics at block-group level
     - Run multinomial logistic regression (statsmodels for proper inference)
-    - Identify demographic predictors of cluster composition
+    - Identify demographic predictors of the mix of clusters across household-days
 
-    Unit of analysis: ONE ROW PER (block_group, cluster)
+    Unit of analysis: ONE ROW PER (block_group, cluster), with counts over
+    household-day observations.
 
 ================================================================================
 USAGE MODES
 ================================================================================
 
-FULL PIPELINE (download from S3 and run everything):
-    python run_comed_pipeline.py --from-s3 --num-files 1000
+Typical workflow from the project root (script lives in scripts/):
 
-VALIDATE ONLY (check existing files):
-    python run_comed_pipeline.py --validate-only
+FULL PIPELINE (download from S3, process, cluster, validate, run Stage 2):
+    python scripts/run_comed_pipeline.py \
+      --from-s3 \
+      --year-month 202308 \
+      --num-files 10000 \
+      --sample-households 20000 \
+      --sample-days 31 \
+      --k-range 3 6 \
+      --run-stage2
 
-PROCESS ONLY (no clustering, useful for testing):
-    python run_comed_pipeline.py --from-s3 --num-files 100 --skip-clustering
+QUICK LOCAL TEST (fewer files, fewer households/days):
+    python scripts/run_comed_pipeline.py \
+      --from-s3 \
+      --year-month 202308 \
+      --num-files 100 \
+      --sample-households 2000 \
+      --sample-days 10 \
+      --k-range 3 4
+
+VALIDATE ONLY (check existing files for a given run):
+    python scripts/run_comed_pipeline.py \
+      --validate-only \
+      --run-name 202308_10000
 
 SPECIFIC STAGE VALIDATION:
-    python run_comed_pipeline.py --validate-only --stage processed
-    python run_comed_pipeline.py --validate-only --stage clustering
+    python scripts/run_comed_pipeline.py \
+      --validate-only \
+      --run-name 202308_10000 \
+      --stage processed
+
+    python scripts/run_comed_pipeline.py \
+      --validate-only \
+      --run-name 202308_10000 \
+      --stage clustering
 
 ================================================================================
 OUTPUT STRUCTURE
 ================================================================================
 
 data/validation_runs/{run_name}/
-├── samples/                    # Raw CSV files from S3
+├── samples/                          # Raw CSV files from S3
 ├── processed/
-│   └── comed_{year_month}.parquet   # Interval-level data (long format)
+│   └── comed_{year_month}.parquet    # Interval-level data (long format)
 ├── clustering/
-│   ├── sampled_profiles.parquet     # Daily load profiles for clustering
-│   ├── zip4_demographics.parquet    # ZIP+4 list (demographics added in Stage 2)
+│   ├── sampled_profiles.parquet      # Household-day profiles for clustering
+│   ├── household_zip4_map.parquet    # Map of households to ZIP+4s
 │   └── results/
 │       ├── cluster_assignments.parquet
 │       ├── cluster_centroids.parquet
-│       ├── clustering_metrics.json
-│       └── centroid_plot.png
+│       ├── k_evaluation.json
+│       ├── clustering_metadata.json
+│       ├── elbow_curve.png
+│       ├── cluster_centroids.png
+│       ├── cluster_samples.png
+│       └── stage2_blockgroups/       # (optional) Stage 2 outputs when run
+│           ├── ... block-group cluster counts, regression results, etc.
 
-================================================================================
-EXAMPLES
-================================================================================
-
-# Quick test with 100 files
-python run_comed_pipeline.py --from-s3 --num-files 100 --sample-households 500 --sample-days 10
-
-# Standard analysis (1000 files, ~30min clustering)
-python run_comed_pipeline.py --from-s3 --num-files 1000
-
-# Large scale (will take longer)
-python run_comed_pipeline.py --from-s3 --num-files 10000 --sample-households 10000
-
-# Just validate existing results
-python run_comed_pipeline.py --validate-only --run-name 202308_1000
 """
 
 from __future__ import annotations
@@ -97,7 +114,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PATHS = {
     "processed": Path("data/processed/comed_202308.parquet"),
-    "enriched": Path("data/enriched_test/enriched.parquet"),
     "clustering_dir": Path("data/clustering"),
     "crosswalk": Path("data/reference/2023_comed_zip4_census_crosswalk.txt"),
 }
@@ -108,12 +124,16 @@ DEFAULT_S3_CONFIG = {
 }
 
 DEFAULT_CLUSTERING_CONFIG = {
-    "sample_days": 20,
-    "sample_households": 5000,  # Number of households to sample (None = all)
-    "k_min": 3,
-    "k_max": 5,
+    # Household/day sampling for clustering
+    "sample_days": 31,
+    "sample_households": 20_000,  # None = all; 20k is the tested high-volume default
     "day_strategy": "stratified",
-    "n_init": 10,  # Number of k-means initializations
+    # K-means hyperparameters
+    "k_min": 3,
+    "k_max": 6,
+    "n_init": 10,
+    # Profile construction (streaming is always on)
+    "chunk_size": 500,  # households per chunk when building profiles
 }
 
 
@@ -127,11 +147,12 @@ class ComedPipeline:
     Orchestrates the ComEd smart meter analysis pipeline.
 
     This class manages the complete workflow from raw S3 data to clustered
-    load profiles, with validation at each step.
+    household-day load profiles, with validation at each step and optional
+    Stage 2 regression.
 
     Attributes:
         base_dir: Project root directory
-        run_name: Identifier for this pipeline run (e.g., "202308_1000")
+        run_name: Identifier for this pipeline run (e.g., "202308_10000")
         run_dir: Output directory for this run
         paths: Dictionary of file paths for this run
     """
@@ -173,7 +194,7 @@ class ComedPipeline:
         for subdir in ["samples", "processed", "clustering/results"]:
             (self.run_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Created output directory: {self.run_dir}")
+        logger.info("Created output directory: %s", self.run_dir)
 
     def download_from_s3(
         self,
@@ -186,13 +207,13 @@ class ComedPipeline:
         Download CSV files from S3 for processing.
 
         Args:
-            year_month: Target month in YYYYMM format (e.g., '202308')
+            year_month: Target month in YYYYMM format (e.g., "202308")
             num_files: Number of CSV files to download
             bucket: S3 bucket name
             prefix: S3 key prefix for ComEd data
 
         Returns:
-            True if download successful, False otherwise
+            True if download successful, False otherwise.
         """
         try:
             import boto3
@@ -200,7 +221,7 @@ class ComedPipeline:
             logger.error("boto3 not installed. Run: pip install boto3")
             return False
 
-        logger.info(f"Connecting to S3: s3://{bucket}/{prefix}{year_month}/")
+        logger.info("Connecting to S3: s3://%s/%s%s/", bucket, prefix, year_month)
 
         try:
             s3 = boto3.client("s3")
@@ -208,7 +229,7 @@ class ComedPipeline:
 
             # List files
             paginator = s3.get_paginator("list_objects_v2")
-            csv_keys = []
+            csv_keys: list[str] = []
 
             for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
                 if "Contents" not in page:
@@ -222,10 +243,10 @@ class ComedPipeline:
                     break
 
             if not csv_keys:
-                logger.error(f"No CSV files found in s3://{bucket}/{full_prefix}")
+                logger.error("No CSV files found in s3://%s/%s", bucket, full_prefix)
                 return False
 
-            logger.info(f"Downloading {len(csv_keys)} files to {self.paths['samples']}")
+            logger.info("Downloading %d files to %s", len(csv_keys), self.paths["samples"])
 
             for i, key in enumerate(csv_keys, 1):
                 filename = Path(key).name
@@ -233,13 +254,13 @@ class ComedPipeline:
                 s3.download_file(bucket, key, str(local_path))
 
                 if i % 100 == 0 or i == len(csv_keys):
-                    logger.info(f"  Downloaded {i}/{len(csv_keys)} files")
+                    logger.info("  Downloaded %d/%d files", i, len(csv_keys))
 
-            logger.info(f"Download complete: {len(csv_keys)} files")
+            logger.info("Download complete: %d files", len(csv_keys))
             return True
 
-        except Exception as e:
-            logger.error(f"S3 download failed: {e}")
+        except Exception as exc:
+            logger.error("S3 download failed: %s", exc)
             return False
 
     def process_raw_data(self, year_month: str) -> bool:
@@ -250,17 +271,17 @@ class ComedPipeline:
         Uses lazy evaluation for memory efficiency.
 
         Args:
-            year_month: Month identifier for output file naming
+            year_month: Month identifier for output file naming.
 
         Returns:
-            True if processing successful, False otherwise
+            True if processing successful, False otherwise.
         """
         csv_files = sorted(self.paths["samples"].glob("*.csv"))
         if not csv_files:
-            logger.error(f"No CSV files found in {self.paths['samples']}")
+            logger.error("No CSV files found in %s", self.paths["samples"])
             return False
 
-        logger.info(f"Processing {len(csv_files)} CSV files")
+        logger.info("Processing %d CSV files", len(csv_files))
 
         from smart_meter_analysis.aws_loader import (
             COMED_SCHEMA,
@@ -268,18 +289,18 @@ class ComedPipeline:
             transform_wide_to_long_lazy,
         )
 
-        lazy_frames = []
+        lazy_frames: list[pl.LazyFrame] = []
         for i, csv_path in enumerate(csv_files, 1):
             if i % 200 == 0 or i == len(csv_files):
-                logger.info(f"  Scanned {i}/{len(csv_files)} files")
+                logger.info("  Scanned %d/%d files", i, len(csv_files))
 
             try:
                 lf = pl.scan_csv(str(csv_path), schema_overrides=COMED_SCHEMA, ignore_errors=True)
                 lf = transform_wide_to_long_lazy(lf)
                 lf = add_time_columns_lazy(lf, day_mode="calendar")
                 lazy_frames.append(lf)
-            except Exception as e:
-                logger.warning(f"Failed to scan {csv_path.name}: {e}")
+            except Exception as exc:
+                logger.warning("Failed to scan %s: %s", csv_path.name, exc)
 
         if not lazy_frames:
             logger.error("No files successfully scanned")
@@ -292,7 +313,7 @@ class ComedPipeline:
         lf_combined.sink_parquet(self.paths["processed"])
 
         row_count = pl.scan_parquet(self.paths["processed"]).select(pl.len()).collect()[0, 0]
-        logger.info(f"Wrote {row_count:,} records to {self.paths['processed']}")
+        logger.info("Wrote %s records to %s", f"{row_count:,}", self.paths["processed"])
 
         return True
 
@@ -301,19 +322,22 @@ class ComedPipeline:
         sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
         sample_households: int | None = DEFAULT_CLUSTERING_CONFIG.get("sample_households"),
         day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
+        chunk_size: int = DEFAULT_CLUSTERING_CONFIG["chunk_size"],
     ) -> bool:
         """
-        Prepare daily load profiles for clustering at the household level.
+        Prepare daily household-day load profiles for clustering.
 
-        Creates profiles for individual households.
+        Creates 48-interval profiles for individual household-day combinations
+        using the manifest-based, chunked streaming pipeline.
 
         Args:
-            sample_days: Number of days to sample
-            sample_households: Number of households to sample (None = all)
-            day_strategy: 'stratified' (70/30 weekday/weekend) or 'random'
+            sample_days: Number of days to sample per run.
+            sample_households: Number of households to sample (None = all).
+            day_strategy: "stratified" (70/30 weekday/weekend) or "random".
+            chunk_size: Households per chunk for the streaming profile builder.
 
         Returns:
-            True if preparation successful, False otherwise
+            True if preparation successful, False otherwise.
         """
         import subprocess
 
@@ -321,7 +345,7 @@ class ComedPipeline:
         output_dir = self.paths["clustering_dir"]
 
         if not input_path.exists():
-            logger.error(f"Processed data not found: {input_path}")
+            logger.error("Processed data not found: %s", input_path)
             return False
 
         cmd = [
@@ -335,18 +359,25 @@ class ComedPipeline:
             day_strategy,
             "--sample-days",
             str(sample_days),
+            "--streaming",  # streaming is always enabled
+            "--chunk-size",
+            str(chunk_size),
         ]
 
         if sample_households:
             cmd.extend(["--sample-households", str(sample_households)])
 
         logger.info(
-            f"Preparing household clustering data ({sample_households or 'all'} households X {sample_days} days)"
+            "Preparing household-day clustering data (%s households x %d days; streaming, chunk_size=%d)",
+            sample_households or "all",
+            sample_days,
+            chunk_size,
         )
+
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            logger.error(f"Clustering prep failed: {result.stderr}")
+            logger.error("Clustering prep failed: %s", result.stderr)
             return False
 
         logger.info("Clustering data prepared")
@@ -359,18 +390,18 @@ class ComedPipeline:
         n_init: int = DEFAULT_CLUSTERING_CONFIG["n_init"],
     ) -> bool:
         """
-        Run k-means clustering on prepared profiles.
+        Run k-means clustering on prepared household-day profiles.
 
         Uses Euclidean distance since all profiles are aligned to the same
         time grid (no time warping needed).
 
         Args:
-            k_min: Minimum number of clusters to test
-            k_max: Maximum number of clusters to test
-            n_init: Number of k-means initializations
+            k_min: Minimum number of clusters to test.
+            k_max: Maximum number of clusters to test.
+            n_init: Number of k-means initializations.
 
         Returns:
-            True if clustering successful, False otherwise
+            True if clustering successful, False otherwise.
         """
         import subprocess
 
@@ -379,7 +410,7 @@ class ComedPipeline:
         results_dir.mkdir(parents=True, exist_ok=True)
 
         if not profiles_path.exists():
-            logger.error(f"Profiles not found: {profiles_path}")
+            logger.error("Profiles not found: %s", profiles_path)
             return False
 
         cmd = [
@@ -398,13 +429,13 @@ class ComedPipeline:
             str(n_init),
         ]
 
-        logger.info(f"Running k-means clustering (k={k_min}-{k_max})...")
+        logger.info("Running k-means clustering (k=%d-%d)...", k_min, k_max)
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            logger.error(f"Clustering failed: {result.stderr}")
+            logger.error("Clustering failed: %s", result.stderr)
             if result.stdout:
-                logger.error(f"stdout: {result.stdout}")
+                logger.error("stdout: %s", result.stdout)
             return False
 
         logger.info("Clustering complete")
@@ -419,19 +450,20 @@ class ComedPipeline:
         Run Stage 2: Block-group-level regression of cluster composition.
 
         Models how Census block-group demographics are associated with the
-        composition of households across load-profile clusters.
+        composition of household-day profiles across clusters.
 
-        Unit of analysis: ONE ROW PER (block_group, cluster).
+        Unit of analysis: ONE ROW PER (block_group, cluster), with counts over
+        household-day observations.
 
         stage2_blockgroup_regression.py handles census fetching internally
-        if cache doesn't exist.
+        if cache does not exist.
 
         Args:
-            crosswalk_path: Path to ZIP+4 → block-group crosswalk file
-            census_cache_path: Path to cached census data
+            crosswalk_path: Path to ZIP+4 → block-group crosswalk file.
+            census_cache_path: Path to cached census data.
 
         Returns:
-            True if regression successful, False otherwise
+            True if regression successful, False otherwise.
         """
         import subprocess
 
@@ -439,7 +471,7 @@ class ComedPipeline:
         output_dir = self.paths["clustering_dir"] / "results" / "stage2_blockgroups"
 
         if not clusters_path.exists():
-            logger.error(f"Cluster assignments not found: {clusters_path}")
+            logger.error("Cluster assignments not found: %s", clusters_path)
             logger.error("Run Stage 1 clustering first")
             return False
 
@@ -450,10 +482,9 @@ class ComedPipeline:
             census_cache_path = self.base_dir / "data" / "reference" / "census_17_2023.parquet"
 
         if not crosswalk_path.exists():
-            logger.error(f"Crosswalk not found: {crosswalk_path}")
+            logger.error("Crosswalk not found: %s", crosswalk_path)
             return False
 
-        # stage2_blockgroup_regression.py handles census fetching if cache missing
         cmd = [
             sys.executable,
             str(self.base_dir / "analysis" / "clustering" / "stage2_blockgroup_regression.py"),
@@ -470,15 +501,15 @@ class ComedPipeline:
         logger.info("Running Stage 2 block-group regression...")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Print output (report goes to stdout)
+        # Print report (stage2 script writes a human-readable summary to stdout)
         if result.stdout:
             print(result.stdout)
 
         if result.returncode != 0:
-            logger.error(f"Stage 2 regression failed: {result.stderr}")
+            logger.error("Stage 2 regression failed: %s", result.stderr)
             return False
 
-        logger.info(f"Stage 2 complete: {output_dir}")
+        logger.info("Stage 2 complete: %s", output_dir)
         return True
 
     # =========================================================================
@@ -492,16 +523,16 @@ class ComedPipeline:
         if not path.exists():
             return self._fail("processed", f"File not found: {path}")
 
-        logger.info(f"Validating processed data: {path}")
+        logger.info("Validating processed data: %s", path)
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         try:
             lf = pl.scan_parquet(path)
             schema = lf.collect_schema()
-        except Exception as e:
-            return self._fail("processed", f"Failed to read: {e}")
+        except Exception as exc:
+            return self._fail("processed", f"Failed to read: {exc}")
 
         # Check required columns
         required = ["zip_code", "account_identifier", "datetime", "kwh", "date", "hour"]
@@ -511,13 +542,15 @@ class ComedPipeline:
 
         # Get stats using lazy evaluation (no full load)
         try:
-            stats_df = lf.select([
-                pl.len().alias("rows"),
-                pl.col("zip_code").n_unique().alias("zip_codes"),
-                pl.col("account_identifier").n_unique().alias("accounts"),
-                pl.col("kwh").min().alias("kwh_min"),
-                pl.col("kwh").null_count().alias("kwh_nulls"),
-            ]).collect()
+            stats_df = lf.select(
+                [
+                    pl.len().alias("rows"),
+                    pl.col("zip_code").n_unique().alias("zip_codes"),
+                    pl.col("account_identifier").n_unique().alias("accounts"),
+                    pl.col("kwh").min().alias("kwh_min"),
+                    pl.col("kwh").null_count().alias("kwh_nulls"),
+                ],
+            ).collect()
 
             stats_dict = stats_df.to_dicts()[0]
 
@@ -543,27 +576,27 @@ class ComedPipeline:
                 "accounts": stats_dict["accounts"],
                 "file_size_mb": path.stat().st_size / 1024 / 1024,
             }
-        except Exception as e:
-            return self._fail("processed", f"Failed to compute stats: {e}")
+        except Exception as exc:
+            return self._fail("processed", f"Failed to compute stats: {exc}")
 
         return self._result("processed", errors, warnings, stats)
 
     def validate_clustering_inputs(self) -> dict:
-        """Validate clustering input files."""
+        """Validate clustering input files (household-day profiles)."""
         profiles_path = self.paths["clustering_dir"] / "sampled_profiles.parquet"
 
         if not profiles_path.exists():
             return self._fail("clustering_inputs", f"Profiles not found: {profiles_path}")
 
-        logger.info(f"Validating clustering inputs: {profiles_path}")
+        logger.info("Validating clustering inputs: %s", profiles_path)
 
         try:
             df = pl.read_parquet(profiles_path)
-        except Exception as e:
-            return self._fail("clustering_inputs", f"Failed to read: {e}")
+        except Exception as exc:
+            return self._fail("clustering_inputs", f"Failed to read: {exc}")
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         # Check required columns
         required = ["zip_code", "date", "profile"]
@@ -595,15 +628,15 @@ class ComedPipeline:
         if not assignments_path.exists():
             return self._skip("clustering_outputs", "No clustering results yet")
 
-        logger.info(f"Validating clustering outputs: {results_dir}")
+        logger.info("Validating clustering outputs: %s", results_dir)
 
         try:
             assignments = pl.read_parquet(assignments_path)
-        except Exception as e:
-            return self._fail("clustering_outputs", f"Failed to read: {e}")
+        except Exception as exc:
+            return self._fail("clustering_outputs", f"Failed to read: {exc}")
 
-        errors = []
-        warnings = []
+        errors: list[str] = []
+        warnings: list[str] = []
 
         # Check required columns
         if "cluster" not in assignments.columns:
@@ -612,8 +645,6 @@ class ComedPipeline:
         # Check cluster distribution
         if "cluster" in assignments.columns:
             cluster_counts = assignments["cluster"].value_counts()
-
-            # Check for empty clusters
             if cluster_counts["count"].min() == 0:
                 warnings.append("Some clusters have no assignments")
 
@@ -644,9 +675,11 @@ class ComedPipeline:
         num_files: int,
         sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
         sample_households: int | None = DEFAULT_CLUSTERING_CONFIG["sample_households"],
+        day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
         k_min: int = DEFAULT_CLUSTERING_CONFIG["k_min"],
         k_max: int = DEFAULT_CLUSTERING_CONFIG["k_max"],
         n_init: int = DEFAULT_CLUSTERING_CONFIG["n_init"],
+        chunk_size: int = DEFAULT_CLUSTERING_CONFIG["chunk_size"],
         skip_clustering: bool = False,
         run_stage2: bool = False,
     ) -> bool:
@@ -654,18 +687,20 @@ class ComedPipeline:
         Execute the complete pipeline.
 
         Args:
-            year_month: Target month (YYYYMM format)
-            num_files: Number of S3 files to download
-            sample_days: Days to sample for clustering
-            sample_households: Households to sample (None = all)
-            k_min: Minimum clusters to test
-            k_max: Maximum clusters to test
-            n_init: Number of k-means initializations
-            skip_clustering: If True, stop after preparing data
-            run_stage2: If True, run demographic regression after clustering
+            year_month: Target month (YYYYMM format).
+            num_files: Number of S3 files to download.
+            sample_days: Days to sample for clustering.
+            sample_households: Households to sample (None = all).
+            day_strategy: Day sampling strategy ("stratified" or "random").
+            k_min: Minimum clusters to test.
+            k_max: Maximum clusters to test.
+            n_init: Number of k-means initializations.
+            chunk_size: Households per chunk for streaming profile builder.
+            skip_clustering: If True, stop after preparing data.
+            run_stage2: If True, run demographic regression after clustering.
 
         Returns:
-            True if all steps succeed, False otherwise
+            True if all steps succeed, False otherwise.
         """
         self._print_header("COMED PIPELINE EXECUTION")
         print(f"Year-Month: {year_month}")
@@ -673,6 +708,7 @@ class ComedPipeline:
         print(f"Output: {self.run_dir}")
         print(f"Clustering: {'Skipped' if skip_clustering else f'k={k_min}-{k_max}'}")
         print(f"Stage 2: {'Yes' if run_stage2 else 'No'}")
+        print(f"Profiles: streaming (chunk_size={chunk_size})")
 
         self.setup_directories()
 
@@ -686,9 +722,14 @@ class ComedPipeline:
         if not self.process_raw_data(year_month):
             return False
 
-        # Step 3: Prepare clustering
+        # Step 3: Prepare clustering data
         self._print_step("PREPARING CLUSTERING DATA")
-        if not self.prepare_clustering_data(sample_days, sample_households):
+        if not self.prepare_clustering_data(
+            sample_days=sample_days,
+            sample_households=sample_households,
+            day_strategy=day_strategy,
+            chunk_size=chunk_size,
+        ):
             return False
 
         # Step 4: Cluster (optional)
@@ -715,7 +756,7 @@ class ComedPipeline:
         Run all validation checks.
 
         Returns:
-            True if all critical validations pass, False otherwise
+            True if all critical validations pass, False otherwise.
         """
         self._print_header("VALIDATION")
 
@@ -733,7 +774,7 @@ class ComedPipeline:
             self.results["clustering_inputs"] = self.validate_clustering_inputs()
             self.results["clustering_outputs"] = self.validate_clustering_outputs()
         else:
-            logger.error(f"Unknown stage: {stage}")
+            logger.error("Unknown stage: %s", stage)
             return False
 
         return self._print_summary()
@@ -752,15 +793,15 @@ class ComedPipeline:
         print(title)
         print(f"{'─' * 70}")
 
-    def _result(self, stage: str, errors: list, warnings: list, stats: dict) -> dict:
+    def _result(self, stage: str, errors: list[str], warnings: list[str], stats: dict) -> dict:
         status = "PASS" if not errors else "FAIL"
         icon = "✅" if status == "PASS" else "❌"
         print(f"\n{icon} {stage.upper()}: {status}")
 
-        for e in errors:
-            print(f"   Error: {e}")
-        for w in warnings:
-            print(f"   ⚠️  {w}")
+        for err in errors:
+            print(f"   Error: {err}")
+        for warn in warnings:
+            print(f"   ⚠️  {warn}")
 
         return {"status": status, "errors": errors, "warnings": warnings, "stats": stats}
 
@@ -790,7 +831,7 @@ class ComedPipeline:
             if stats.get("k"):
                 print("\nClustering Results:")
                 print(f"  • {stats.get('n_assigned', '?')} profiles → {stats.get('k')} clusters")
-                if stats.get("silhouette"):
+                if stats.get("silhouette") is not None:
                     print(f"  • Silhouette score: {stats['silhouette']:.3f}")
 
         print()
@@ -802,24 +843,35 @@ class ComedPipeline:
 # =============================================================================
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="ComEd Smart Meter Analysis Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run full pipeline with 1000 files
-  python run_comed_pipeline.py --from-s3 --num-files 1000
+  # Quick local test (100 files, fewer households/days, no Stage 2)
+  python scripts/run_comed_pipeline.py \\
+      --from-s3 \\
+      --year-month 202308 \\
+      --num-files 100 \\
+      --sample-households 2000 \\
+      --sample-days 10 \\
+      --k-range 3 4
 
-  # Quick test with 100 files, skip clustering
-  python run_comed_pipeline.py --from-s3 --num-files 100 --skip-clustering
+  # High-volume analysis (tested configuration, with Stage 2)
+  python scripts/run_comed_pipeline.py \\
+      --from-s3 \\
+      --year-month 202308 \\
+      --num-files 10000 \\
+      --sample-households 20000 \\
+      --sample-days 31 \\
+      --k-range 3 6 \\
+      --run-stage2
 
-  # Validate existing results
-  python run_comed_pipeline.py --validate-only --run-name 202308_1000
-
-  # Custom clustering parameters
-  python run_comed_pipeline.py --from-s3 --num-files 1000 \\
-      --sample-households 2000 --sample-days 15 --k-range 3 5
+  # Validate existing results for a specific run
+  python scripts/run_comed_pipeline.py \\
+      --validate-only \\
+      --run-name 202308_10000
         """,
     )
 
@@ -866,7 +918,7 @@ Examples:
         "--sample-households",
         type=int,
         default=DEFAULT_CLUSTERING_CONFIG["sample_households"],
-        help=f"Households to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_households']}, use 0 for all)",
+        help=(f"Households to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_households']}, use 0 for all)"),
     )
     cluster_group.add_argument(
         "--sample-days",
@@ -880,16 +932,17 @@ Examples:
         nargs=2,
         metavar=("MIN", "MAX"),
         default=[DEFAULT_CLUSTERING_CONFIG["k_min"], DEFAULT_CLUSTERING_CONFIG["k_max"]],
-        help=f"Cluster range to test (default: {DEFAULT_CLUSTERING_CONFIG['k_min']} {DEFAULT_CLUSTERING_CONFIG['k_max']})",
+        help=(
+            "Cluster range to test "
+            f"(default: {DEFAULT_CLUSTERING_CONFIG['k_min']} {DEFAULT_CLUSTERING_CONFIG['k_max']})"
+        ),
     )
     cluster_group.add_argument(
         "--day-strategy",
         choices=["stratified", "random"],
         default=DEFAULT_CLUSTERING_CONFIG["day_strategy"],
-        help="Day sampling strategy (default: stratified = 70%% weekday, 30%% weekend)",
+        help="Day sampling strategy (default: stratified = 70% weekday, 30% weekend)",
     )
-
-    # Clustering options
     cluster_group.add_argument(
         "--n-init",
         type=int,
@@ -900,6 +953,14 @@ Examples:
         "--fast",
         action="store_true",
         help="Fast mode: k=3-4 (for testing)",
+    )
+    cluster_group.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CLUSTERING_CONFIG["chunk_size"],
+        help=(
+            f"Households per chunk for streaming profile builder (default: {DEFAULT_CLUSTERING_CONFIG['chunk_size']})"
+        ),
     )
 
     # Output options
@@ -944,17 +1005,19 @@ Examples:
             num_files=args.num_files,
             sample_days=args.sample_days,
             sample_households=sample_households,
+            day_strategy=args.day_strategy,
             k_min=args.k_range[0],
             k_max=args.k_range[1],
             n_init=args.n_init,
+            chunk_size=args.chunk_size,
             skip_clustering=args.skip_clustering,
             run_stage2=args.run_stage2,
         )
+
         if success:
             pipeline.validate_all()
     elif args.validate_only:
         success = pipeline.validate_all() if args.stage == "all" else pipeline.validate_stage(args.stage)
-
     else:
         parser.print_help()
         print("\n⚠️  Specify --from-s3 to run pipeline or --validate-only to check existing files")
