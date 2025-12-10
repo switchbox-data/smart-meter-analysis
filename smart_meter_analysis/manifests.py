@@ -72,22 +72,11 @@ def _validate_input_has_columns(input_path: Path, required: list[str]) -> None:
 
 def ensure_account_manifest(input_path: Path) -> Path:
     """
-    Create or load account manifest using streaming sink.
+    Create or load account manifest in a memory-safe way.
 
-    The manifest contains unique (account_identifier, zip_code) pairs,
-    extracted from the source file without loading it fully into memory.
-
-    Args:
-        input_path:
-            Path to interval-level parquet file.
-
-    Returns:
-        Path to account manifest parquet file.
-
-    Example:
-        >>> manifest_path = ensure_account_manifest(Path("comed_202308.parquet"))
-        >>> accounts_df = pl.read_parquet(manifest_path)
-        >>> accounts = accounts_df["account_identifier"].to_list()
+    The manifest contains one row per account_identifier with an associated
+    zip_code. Memory cost scales with the number of accounts, not the number
+    of interval-level rows.
     """
     _validate_input_has_columns(input_path, ["account_identifier", "zip_code"])
 
@@ -110,16 +99,30 @@ def ensure_account_manifest(input_path: Path) -> Path:
                 manifest_path,
             )
 
-    # Build manifest using streaming
-    logger.info("Building account manifest from %s (streaming)...", input_path)
+    # Build manifest using streaming-friendly group_by
+    logger.info("Building account manifest from %s (streaming group_by)...", input_path)
     log_memory("before account manifest")
 
-    (pl.scan_parquet(input_path).select(["account_identifier", "zip_code"]).unique().sink_parquet(manifest_path))
+    lf = pl.scan_parquet(input_path)
+
+    # One row per account_identifier, keep a representative zip_code.
+    # group_by + agg with collect(streaming=True) is streaming-safe; we only
+    # hold ~#accounts rows in memory.
+    accounts_df = (
+        lf.select(["account_identifier", "zip_code"])
+        .filter(pl.col("account_identifier").is_not_null())
+        .group_by("account_identifier")
+        .agg(pl.first("zip_code").alias("zip_code"))
+        .collect(streaming=True)
+        .sort("account_identifier")
+    )
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    accounts_df.write_parquet(manifest_path)
 
     log_memory("after account manifest")
 
-    # Validate and report
-    n = pl.scan_parquet(manifest_path).select(pl.len()).collect()[0, 0]
+    n = accounts_df.height
     logger.info(
         "Account manifest complete (rebuilt): %s (%s accounts)",
         manifest_path,
@@ -131,18 +134,11 @@ def ensure_account_manifest(input_path: Path) -> Path:
 
 def ensure_date_manifest(input_path: Path) -> Path:
     """
-    Create or load date manifest using streaming sink.
+    Create or load date manifest in a memory-safe way.
 
-    The manifest contains unique (date, is_weekend, weekday) tuples.
-    This is typically small (~31 rows for a month) but we use streaming
-    for consistency and to avoid scanning the full file into memory.
-
-    Args:
-        input_path:
-            Path to interval-level parquet file.
-
-    Returns:
-        Path to date manifest parquet file.
+    The manifest contains one row per date with representative weekend/weekday
+    flags. This is small in practice (~31 rows for one month), but we still
+    build it via streaming group_by for consistency.
     """
     _validate_input_has_columns(input_path, ["date", "is_weekend", "weekday"])
 
@@ -165,16 +161,30 @@ def ensure_date_manifest(input_path: Path) -> Path:
                 manifest_path,
             )
 
-    # Build manifest using streaming
-    logger.info("Building date manifest from %s (streaming)...", input_path)
+    # Build manifest using streaming-friendly group_by
+    logger.info("Building date manifest from %s (streaming group_by)...", input_path)
     log_memory("before date manifest")
 
-    (pl.scan_parquet(input_path).select(["date", "is_weekend", "weekday"]).unique().sink_parquet(manifest_path))
+    lf = pl.scan_parquet(input_path)
+
+    dates_df = (
+        lf.select(["date", "is_weekend", "weekday"])
+        .filter(pl.col("date").is_not_null())
+        .group_by("date")
+        .agg(
+            pl.first("is_weekend").alias("is_weekend"),
+            pl.first("weekday").alias("weekday"),
+        )
+        .collect(streaming=True)
+        .sort("date")
+    )
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    dates_df.write_parquet(manifest_path)
 
     log_memory("after date manifest")
 
-    # Validate and report
-    n = pl.scan_parquet(manifest_path).select(pl.len()).collect()[0, 0]
+    n = dates_df.height
     logger.info(
         "Date manifest complete (rebuilt): %s (%s dates)",
         manifest_path,

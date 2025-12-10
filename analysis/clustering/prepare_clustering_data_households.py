@@ -6,19 +6,22 @@ data for clustering analysis.
 Transforms interval-level energy data into daily load profiles at the
 HOUSEHOLD (account) level for k-means clustering.
 
-Pipeline:
-    1. Validate schema (no data scan)
-    2. Scan for metadata and sample households + dates
-    3. Create daily 48-point load profiles per household
-    4. Output profiles ready for clustering
+What this does:
+    1. Validate schema (no full data scan)
+    2. Build/load manifests for accounts and dates (streaming, memory-safe)
+    3. Sample households + dates from manifests
+    4. Create daily 48-point load profiles per household
+    5. Output profiles ready for clustering
 
 Design notes:
-    - Minimizes full-file scans (summary + unique accounts + unique dates only)
+    - Uses MANIFESTS to avoid OOM on unique().collect() for large files
+    - Manifests are built once via sink_parquet (streaming) and cached
     - Standard mode: single filtered collect() for selected households/dates
-    * good for up to ~50k households sampled
-    - Streaming mode: sink_parquet() pre-filter, then aggregate
-    * safer for 100k+ households
+      * good for up to ~5k-10k households sampled (depending on memory)
+    - Chunked streaming mode: fully streaming pipeline with per-chunk sinks
+      * required for 10k+ households on constrained hardware
     - Profiles are 48 half-hourly kWh values in chronological order (00:30-24:00)
+    - Incomplete days (not 48 intervals) are dropped as “missing/irregular data”
 
 Output files:
     - sampled_profiles.parquet:
@@ -26,30 +29,42 @@ Output files:
     - household_zip4_map.parquet:
         Unique account_identifier → zip_code mapping for later joins
 
+Manifest files (auto-generated alongside input, via smart_meter_analysis.manifests):
+    - {input_stem}_accounts.parquet: unique (account_identifier, zip_code) pairs
+    - {input_stem}_dates.parquet: unique (date, is_weekend, weekday) tuples
+
 Usage:
-    # Standard (5000 households, 20 days)
+    # Standard (5,000 households, 20 days)
     python prepare_clustering_data_households.py \
         --input data/processed/comed_202308.parquet \
         --output-dir data/clustering \
         --sample-households 5000 \
         --sample-days 20
 
-    # Large dataset with streaming
+    # Large dataset with chunked streaming (20,000 households)
     python prepare_clustering_data_households.py \
         --input data/processed/comed_202308.parquet \
         --output-dir data/clustering \
-        --sample-households 100000 \
-        --streaming
+        --sample-households 20000 \
+        --sample-days 31 \
+        --streaming \
+        --chunk-size 2000
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
+
+from smart_meter_analysis.manifests import (
+    ensure_account_manifest,
+    ensure_date_manifest,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +75,25 @@ logger = logging.getLogger(__name__)
 # Required columns for household-level clustering
 REQUIRED_ENERGY_COLS = ["zip_code", "account_identifier", "datetime", "kwh"]
 REQUIRED_TIME_COLS = ["date", "hour", "is_weekend", "weekday"]
+
+
+# =============================================================================
+# MEMORY INSTRUMENTATION
+# =============================================================================
+
+
+def log_memory(label: str) -> None:
+    """Log current RSS memory usage (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    mem_mb = int(line.split()[1]) / 1024
+                    logger.info("[MEMORY] %s: %.0f MB", label, mem_mb)
+                    break
+    except Exception as exc:
+        # Best-effort only; ignore on non-Linux or restricted environments
+        logger.debug("Skipping memory log for %s: %s", label, exc)
 
 
 # =============================================================================
@@ -108,13 +142,12 @@ def get_metadata_and_samples(
     seed: int = 42,
 ) -> dict[str, Any]:
     """
-    Get summary statistics and sample households + dates using minimal scans.
+    Get summary statistics and sample households + dates using MANIFESTS.
 
-    This function performs:
-    - Summary stats (row counts, unique counts, date range)
-    - Unique households
-    - Unique dates with weekend flags
-    - Sampling of households and dates
+    This function:
+    - Computes summary stats via streaming (safe for large files)
+    - Builds/loads account and date manifests (streaming sink, memory-safe)
+    - Samples households and dates from the small manifest files
 
     Args:
         input_path: Path to input parquet file.
@@ -130,44 +163,55 @@ def get_metadata_and_samples(
             - dates: list[date] of sampled dates
     """
     logger.info("Scanning input data for metadata and sampling...")
+    log_memory("start of get_metadata_and_samples")
 
     lf = pl.scan_parquet(input_path)
 
-    # Summary stats
+    # Summary stats (streaming-safe: single row output)
+    logger.info("  Computing summary statistics...")
     summary_df = lf.select([
         pl.len().alias("n_rows"),
         pl.col("zip_code").n_unique().alias("n_zip_codes"),
         pl.col("account_identifier").n_unique().alias("n_accounts"),
         pl.col("date").min().alias("min_date"),
         pl.col("date").max().alias("max_date"),
-    ]).collect()
+    ]).collect(engine="streaming")
     summary = summary_df.to_dicts()[0]
 
     # Early checks
     if summary["n_rows"] == 0:
         raise ValueError(f"Input file {input_path} contains no rows.")
 
-    logger.info(f"  {summary['n_rows']:,} rows")
-    logger.info(f"  {summary['n_accounts']:,} households")
-    logger.info(f"  {summary['n_zip_codes']:,} ZIP+4 codes")
-    logger.info(f"  Date range: {summary['min_date']} to {summary['max_date']}")
+    logger.info("  %s rows", f"{summary['n_rows']:,}")
+    logger.info("  %s households", f"{summary['n_accounts']:,}")
+    logger.info("  %s ZIP+4 codes", f"{summary['n_zip_codes']:,}")
+    logger.info("  Date range: %s to %s", summary["min_date"], summary["max_date"])
 
-    # Unique households
-    accounts_df = pl.scan_parquet(input_path).select("account_identifier").unique().collect()
+    # ==========================================================================
+    # KEY CHANGE: Use manifests instead of unique().collect()
+    # ==========================================================================
+
+    logger.info("  Loading manifests...")
+    account_manifest = ensure_account_manifest(input_path)
+    date_manifest = ensure_date_manifest(input_path)
+
+    # Read from small manifest files (fits easily in memory)
+    accounts_df = pl.read_parquet(account_manifest)
+    dates_df = pl.read_parquet(date_manifest)
+
+    log_memory("after loading manifests")
+
     if accounts_df.height == 0:
-        raise ValueError("No account_identifier values found in input data.")
-
-    # Unique dates with weekend flag
-    dates_df = pl.scan_parquet(input_path).select(["date", "is_weekend"]).unique().collect()
+        raise ValueError("No account_identifier values found in manifest.")
     if dates_df.height == 0:
-        raise ValueError("No dates found in input data.")
+        raise ValueError("No dates found in manifest.")
 
     # Sample households
     if sample_households is not None and sample_households < len(accounts_df):
         accounts_df = accounts_df.sample(n=sample_households, shuffle=True, seed=seed)
-        logger.info(f"  Sampled {len(accounts_df):,} households")
+        logger.info("  Sampled %s households", f"{len(accounts_df):,}")
     else:
-        logger.info(f"  Using all {len(accounts_df):,} households")
+        logger.info("  Using all %s households", f"{len(accounts_df):,}")
 
     accounts = accounts_df["account_identifier"].to_list()
 
@@ -176,11 +220,8 @@ def get_metadata_and_samples(
         weekday_df = dates_df.filter(~pl.col("is_weekend"))
         weekend_df = dates_df.filter(pl.col("is_weekend"))
 
-        if weekday_df.height == 0:
-            logger.warning("  No weekdays found; falling back to random day sampling.")
-            day_strategy = "random"
-        elif weekend_df.height == 0:
-            logger.warning("  No weekends found; falling back to random day sampling.")
+        if weekday_df.height == 0 or weekend_df.height == 0:
+            logger.warning("  Missing weekdays or weekends; falling back to random day sampling.")
             day_strategy = "random"
 
     if day_strategy == "stratified":
@@ -198,14 +239,20 @@ def get_metadata_and_samples(
         )
 
         dates = sampled_weekdays + sampled_weekends
-        logger.info(f"  Sampled {len(sampled_weekdays)} weekdays + {len(sampled_weekends)} weekend days (stratified)")
+        logger.info(
+            "  Sampled %d weekdays + %d weekend days (stratified)",
+            len(sampled_weekdays),
+            len(sampled_weekends),
+        )
     else:
         n_sample = min(sample_days, len(dates_df))
         dates = dates_df.sample(n=n_sample, shuffle=True, seed=seed)["date"].to_list()
-        logger.info(f"  Sampled {len(dates)} days (random)")
+        logger.info("  Sampled %d days (random)", len(dates))
 
     if not dates:
         raise ValueError("No dates were sampled; check input data and sampling settings.")
+
+    log_memory("end of get_metadata_and_samples")
 
     return {
         "summary": summary,
@@ -232,7 +279,7 @@ def create_household_profiles(
     (00:30 to 24:00).
 
     This uses a single filtered collect() over the full file, which is efficient
-    when sampling a subset of households and dates.
+    when sampling a moderate subset of households and dates.
 
     Args:
         input_path: Path to input parquet file.
@@ -248,7 +295,12 @@ def create_household_profiles(
             - is_weekend
             - weekday
     """
-    logger.info(f"Creating profiles for {len(accounts):,} households X {len(dates)} days...")
+    logger.info(
+        "Creating profiles for %s households x %d days...",
+        f"{len(accounts):,}",
+        len(dates),
+    )
+    log_memory("start of create_household_profiles")
 
     if not accounts:
         raise ValueError("No accounts provided for profile creation.")
@@ -267,7 +319,8 @@ def create_household_profiles(
         logger.warning("  No data found for selected households/dates")
         return pl.DataFrame()
 
-    logger.info(f"  Loaded {len(df):,} interval records")
+    logger.info("  Loaded %s interval records", f"{len(df):,}")
+    log_memory("after loading filtered intervals")
 
     profiles_df = df.group_by(["account_identifier", "zip_code", "date"]).agg([
         pl.col("kwh").alias("profile"),
@@ -281,92 +334,163 @@ def create_household_profiles(
     n_dropped = n_before - len(profiles_df)
 
     if n_dropped > 0:
-        logger.info(f"  Dropped {n_dropped:,} incomplete profiles (DST days, missing data)")
+        logger.info(
+            "  Dropped %s incomplete profiles (missing or irregular data)",
+            f"{n_dropped:,}",
+        )
 
-    logger.info(f"  Created {len(profiles_df):,} complete profiles")
+    logger.info("  Created %s complete profiles", f"{len(profiles_df):,}")
+    log_memory("end of create_household_profiles")
 
     return profiles_df.drop("num_intervals")
 
 
-def create_household_profiles_streaming(
+def _create_profiles_for_chunk_streaming(
+    input_path: Path,
+    accounts_chunk: list[str],
+    dates: list[Any],
+    chunk_idx: int,
+    total_chunks: int,
+    tmp_dir: Path,
+) -> Path:
+    """
+    Create profiles for a single chunk of households and write directly to parquet.
+
+    Uses within-group sort (struct.sort_by) to preserve chronological order
+    without a global sort, which keeps the lazy plan streaming-compatible.
+
+    Returns:
+        Path to the chunk parquet file.
+    """
+    logger.info(
+        "  Chunk %d/%d: %s households...",
+        chunk_idx + 1,
+        total_chunks,
+        f"{len(accounts_chunk):,}",
+    )
+    log_memory(f"chunk {chunk_idx + 1} start")
+
+    chunk_path = tmp_dir / f"sampled_profiles_chunk_{chunk_idx:03d}.parquet"
+
+    (
+        pl.scan_parquet(input_path)
+        .filter(pl.col("account_identifier").is_in(accounts_chunk) & pl.col("date").is_in(dates))
+        .group_by(["account_identifier", "zip_code", "date"])
+        .agg([
+            # Sort by datetime within group, then extract kwh values
+            pl.struct(["datetime", "kwh"]).sort_by("datetime").struct.field("kwh").alias("profile"),
+            pl.col("is_weekend").first(),
+            pl.col("weekday").first(),
+            pl.len().alias("num_intervals"),
+        ])
+        .filter(pl.col("num_intervals") == 48)
+        .drop("num_intervals")
+        .sink_parquet(chunk_path)
+    )
+
+    log_memory(f"chunk {chunk_idx + 1} done")
+    logger.info("    Wrote chunk parquet: %s", chunk_path)
+
+    return chunk_path
+
+
+def create_household_profiles_chunked_streaming(
     input_path: Path,
     accounts: list[str],
     dates: list[Any],
     output_path: Path,
+    chunk_size: int = 5000,
 ) -> int:
     """
-    Create daily load profiles using a streaming-friendly two-pass approach.
+    Create daily load profiles using chunked streaming.
 
-    Pass 1:
-        Filter to selected households/dates and stream to a temp parquet file.
-    Pass 2:
-        Sort by (account_identifier, datetime), aggregate to daily profiles
-        with list-of-48 kWh values, and write final output.
+    - Splits households into chunks.
+    - For each chunk, runs a streaming filter → group_by → aggregate → sink.
+    - Concatenates all chunk files using a streaming concat.
+    - Deletes temporary chunk files.
 
-    This avoids loading the entire original parquet into memory, but the
-    aggregated profiles are still collected in-memory before final write.
+    This avoids ever materializing profiles for all households in memory.
 
     Args:
-        input_path: Path to input parquet file.
+        input_path: Path to interval-level parquet file.
         accounts: List of account_identifier values to include.
         dates: List of dates to include.
-        output_path: Path to write final profiles parquet.
+        output_path: Final output parquet path for all profiles.
+        chunk_size: Number of households per chunk.
 
     Returns:
         Number of complete daily profiles created.
     """
-    logger.info(f"Creating profiles (streaming) for {len(accounts):,} households X {len(dates)} days...")
-
     if not accounts:
-        raise ValueError("No accounts provided for streaming profile creation.")
+        raise ValueError(
+            "No accounts provided for chunked streaming profile creation.",
+        )
     if not dates:
-        raise ValueError("No dates provided for streaming profile creation.")
+        raise ValueError("No dates provided for chunked streaming profile creation.")
 
-    temp_path = output_path.parent / "_temp_filtered.parquet"
+    n_accounts = len(accounts)
+    n_chunks = (n_accounts + chunk_size - 1) // chunk_size
 
-    try:
-        # Pass 1: Stream filtered data to temp file
-        logger.info("  Pass 1: Streaming filtered data to temp parquet...")
-        (
-            pl.scan_parquet(input_path)
-            .filter(pl.col("account_identifier").is_in(accounts) & pl.col("date").is_in(dates))
-            .sink_parquet(temp_path)
+    logger.info(
+        "Creating profiles in %d chunks of up to %s households each (total: %s households x %d days)...",
+        n_chunks,
+        f"{chunk_size:,}",
+        f"{n_accounts:,}",
+        len(dates),
+    )
+    log_memory("before chunked streaming")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_path.parent
+
+    chunk_paths: list[Path] = []
+
+    for i in range(n_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, n_accounts)
+        accounts_chunk = accounts[start_idx:end_idx]
+
+        chunk_path = _create_profiles_for_chunk_streaming(
+            input_path=input_path,
+            accounts_chunk=accounts_chunk,
+            dates=dates,
+            chunk_idx=i,
+            total_chunks=n_chunks,
+            tmp_dir=tmp_dir,
         )
 
-        if not temp_path.exists() or temp_path.stat().st_size == 0:
-            logger.warning("  No data found for selected households/dates in streaming mode")
-            return 0
+        # Only keep non-empty chunk files
+        if chunk_path.exists() and chunk_path.stat().st_size > 0:
+            chunk_paths.append(chunk_path)
 
-        # Pass 2: Sort, aggregate, and write final output
-        logger.info("  Pass 2: Sorting and aggregating to daily profiles...")
+        gc.collect()
 
-        profiles_df = (
-            pl.scan_parquet(temp_path)
-            .sort(["account_identifier", "datetime"])
-            .collect()
-            .group_by(["account_identifier", "zip_code", "date"])
-            .agg([
-                pl.col("kwh").alias("profile"),
-                pl.col("is_weekend").first(),
-                pl.col("weekday").first(),
-                pl.len().alias("num_intervals"),
-            ])
-            .filter(pl.col("num_intervals") == 48)
-            .drop("num_intervals")
-        )
+    if not chunk_paths:
+        logger.warning("No profiles created in chunked streaming mode!")
+        return 0
 
-        n_profiles = len(profiles_df)
-        logger.info(f"  Created {n_profiles:,} complete profiles")
+    # Stream-concatenate all chunk parquet files
+    logger.info("Combining %d chunk files into %s", len(chunk_paths), output_path)
+    log_memory("before streaming concat")
 
-        profiles_df.write_parquet(output_path)
-        logger.info(f"  Saved profiles (streaming) to {output_path}")
+    combined_lf = pl.concat([pl.scan_parquet(p) for p in chunk_paths])
+    combined_lf.sink_parquet(output_path)
 
-        return n_profiles
+    log_memory("after streaming concat")
 
-    finally:
-        # Clean up temp file
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+    # Count rows in final output
+    n_profiles = pl.scan_parquet(output_path).select(pl.len()).collect()[0, 0]
+    logger.info("  Created %s complete profiles (chunked streaming)", f"{n_profiles:,}")
+    logger.info("  Saved to %s", output_path)
+
+    # Clean up temporary chunk files
+    for p in chunk_paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to delete temp chunk file %s: %s", p, exc)
+
+    return int(n_profiles)
 
 
 # =============================================================================
@@ -381,6 +505,7 @@ def prepare_clustering_data(
     sample_days: int = 20,
     day_strategy: Literal["stratified", "random"] = "stratified",
     streaming: bool = False,
+    chunk_size: int = 5000,
     seed: int = 42,
 ) -> dict[str, Any]:
     """
@@ -392,7 +517,8 @@ def prepare_clustering_data(
         sample_households: Number of households to sample (None = all).
         sample_days: Number of days to sample.
         day_strategy: 'stratified' (70% weekdays) or 'random'.
-        streaming: If True, use streaming-friendly mode for large samples.
+        streaming: If True, use chunked streaming mode for large samples.
+        chunk_size: Households per chunk when streaming is enabled.
         seed: Random seed for reproducibility.
 
     Returns:
@@ -405,15 +531,16 @@ def prepare_clustering_data(
     logger.info("=" * 70)
     logger.info("PREPARING HOUSEHOLD-LEVEL CLUSTERING DATA")
     if streaming:
-        logger.info("(STREAMING MODE ENABLED)")
+        logger.info("(STREAMING MODE ENABLED, chunk_size=%d)", chunk_size)
     logger.info("=" * 70)
+    log_memory("start of prepare_clustering_data")
 
     # 1. Schema validation (cheap, no data load)
     validation = validate_schema(input_path)
     if not validation["valid"]:
         raise ValueError(f"Input validation failed: {validation['errors']}")
 
-    # 2. Metadata + sampling
+    # 2. Metadata + sampling (uses manifests for memory safety)
     metadata = get_metadata_and_samples(
         input_path=input_path,
         sample_households=sample_households,
@@ -429,17 +556,20 @@ def prepare_clustering_data(
     output_dir.mkdir(parents=True, exist_ok=True)
     profiles_path = output_dir / "sampled_profiles.parquet"
 
-    # 4. Create profiles (in-memory or streaming)
+    # 4. Create profiles (in-memory or chunked streaming)
     if streaming:
-        n_profiles = create_household_profiles_streaming(
+        n_profiles = create_household_profiles_chunked_streaming(
             input_path=input_path,
             accounts=accounts,
             dates=dates,
             output_path=profiles_path,
+            chunk_size=chunk_size,
         )
 
         if n_profiles == 0:
-            raise ValueError("No profiles created in streaming mode - check input data.")
+            raise ValueError(
+                "No profiles created in chunked streaming mode - check input data and sampling settings.",
+            )
 
         profiles_df = pl.read_parquet(profiles_path)
     else:
@@ -450,25 +580,29 @@ def prepare_clustering_data(
         )
 
         if profiles_df.is_empty():
-            raise ValueError("No profiles created - check input data and sampling settings.")
+            raise ValueError(
+                "No profiles created - check input data and sampling settings.",
+            )
 
-        (
-            profiles_df.select([
-                "account_identifier",
-                "zip_code",
-                "date",
-                "profile",
-                "is_weekend",
-                "weekday",
-            ]).write_parquet(profiles_path)
-        )
-        logger.info(f"  Saved profiles: {profiles_path}")
+        profiles_df.select([
+            "account_identifier",
+            "zip_code",
+            "date",
+            "profile",
+            "is_weekend",
+            "weekday",
+        ]).write_parquet(profiles_path)
+        logger.info("  Saved profiles: %s", profiles_path)
 
     # 5. Save household → ZIP+4 mapping
     household_map = profiles_df.select(["account_identifier", "zip_code"]).unique()
     map_path = output_dir / "household_zip4_map.parquet"
     household_map.write_parquet(map_path)
-    logger.info(f"  Saved household-ZIP+4 map: {map_path} ({len(household_map):,} households)")
+    logger.info(
+        "  Saved household-ZIP+4 map: %s (%s households)",
+        map_path,
+        f"{len(household_map):,}",
+    )
 
     # 6. Stats
     stats = {
@@ -482,11 +616,12 @@ def prepare_clustering_data(
     logger.info("=" * 70)
     logger.info("CLUSTERING DATA READY")
     logger.info("=" * 70)
-    logger.info(f"  Profiles: {stats['n_profiles']:,}")
-    logger.info(f"  Households: {stats['n_households']:,}")
-    logger.info(f"  ZIP+4s represented: {stats['n_zip4s']:,}")
-    logger.info(f"  Days: {stats['n_dates']}")
-    logger.info(f"  Output: {output_dir}")
+    logger.info("  Profiles: %s", f"{stats['n_profiles']:,}")
+    logger.info("  Households: %s", f"{stats['n_households']:,}")
+    logger.info("  ZIP+4s represented: %s", f"{stats['n_zip4s']:,}")
+    logger.info("  Days: %d", stats["n_dates"])
+    logger.info("  Output: %s", output_dir)
+    log_memory("end of prepare_clustering_data")
 
     return stats
 
@@ -497,31 +632,33 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Standard run (5000 households, 20 days)
-    python prepare_clustering_data_households.py \
-        --input data/processed/comed_202308.parquet \
-        --output-dir data/clustering \
-        --sample-households 5000 \
+    # Standard run (5,000 households, 20 days)
+    python prepare_clustering_data_households.py \\
+        --input data/processed/comed_202308.parquet \\
+        --output-dir data/clustering \\
+        --sample-households 5000 \\
         --sample-days 20
 
-    # Large dataset with streaming
-    python prepare_clustering_data_households.py \
-        --input data/processed/comed_202308.parquet \
-        --output-dir data/clustering \
-        --sample-households 100000 \
-        --streaming
+    # Large dataset with chunked streaming
+    python prepare_clustering_data_households.py \\
+        --input data/processed/comed_202308.parquet \\
+        --output-dir data/clustering \\
+        --sample-households 20000 \\
+        --sample-days 31 \\
+        --streaming \\
+        --chunk-size 2000
 
     # All households, fewer days
-    python prepare_clustering_data_households.py \
-        --input data/processed/comed_202308.parquet \
-        --output-dir data/clustering \
+    python prepare_clustering_data_households.py \\
+        --input data/processed/comed_202308.parquet \\
+        --output-dir data/clustering \\
         --sample-days 10
 
     # Quick test
-    python prepare_clustering_data_households.py \
-        --input data/processed/comed_202308.parquet \
-        --output-dir data/clustering \
-        --sample-households 500 \
+    python prepare_clustering_data_households.py \\
+        --input data/processed/comed_202308.parquet \\
+        --output-dir data/clustering \\
+        --sample-households 500 \\
         --sample-days 5
         """,
     )
@@ -554,7 +691,7 @@ Examples:
         "--day-strategy",
         choices=["stratified", "random"],
         default="stratified",
-        help="Day sampling: stratified (70%% weekday) or random.",
+        help="Day sampling: stratified (70% weekday) or random.",
     )
     parser.add_argument(
         "--seed",
@@ -565,13 +702,19 @@ Examples:
     parser.add_argument(
         "--streaming",
         action="store_true",
-        help="Use streaming-friendly mode for large household samples.",
+        help="Use chunked streaming mode for large household samples (10k+).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=5000,
+        help="Households per chunk when --streaming is enabled (default: 5000).",
     )
 
     args = parser.parse_args()
 
     if not args.input.exists():
-        logger.error(f"Input file not found: {args.input}")
+        logger.error("Input file not found: %s", args.input)
         return 1
 
     try:
@@ -582,11 +725,12 @@ Examples:
             sample_days=args.sample_days,
             day_strategy=args.day_strategy,
             streaming=args.streaming,
+            chunk_size=args.chunk_size,
             seed=args.seed,
         )
         return 0
-    except Exception as e:
-        logger.error(f"Failed: {e}")
+    except Exception as exc:
+        logger.error("Failed: %s", exc)
         # Re-raise so stack traces are visible in logs when run via a pipeline
         raise
 
