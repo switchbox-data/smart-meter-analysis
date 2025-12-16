@@ -6,6 +6,8 @@ data for clustering analysis.
 Transforms interval-level energy data into daily load profiles at the
 HOUSEHOLD (account) level for k-means clustering.
 
+MODIFIED: Now accepts multiple input parquet files (e.g., split by time period).
+
 What this does:
     1. Validate schema (no full data scan)
     2. Build/load manifests for accounts and dates (streaming, memory-safe)
@@ -21,7 +23,7 @@ Design notes:
     - Chunked streaming mode: fully streaming pipeline with per-chunk sinks
       * required for 10k+ households on constrained hardware
     - Profiles are 48 half-hourly kWh values in chronological order (00:30-24:00)
-    - Incomplete days (not 48 intervals) are dropped as “missing/irregular data”
+    - Incomplete days (not 48 intervals) are dropped as "missing/irregular data"
 
 Output files:
     - sampled_profiles.parquet:
@@ -40,6 +42,14 @@ Usage:
         --output-dir data/clustering \
         --sample-households 5000 \
         --sample-days 20
+
+    # Multiple input files
+    python prepare_clustering_data_households.py \
+        --input file1.parquet file2.parquet \
+        --output-dir data/clustering \
+        --sample-households 100000 \
+        --sample-days 365 \
+        --streaming
 
     # Large dataset with chunked streaming (20,000 households)
     python prepare_clustering_data_households.py \
@@ -97,16 +107,38 @@ def log_memory(label: str) -> None:
 
 
 # =============================================================================
+# MULTI-FILE SUPPORT
+# =============================================================================
+
+
+def scan_multiple_parquet(paths: list[Path]) -> pl.LazyFrame:
+    """
+    Create a unified LazyFrame from multiple parquet files.
+
+    Args:
+        paths: List of parquet file paths
+
+    Returns:
+        Combined LazyFrame
+    """
+    if len(paths) == 1:
+        return pl.scan_parquet(paths[0])
+    else:
+        logger.info("Combining %d input files...", len(paths))
+        return pl.concat([pl.scan_parquet(p) for p in paths])
+
+
+# =============================================================================
 # DATA INSPECTION & SAMPLING
 # =============================================================================
 
 
-def validate_schema(path: Path) -> dict[str, Any]:
+def validate_schema(paths: list[Path]) -> dict[str, Any]:
     """
     Validate input data has required columns (schema-only check, no full data scan).
 
     Args:
-        path: Path to input parquet file.
+        paths: List of paths to input parquet files.
 
     Returns:
         Dictionary with:
@@ -114,7 +146,7 @@ def validate_schema(path: Path) -> dict[str, Any]:
             - errors: list[str]
             - columns: list[str]
     """
-    lf = pl.scan_parquet(path)
+    lf = scan_multiple_parquet(paths)
     schema = lf.collect_schema()
 
     errors: list[str] = []
@@ -134,8 +166,8 @@ def validate_schema(path: Path) -> dict[str, Any]:
     }
 
 
-def get_metadata_and_samples(
-    input_path: Path,
+def get_metadata_and_samples(  # noqa: C901
+    input_paths: list[Path],
     sample_households: int | None,
     sample_days: int,
     day_strategy: Literal["stratified", "random"],
@@ -150,7 +182,7 @@ def get_metadata_and_samples(
     - Samples households and dates from the small manifest files
 
     Args:
-        input_path: Path to input parquet file.
+        input_paths: List of paths to input parquet files.
         sample_households: Number of households to sample (None = all).
         sample_days: Number of days to sample.
         day_strategy: 'stratified' (70/30 weekday/weekend) or 'random'.
@@ -165,7 +197,7 @@ def get_metadata_and_samples(
     logger.info("Scanning input data for metadata and sampling...")
     log_memory("start of get_metadata_and_samples")
 
-    lf = pl.scan_parquet(input_path)
+    lf = scan_multiple_parquet(input_paths)
 
     # Summary stats (streaming-safe: single row output)
     logger.info("  Computing summary statistics...")
@@ -180,7 +212,7 @@ def get_metadata_and_samples(
 
     # Early checks
     if summary["n_rows"] == 0:
-        raise ValueError(f"Input file {input_path} contains no rows.")
+        raise ValueError("Input files contain no rows.")
 
     logger.info("  %s rows", f"{summary['n_rows']:,}")
     logger.info("  %s households", f"{summary['n_accounts']:,}")
@@ -188,16 +220,27 @@ def get_metadata_and_samples(
     logger.info("  Date range: %s to %s", summary["min_date"], summary["max_date"])
 
     # ==========================================================================
-    # KEY CHANGE: Use manifests instead of unique().collect()
+    # KEY CHANGE: Use manifests from first file (assumes all files have same structure)
     # ==========================================================================
 
-    logger.info("  Loading manifests...")
-    account_manifest = ensure_account_manifest(input_path)
-    date_manifest = ensure_date_manifest(input_path)
+    logger.info("  Loading manifests from first input file...")
+    account_manifest = ensure_account_manifest(input_paths[0])
+    date_manifest = ensure_date_manifest(input_paths[0])
 
     # Read from small manifest files (fits easily in memory)
     accounts_df = pl.read_parquet(account_manifest)
     dates_df = pl.read_parquet(date_manifest)
+
+    # If multiple files, also load manifests from other files and combine
+    if len(input_paths) > 1:
+        logger.info("  Loading manifests from additional input files...")
+        for path in input_paths[1:]:
+            acc_manifest = ensure_account_manifest(path)
+            date_manifest_extra = ensure_date_manifest(path)
+
+            accounts_df = pl.concat([accounts_df, pl.read_parquet(acc_manifest)]).unique()
+
+            dates_df = pl.concat([dates_df, pl.read_parquet(date_manifest_extra)]).unique()
 
     log_memory("after loading manifests")
 
@@ -267,7 +310,7 @@ def get_metadata_and_samples(
 
 
 def create_household_profiles(
-    input_path: Path,
+    input_paths: list[Path],
     accounts: list[str],
     dates: list[Any],
 ) -> pl.DataFrame:
@@ -282,7 +325,7 @@ def create_household_profiles(
     when sampling a moderate subset of households and dates.
 
     Args:
-        input_path: Path to input parquet file.
+        input_paths: List of paths to input parquet files.
         accounts: List of account_identifier values to include.
         dates: List of dates to include.
 
@@ -308,7 +351,7 @@ def create_household_profiles(
         raise ValueError("No dates provided for profile creation.")
 
     df = (
-        pl.scan_parquet(input_path)
+        scan_multiple_parquet(input_paths)
         .filter(pl.col("account_identifier").is_in(accounts) & pl.col("date").is_in(dates))
         # Ensures profile list is chronological within each (account, date)
         .sort(["account_identifier", "datetime"])
@@ -346,7 +389,7 @@ def create_household_profiles(
 
 
 def _create_profiles_for_chunk_streaming(
-    input_path: Path,
+    input_paths: list[Path],
     accounts_chunk: list[str],
     dates: list[Any],
     chunk_idx: int,
@@ -373,7 +416,7 @@ def _create_profiles_for_chunk_streaming(
     chunk_path = tmp_dir / f"sampled_profiles_chunk_{chunk_idx:03d}.parquet"
 
     (
-        pl.scan_parquet(input_path)
+        scan_multiple_parquet(input_paths)
         .filter(pl.col("account_identifier").is_in(accounts_chunk) & pl.col("date").is_in(dates))
         .group_by(["account_identifier", "zip_code", "date"])
         .agg([
@@ -395,7 +438,7 @@ def _create_profiles_for_chunk_streaming(
 
 
 def create_household_profiles_chunked_streaming(
-    input_path: Path,
+    input_paths: list[Path],
     accounts: list[str],
     dates: list[Any],
     output_path: Path,
@@ -412,7 +455,7 @@ def create_household_profiles_chunked_streaming(
     This avoids ever materializing profiles for all households in memory.
 
     Args:
-        input_path: Path to interval-level parquet file.
+        input_paths: List of paths to interval-level parquet files.
         accounts: List of account_identifier values to include.
         dates: List of dates to include.
         output_path: Final output parquet path for all profiles.
@@ -451,7 +494,7 @@ def create_household_profiles_chunked_streaming(
         accounts_chunk = accounts[start_idx:end_idx]
 
         chunk_path = _create_profiles_for_chunk_streaming(
-            input_path=input_path,
+            input_paths=input_paths,
             accounts_chunk=accounts_chunk,
             dates=dates,
             chunk_idx=i,
@@ -499,7 +542,7 @@ def create_household_profiles_chunked_streaming(
 
 
 def prepare_clustering_data(
-    input_path: Path,
+    input_paths: list[Path],
     output_dir: Path,
     sample_households: int | None = None,
     sample_days: int = 20,
@@ -512,7 +555,7 @@ def prepare_clustering_data(
     Prepare household-level clustering data from interval parquet.
 
     Args:
-        input_path: Path to processed interval parquet file.
+        input_paths: List of paths to processed interval parquet files.
         output_dir: Output directory for clustering files.
         sample_households: Number of households to sample (None = all).
         sample_days: Number of days to sample.
@@ -530,19 +573,21 @@ def prepare_clustering_data(
     """
     logger.info("=" * 70)
     logger.info("PREPARING HOUSEHOLD-LEVEL CLUSTERING DATA")
+    if len(input_paths) > 1:
+        logger.info("(MULTI-FILE MODE: %d input files)", len(input_paths))
     if streaming:
         logger.info("(STREAMING MODE ENABLED, chunk_size=%d)", chunk_size)
     logger.info("=" * 70)
     log_memory("start of prepare_clustering_data")
 
     # 1. Schema validation (cheap, no data load)
-    validation = validate_schema(input_path)
+    validation = validate_schema(input_paths)
     if not validation["valid"]:
         raise ValueError(f"Input validation failed: {validation['errors']}")
 
     # 2. Metadata + sampling (uses manifests for memory safety)
     metadata = get_metadata_and_samples(
-        input_path=input_path,
+        input_paths=input_paths,
         sample_households=sample_households,
         sample_days=sample_days,
         day_strategy=day_strategy,
@@ -559,7 +604,7 @@ def prepare_clustering_data(
     # 4. Create profiles (in-memory or chunked streaming)
     if streaming:
         n_profiles = create_household_profiles_chunked_streaming(
-            input_path=input_path,
+            input_paths=input_paths,
             accounts=accounts,
             dates=dates,
             output_path=profiles_path,
@@ -574,7 +619,7 @@ def prepare_clustering_data(
         profiles_df = pl.read_parquet(profiles_path)
     else:
         profiles_df = create_household_profiles(
-            input_path=input_path,
+            input_paths=input_paths,
             accounts=accounts,
             dates=dates,
         )
@@ -639,6 +684,15 @@ Examples:
         --sample-households 5000 \\
         --sample-days 20
 
+    # Multiple input files
+    python prepare_clustering_data_households.py \\
+        --input file1.parquet file2.parquet file3.parquet \\
+        --output-dir data/clustering \\
+        --sample-households 100000 \\
+        --sample-days 365 \\
+        --streaming \\
+        --chunk-size 5000
+
     # Large dataset with chunked streaming
     python prepare_clustering_data_households.py \\
         --input data/processed/comed_202308.parquet \\
@@ -667,7 +721,8 @@ Examples:
         "--input",
         type=Path,
         required=True,
-        help="Path to processed interval parquet file.",
+        nargs="+",
+        help="Path(s) to processed interval parquet file(s).",
     )
     parser.add_argument(
         "--output-dir",
@@ -691,7 +746,7 @@ Examples:
         "--day-strategy",
         choices=["stratified", "random"],
         default="stratified",
-        help="Day sampling: stratified (70% weekday) or random.",
+        help="Day sampling: stratified (70%% weekday) or random.",
     )
     parser.add_argument(
         "--seed",
@@ -713,13 +768,17 @@ Examples:
 
     args = parser.parse_args()
 
-    if not args.input.exists():
-        logger.error("Input file not found: %s", args.input)
-        return 1
+    # Convert input to list if single path provided
+    input_paths = args.input if isinstance(args.input, list) else [args.input]
+
+    for path in input_paths:
+        if not path.exists():
+            logger.error("Input file not found: %s", path)
+            return 1
 
     try:
         prepare_clustering_data(
-            input_path=args.input,
+            input_paths=input_paths,
             output_dir=args.output_dir,
             sample_households=args.sample_households,
             sample_days=args.sample_days,
