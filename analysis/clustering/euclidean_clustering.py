@@ -7,7 +7,7 @@ to identify distinct consumption patterns.
 
 Pipeline:
     1. Load daily profiles from Phase 1
-    2. Normalize profiles (optional but recommended)
+    2. Normalize profiles (optional)
     3. Evaluate k values to find optimal k (via silhouette score on a sample)
     4. Run final clustering with optimal k
     5. Output assignments, centroids, and visualizations
@@ -23,7 +23,7 @@ Usage:
         --silhouette-sample-size 10000
 
     # Fixed k (no evaluation)
-    python euclidean_clustering_fixed.py \\
+    python euclidean_clustering.py \\
         --input data/clustering/sampled_profiles.parquet \\
         --output-dir data/clustering/results \\
         --k 4 --normalize
@@ -624,14 +624,14 @@ def main() -> None:
         epilog="""
 Examples:
     # Standard run with k evaluation (silhouette on sample)
-    python euclidean_clustering_fixed.py \\
+    python euclidean_clustering.py \\
         --input data/clustering/sampled_profiles.parquet \\
         --output-dir data/clustering/results \\
         --k-range 3 6 --find-optimal-k --normalize \\
         --silhouette-sample-size 10000
 
     # Fixed k (no evaluation)
-    python euclidean_clustering_fixed.py \\
+    python euclidean_clustering.py \\
         --input data/clustering/sampled_profiles.parquet \\
         --output-dir data/clustering/results \\
         --k 4 --normalize
