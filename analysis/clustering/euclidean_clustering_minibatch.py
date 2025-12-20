@@ -341,7 +341,7 @@ def main() -> int:
         model=model,
         input_path=args.input,
         output_path=assignments_path,
-        batch_size=max(args.batch_size, 50_000),
+        batch_size=args.batch_size,
         normalize=bool(eff_norm),
         normalize_method=args.normalize_method,
         silhouette_sample_idx=silhouette_sample_idx,
