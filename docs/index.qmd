@@ -4,25 +4,29 @@
 
 ### Load profiles
 
-Our ComEd and Ameren Illinois data consists of kWh load profiles in 30-minute increments for the complete set of households across the entire Chicago metro area. To preserve anonymity, TK.
+Our ComEd and Ameren Illinois data consists of kWh load profiles in 30-minute increments for the complete set of households across the entire ComEd service area. To preserve anonymity per rules set by the Illinois Chamber of Commerce, customer data can only be included in a data release from a utility company if it passes a screening process. In this case, a customer’s individual data cannot be released if there are 15 or fewer customers in the given geographic area, or if they represent more than 15% of that area’s load. In our case, the geographic area of interest is the nine-digit Zip+4 postal code.
 
-As a result, we only get consistent household identifiers for a given calendar month. Since Chicago's grid is summer-peaking, we choose load profiles for the month of TK. We denote load profiles as $L_i$ (for each $i$ household). Each $L_i$ is a TK point time series, for every 30 minutes in the month.
+# The Ameren data was grabbed for a hypothetical second project with CUB. It's not part of the scope of this round of work--CUB explicitly asked for the ComEd data first and separately
+
+Furthermore, even when individual customers’ usage data is provided, the identification number associated with each customer is not retained month to month. In other words, while the usage data may feature the same customers in September as they did in August, ComEd assigns each customer a new account ID for each month.  As a result, we only get consistent household identifiers for a given calendar month. Since Illinois’s grid peaked in July 2023, we choose load profiles for the month of TK. We denote load profiles as $L_i$ (for each $i$ household). Each $L_i$ is a TK point time series, for every 30 minutes in the month  (48 half-hour readings over the course of 30 days).
 
 ### Demographic information
 
-The highest spatial resolution demographic data available for our analysis is the 5-year TK (2024?) US Census Bureau American Community Survey (2024 ACS) at the block group level. From this, we derive a number of block-group level demographic features:
-
+The highest spatial resolution demographic data available for our analysis is the 5-year 2023 US Census Bureau American Community Survey (2023 ACS) and the decennial 2020 Census Supplemental Demographic and Housing Characteristics File (2020 DHS) at the block group level (DHS 2020). From this, we derive a number of block-group level demographic features:
 * TK
 
 ### Geographical crosswalk
 
-Load profiles are identified by ZIP+4. Our demographic information from the TK (2024?) ACS is available at the Census block group level. To join the two, we use a crosswalk from Melissa. TK details of crosswalk.
+Load profiles are identified by ZIP+4. Our demographic information from the 2023ACS and 2020 DHS is available at the Census block group level. To join the two, we use a crosswalk from Melissa. That crosswalk matches every Zip+4 postal code in Illinois to the Census Block that it was associated with in 2023. From here we aggregate the Census Blocks to their Block Groups–allowing them to be associated with our demographic information. Thus, we are able to characterize Block Groups both demographically and by the usage data of their residents.
 
-TK ZIP+4 and Census Block group spaital overlap to show that it's a reasonable mapping.
+TK ZIP+4 and Census Block group spatial overlap to show that it’s a reasonable mapping.
 
 ### Clusters
 
 We cluster the load profiles into clusters via k-means. We use Euclidean distance on normalized load profiles, to focus on load shape rather than overall levels. We are aiming for a small number of clusters (4-10) to aid in interpretation. We chose $k=\textrm{TK}$ via the gap statistic [@tibshiraniEstimatingNumberClusters2001], using the `GapStatistics` package(TK citation).
+
+# current code compares silhouette scores to give the k gives the tightest, best separated clusters. Given skepticism about the initial paper's findings
+# (as in... maybe there's nothing to see here?) your approach might be better. My limited understanding is that the gap score compares to a null model, # while my code only compares clusters that it generates itself. Happy to change
 
 TK details on each cluster, and brief description of each shape.
 
