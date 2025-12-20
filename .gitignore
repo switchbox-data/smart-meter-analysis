@@ -170,3 +170,5 @@ results/
 
 # benchmark artificats
 profiles/
+docs/*.html
+docs/index_files/

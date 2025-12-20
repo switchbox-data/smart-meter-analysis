@@ -173,7 +173,6 @@ def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.La
     if day_mode not in {"calendar", "billing"}:
         raise ValueError("day_mode must be 'calendar' or 'billing'")
 
-    # Fixed DST dates currently encoded
     DST_SPRING_2023 = _date(2023, 3, 12)
     DST_FALL_2023 = _date(2023, 11, 5)
 
@@ -182,12 +181,13 @@ def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.La
     if day_mode == "calendar":
         date_expr = dt.dt.date()
     else:
-        # Billing day: assign midnight rows (00:00) back to the previous date
         date_expr = (
             pl.when((dt.dt.hour() == 0) & (dt.dt.minute() == 0))
             .then((dt - pl.duration(days=1)).dt.date())
             .otherwise(dt.dt.date())
         )
+
+    weekday_expr = pl.col("date").dt.weekday()  # Polars: Mon=1 ... Sun=7
 
     return (
         lf.with_columns([
@@ -195,8 +195,8 @@ def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.La
             dt.dt.hour().alias("hour"),
         ])
         .with_columns([
-            pl.col("date").dt.weekday().alias("weekday"),
-            (pl.col("date").dt.weekday() >= 5).alias("is_weekend"),
+            weekday_expr.alias("weekday"),
+            (weekday_expr >= 6).alias("is_weekend"),
         ])
         .with_columns([
             (pl.col("date") == DST_SPRING_2023).alias("is_spring_forward_day"),

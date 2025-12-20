@@ -58,18 +58,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Default predictors (for convergence and interpretability)
 DEFAULT_PREDICTORS = [
+    "Owner_Occupied_Pct",
+    "Average_Household_Size",
+    "Old_Building_Pct",
+    "Heat_Electric_Pct",
     "Median_Household_Income",
-    "Median_Age",
     "Urban_Percent",
-    "Total_Households",
 ]
-
-
-# =============================================================================
-# 1. LOAD CLUSTER ASSIGNMENTS (HOUSEHOLD-DAY LEVEL)
-# =============================================================================
 
 
 def load_cluster_assignments_household_day(path: Path) -> tuple[pl.DataFrame, dict]:
@@ -113,7 +109,6 @@ def load_cluster_assignments_household_day(path: Path) -> tuple[pl.DataFrame, di
         n_clusters,
     )
 
-    # This doesn't affect the regression - just useful context
     dominance_stats = _compute_dominance_stats(raw)
 
     logger.info(
@@ -135,16 +130,12 @@ def _compute_dominance_stats(df: pl.DataFrame) -> dict:
 
     Returns summary statistics across all households.
     """
-    # Count days per (household, cluster)
     counts = df.group_by(["account_identifier", "cluster"]).agg(pl.len().alias("days_in_cluster"))
 
-    # Total days per household
     totals = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").sum().alias("n_days"))
 
-    # Max days in any single cluster per household
     max_days = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").max().alias("max_days_in_cluster"))
 
-    # Compute dominance
     dominance_df = max_days.join(totals, on="account_identifier").with_columns(
         (pl.col("max_days_in_cluster") / pl.col("n_days")).alias("dominance")
     )
@@ -162,11 +153,6 @@ def _compute_dominance_stats(df: pl.DataFrame) -> dict:
         "pct_above_67": float((dominance_values > 0.67).mean() * 100),
         "pct_above_80": float((dominance_values > 0.8).mean() * 100),
     }
-
-
-# =============================================================================
-# 2. CROSSWALK AND BLOCK GROUP MAPPING
-# =============================================================================
 
 
 def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
@@ -200,7 +186,6 @@ def load_crosswalk(crosswalk_path: Path, zip_codes: list[str]) -> pl.DataFrame:
         logger.warning("  Crosswalk is empty after filtering for sample ZIP+4s.")
         return crosswalk
 
-    # Fan-out diagnostic
     fanout = crosswalk.group_by("zip_code").agg(pl.n_unique("block_group_geoid").alias("n_block_groups"))
     max_fanout = int(fanout["n_block_groups"].max())
 
@@ -247,11 +232,6 @@ def attach_block_groups_to_household_days(
     return df
 
 
-# =============================================================================
-# 3. AGGREGATE TO BLOCK-GROUP x CLUSTER COUNTS
-# =============================================================================
-
-
 def aggregate_blockgroup_cluster_counts(df: pl.DataFrame) -> pl.DataFrame:
     """
     Aggregate household-day observations to block-group x cluster counts.
@@ -270,19 +250,16 @@ def aggregate_blockgroup_cluster_counts(df: pl.DataFrame) -> pl.DataFrame:
     """
     logger.info("Aggregating to block-group x cluster counts (household-day units)...")
 
-    # Counts per (block_group, cluster)
     counts = df.group_by(["block_group_geoid", "cluster"]).agg([
         pl.len().alias("n_obs"),
         pl.col("account_identifier").n_unique().alias("n_households"),
     ])
 
-    # Totals per block_group
     totals = df.group_by("block_group_geoid").agg([
         pl.len().alias("total_obs"),
         pl.col("account_identifier").n_unique().alias("total_households"),
     ])
 
-    # Merge and compute cluster shares
     bg_counts = counts.join(totals, on="block_group_geoid", how="left").with_columns(
         (pl.col("n_obs") / pl.col("total_obs")).alias("cluster_share")
     )
@@ -299,11 +276,6 @@ def aggregate_blockgroup_cluster_counts(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     return bg_counts
-
-
-# =============================================================================
-# 4. CENSUS DATA
-# =============================================================================
 
 
 def fetch_or_load_census(
@@ -328,6 +300,43 @@ def fetch_or_load_census(
     return census_df
 
 
+def create_derived_variables(census_df: pl.DataFrame) -> pl.DataFrame:
+    """Create derived percentage variables from raw Census counts."""
+    logger.info("Creating derived variables...")
+
+    df = census_df.with_columns([
+        (pl.col("Owner_Occupied") / pl.col("Occupied_Housing_Units") * 100).alias("Owner_Occupied_Pct"),
+        (pl.col("Heat_Electric") / pl.col("Total_Households") * 100).alias("Heat_Electric_Pct"),
+        (
+            (
+                pl.col("Built_1960_1969")
+                + pl.col("Built_1950_1959")
+                + pl.col("Built_1940_1949")
+                + pl.col("Built_1939_Earlier")
+            )
+            / pl.col("Total_Housing_Units")
+            * 100
+        ).alias("Old_Building_Pct"),
+    ])
+
+    df = df.with_columns([
+        pl.when(pl.col("Owner_Occupied_Pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("Owner_Occupied_Pct"))
+        .alias("Owner_Occupied_Pct"),
+        pl.when(pl.col("Heat_Electric_Pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("Heat_Electric_Pct"))
+        .alias("Heat_Electric_Pct"),
+        pl.when(pl.col("Old_Building_Pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("Old_Building_Pct"))
+        .alias("Old_Building_Pct"),
+    ])
+
+    return df
+
+
 def attach_census_to_blockgroups(bg_counts: pl.DataFrame, census_df: pl.DataFrame) -> pl.DataFrame:
     """Attach Census demographics to block-group cluster counts."""
     logger.info("Joining Census data to block-group counts...")
@@ -349,11 +358,6 @@ def attach_census_to_blockgroups(bg_counts: pl.DataFrame, census_df: pl.DataFram
     return demo
 
 
-# =============================================================================
-# 5. PREPARE REGRESSION DATA
-# =============================================================================
-
-
 def prepare_regression_dataset(
     demo_df: pl.DataFrame,
     predictors: list[str],
@@ -369,7 +373,6 @@ def prepare_regression_dataset(
     """
     logger.info("Preparing regression dataset...")
 
-    # Filter by minimum observations (household-days)
     df = demo_df.filter(pl.col("total_obs") >= min_obs_per_bg)
     logger.info(
         "  After min_obs filter (>=%d): %s block groups",
@@ -377,7 +380,6 @@ def prepare_regression_dataset(
         f"{df['block_group_geoid'].n_unique():,}",
     )
 
-    # Require block groups to have multiple clusters represented
     nonzero_counts = (
         df.filter(pl.col("n_obs") > 0).group_by("block_group_geoid").agg(pl.len().alias("n_nonzero_clusters"))
     )
@@ -394,7 +396,6 @@ def prepare_regression_dataset(
         f"{df['block_group_geoid'].n_unique():,}",
     )
 
-    # Filter predictors
     available_predictors: list[str] = []
     for p in predictors:
         if p not in df.columns:
@@ -419,11 +420,6 @@ def prepare_regression_dataset(
     )
 
     return df, available_predictors
-
-
-# =============================================================================
-# 6. MULTINOMIAL REGRESSION
-# =============================================================================
 
 
 def run_multinomial_regression(
@@ -454,12 +450,10 @@ def run_multinomial_regression(
     logger.info("Running multinomial logistic regression...")
     logger.info("  Weighting by: %s (household-day observations)", weight_col)
 
-    # Extract arrays
     X = reg_df.select(predictors).to_numpy().astype(np.float64)
     y = reg_df.get_column(outcome).to_numpy()
     weights = reg_df.get_column(weight_col).to_numpy().astype(np.float64)
 
-    # Drop rows with NaN in predictors
     nan_mask = np.isnan(X).any(axis=1)
     if nan_mask.sum() > 0:
         logger.warning("  Dropping %s rows with NaN predictors", f"{nan_mask.sum():,}")
@@ -470,7 +464,6 @@ def run_multinomial_regression(
 
     n_block_groups = reg_df.filter(~pl.any_horizontal(pl.col(predictors).is_null()))["block_group_geoid"].n_unique()
 
-    # Standardize or use raw units
     if standardize:
         logger.info("  Standardizing predictors...")
         scaler = StandardScaler()
@@ -479,10 +472,8 @@ def run_multinomial_regression(
         logger.info("  Using raw predictor units (no standardization).")
         X_transformed = X
 
-    # Add intercept
     X_with_const = sm.add_constant(X_transformed)
 
-    # Expand rows by integer weights
     weight_ints = np.maximum(np.round(weights).astype(int), 1)
     X_expanded = np.repeat(X_with_const, weight_ints, axis=0)
     y_expanded = np.repeat(y, weight_ints)
@@ -497,7 +488,6 @@ def run_multinomial_regression(
     model = sm.MNLogit(y_expanded, X_expanded)
     result = model.fit(method="newton", maxiter=100, disp=False)
 
-    # Extract results
     classes = sorted(np.unique(y).tolist())
     baseline = classes[0]
     param_names = ["const", *predictors]
@@ -514,7 +504,6 @@ def run_multinomial_regression(
         p_values[key] = {name: float(result.pvalues[j, i]) for j, name in enumerate(param_names)}
         odds_ratios[key] = {name: float(np.exp(result.params[j, i])) for j, name in enumerate(param_names)}
 
-    # Baseline cluster
     baseline_key = f"cluster_{baseline}"
     coefficients[baseline_key] = dict.fromkeys(param_names, 0.0)
     std_errors[baseline_key] = dict.fromkeys(param_names, 0.0)
@@ -545,11 +534,6 @@ def run_multinomial_regression(
         "llf": float(result.llf),
         "model_summary": result.summary().as_text(),
     }
-
-
-# =============================================================================
-# 7. REPORT GENERATION
-# =============================================================================
 
 
 def generate_report(
@@ -636,11 +620,6 @@ def generate_report(
     print("\n" + text)
 
 
-# =============================================================================
-# 8. CLI
-# =============================================================================
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Stage 2: Block-group-level regression using household-day units.",
@@ -696,18 +675,14 @@ def main() -> int:
     print("STAGE 2: BLOCK-GROUP REGRESSION (HOUSEHOLD-DAY UNITS)")
     print("=" * 70)
 
-    # 1. Load household-day cluster assignments (NO dominant cluster reduction)
     household_days, dominance_stats = load_cluster_assignments_household_day(args.clusters)
 
-    # 2. Load crosswalk and attach block groups
     zip_codes = household_days["zip_code"].unique().to_list()
     crosswalk = load_crosswalk(args.crosswalk, zip_codes)
     household_days_bg = attach_block_groups_to_household_days(household_days, crosswalk)
 
-    # 3. Aggregate to block-group x cluster counts
     bg_counts = aggregate_blockgroup_cluster_counts(household_days_bg)
 
-    # 4. Load Census and attach demographics
     census_df = fetch_or_load_census(
         cache_path=args.census_cache,
         state_fips=args.state_fips,
@@ -716,9 +691,10 @@ def main() -> int:
     )
     logger.info("  Census: %s block groups, %s columns", f"{len(census_df):,}", len(census_df.columns))
 
+    census_df = create_derived_variables(census_df)
+
     demo_df = attach_census_to_blockgroups(bg_counts, census_df)
 
-    # 5. Prepare regression dataset
     reg_df, predictors = prepare_regression_dataset(
         demo_df=demo_df,
         predictors=args.predictors,
@@ -730,29 +706,24 @@ def main() -> int:
         logger.error("No data after filtering")
         return 1
 
-    # Save regression dataset
     reg_df.write_parquet(args.output_dir / "regression_data_blockgroups.parquet")
     logger.info("Saved regression data to %s", args.output_dir / "regression_data_blockgroups.parquet")
 
-    # 6. Run regression (weighted by n_obs = household-day counts)
     results = run_multinomial_regression(
         reg_df=reg_df,
         predictors=predictors,
         outcome="cluster",
-        weight_col="n_obs",  # household-day observations
+        weight_col="n_obs",
         standardize=args.standardize,
     )
 
-    # Add dominance stats to results for reference
     results["dominance_stats"] = dominance_stats
 
-    # Save results
     model_summary = results.pop("model_summary")
     with open(args.output_dir / "regression_results_blockgroups.json", "w") as f:
         json.dump(results, f, indent=2)
     (args.output_dir / "statsmodels_summary.txt").write_text(model_summary)
 
-    # Generate report
     cluster_dist = (
         reg_df.group_by("cluster")
         .agg(pl.col("n_obs").sum())

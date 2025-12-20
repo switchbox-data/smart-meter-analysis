@@ -136,11 +136,11 @@ def ensure_date_manifest(input_path: Path) -> Path:
     """
     Create or load date manifest in a memory-safe way.
 
-    The manifest contains one row per date with representative weekend/weekday
-    flags. This is small in practice (~31 rows for one month), but we still
-    build it via streaming group_by for consistency.
+    The manifest contains one row per date with weekend/weekday
+    flags derived from weekday (source of truth).
     """
-    _validate_input_has_columns(input_path, ["date", "is_weekend", "weekday"])
+    # Only require date + weekday; is_weekend will be derived
+    _validate_input_has_columns(input_path, ["date", "weekday"])
 
     manifest_path = input_path.parent / f"{input_path.stem}_dates.parquet"
 
@@ -161,19 +161,21 @@ def ensure_date_manifest(input_path: Path) -> Path:
                 manifest_path,
             )
 
-    # Build manifest using streaming-friendly group_by
     logger.info("Building date manifest from %s (streaming group_by)...", input_path)
     log_memory("before date manifest")
 
     lf = pl.scan_parquet(input_path)
 
+    # Build: date -> weekday (first) -> is_weekend (derived)
     dates_df = (
-        lf.select(["date", "is_weekend", "weekday"])
+        lf.select(["date", "weekday"])
         .filter(pl.col("date").is_not_null())
         .group_by("date")
         .agg(
-            pl.first("is_weekend").alias("is_weekend"),
             pl.first("weekday").alias("weekday"),
+        )
+        .with_columns(
+            (pl.col("weekday") >= 6).alias("is_weekend")  # 6=Sat, 7=Sun
         )
         .collect(engine="streaming")
         .sort("date")
