@@ -10,7 +10,7 @@ regression (ALR / additive log-ratio).
 
 Unit of Analysis
 ----------------
-One row per Census Block Group
+One row per Census BLOCK GROUP (not one row per block_group x cluster).
 
 Data Flow
 ---------
@@ -92,25 +92,37 @@ def load_cluster_assignments_household_day(path: Path) -> tuple[pl.DataFrame, di
         (for reporting/interpretation, not used in regression)
     """
     logger.info("Loading cluster assignments from %s", path)
-    raw = pl.read_parquet(path)
 
+    # For large files, compute stats without loading everything
+    logger.info("  Computing statistics in streaming mode...")
+    lf = pl.scan_parquet(path)
+
+    # Quick validation
+    schema = lf.collect_schema()
     required = ["account_identifier", "zip_code", "cluster"]
-    missing = [c for c in required if c not in raw.columns]
+    missing = [c for c in required if c not in schema.names()]
     if missing:
         raise ValueError(f"cluster_assignments missing required columns: {missing}")
 
-    n_household_days = len(raw)
-    n_households = raw["account_identifier"].n_unique()
-    n_clusters = raw["cluster"].n_unique()
+    # Compute basic stats without loading full data
+    stats_df = lf.select([
+        pl.len().alias("n_household_days"),
+        pl.col("account_identifier").n_unique().alias("n_households"),
+        pl.col("cluster").n_unique().alias("n_clusters"),
+    ]).collect()
+
+    stats = stats_df.to_dicts()[0]
 
     logger.info(
-        "  Loaded: %s household-day observations, %s households, %s clusters",
-        f"{n_household_days:,}",
-        f"{n_households:,}",
-        n_clusters,
+        "  Found: %s household-day observations, %s households, %s clusters",
+        f"{stats['n_household_days']:,}",
+        f"{stats['n_households']:,}",
+        stats["n_clusters"],
     )
 
-    dominance_stats = _compute_dominance_stats(raw)
+    # Compute dominance stats with streaming
+    logger.info("  Computing dominance statistics...")
+    dominance_stats = _compute_dominance_stats_streaming(path)
 
     logger.info(
         "  Dominance stats: mean=%.1f%%, median=%.1f%%, >50%%: %.1f%% of households",
@@ -119,38 +131,46 @@ def load_cluster_assignments_household_day(path: Path) -> tuple[pl.DataFrame, di
         dominance_stats["pct_above_50"],
     )
 
+    # Now load only what we need for regression: just the columns
+    logger.info("  Loading data for regression (selecting needed columns only)...")
+    raw = lf.select(required).collect(streaming=True)
+
     return raw, dominance_stats
 
 
-def _compute_dominance_stats(df: pl.DataFrame) -> dict:
+def _compute_dominance_stats_streaming(path: Path) -> dict:
     """
-    Compute how consistently each household stays in one cluster.
-
-    For each household:
-    - dominance = (days in most frequent cluster) / (total days)
-
-    Returns summary statistics across all households.
+    Compute dominance stats using streaming aggregation to avoid OOM.
     """
-    counts = df.group_by(["account_identifier", "cluster"]).agg(pl.len().alias("days_in_cluster"))
-    totals = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").sum().alias("n_days"))
-    max_days = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").max().alias("max_days_in_cluster"))
+    lf = pl.scan_parquet(path)
 
-    dominance_df = max_days.join(totals, on="account_identifier").with_columns(
-        (pl.col("max_days_in_cluster") / pl.col("n_days")).alias("dominance")
+    # Compute per-household cluster counts
+    counts = (
+        lf.group_by(["account_identifier", "cluster"]).agg(pl.len().alias("days_in_cluster")).collect(streaming=True)
     )
 
-    dominance_values = dominance_df["dominance"].to_numpy()
+    # Get max days per household
+    max_days = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").max().alias("max_days_in_cluster"))
+
+    # Get total days per household
+    totals = counts.group_by("account_identifier").agg(pl.col("days_in_cluster").sum().alias("n_days"))
+
+    # Join and compute dominance
+    dominance = max_days.join(totals, on="account_identifier")
+    dominance = dominance.with_columns((pl.col("max_days_in_cluster") / pl.col("n_days")).alias("dominance"))
+
+    dom_series = dominance["dominance"]
 
     return {
-        "n_households": len(dominance_df),
-        "dominance_mean": float(dominance_values.mean()),
-        "dominance_median": float(np.median(dominance_values)),
-        "dominance_std": float(dominance_values.std()),
-        "dominance_min": float(dominance_values.min()),
-        "dominance_max": float(dominance_values.max()),
-        "pct_above_50": float((dominance_values > 0.5).mean() * 100),
-        "pct_above_67": float((dominance_values > 0.67).mean() * 100),
-        "pct_above_80": float((dominance_values > 0.8).mean() * 100),
+        "n_households": int(dominance.height),
+        "dominance_mean": float(dom_series.mean()),
+        "dominance_median": float(dom_series.median()),
+        "dominance_std": float(dom_series.std()),
+        "dominance_min": float(dom_series.min()),
+        "dominance_max": float(dom_series.max()),
+        "pct_above_50": float((dom_series > 0.5).mean() * 100),
+        "pct_above_67": float((dom_series > 0.67).mean() * 100),
+        "pct_above_80": float((dom_series > 0.80).mean() * 100),
     }
 
 
@@ -161,6 +181,7 @@ def load_crosswalk_one_to_one(crosswalk_path: Path, zip_codes: list[str]) -> pl.
     When fan-out exists (ZIP+4 maps to multiple block groups),
     choose smallest GEOID per ZIP+4 to avoid double-counting household-day observations.
 
+    This is the only valid approach when crosswalk weights are unavailable.
     """
     logger.info("Loading crosswalk from %s", crosswalk_path)
 
