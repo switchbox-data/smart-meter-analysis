@@ -75,6 +75,7 @@ dev = [
     "mkdocstrings[python]>=0.26.1",
     "boto3-stubs>=1.40.46",
     "types-requests>=2.32.4.20250913",
+    "types-pyyaml>=6.0.12.20250915",
 ]
 
 
