@@ -1,0 +1,43 @@
+# Monthly Pipeline Configuration
+# This config file parameterizes the smart meter analysis pipeline for any month
+
+year: 2023
+month: 7  # 1-12, default is July 2023 (matches existing working setup)
+
+# S3 Configuration
+s3:
+  bucket: "smart-meter-data-sb"
+  prefix: "sharepoint-files/Zip4/"
+
+# Clustering Configuration
+clustering:
+  n_clusters: 4
+  algorithm: "minibatch"
+  batch_size: 10000
+  n_init: 3
+  random_state: 42
+  normalize: true
+  normalize_method: "minmax"
+  silhouette_sample_size: 5000
+
+# Census Configuration
+census:
+  api_key: ${CENSUS_API_KEY}  # from environment variable
+  year: 2023
+  state_fips: "17"  # Illinois
+
+# Output Directories
+output:
+  parquet_dir: "data/processed"
+  models_dir: "models"
+  results_dir: "results"
+  clustering_dir: "data/clustering"
+
+# Sampling Configuration
+sampling:
+  sample_households: null  # null = all households
+  sample_days: 20
+  day_strategy: "stratified"  # "stratified" or "random"
+  seed: 42
+  streaming: true
+  chunk_size: 5000
