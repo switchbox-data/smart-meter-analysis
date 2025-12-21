@@ -58,7 +58,7 @@ DEP002 = [
   "memory-profiler",
   "snakeviz",
 ]
-DEP003 = ["botocore"]
+DEP003 = ["botocore", "analysis"]
 DEP004 = ["botocore"]
 
 [dependency-groups]
