@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -55,21 +56,14 @@ import statsmodels.api as sm
 from sklearn.preprocessing import StandardScaler
 
 from smart_meter_analysis.census import fetch_census_data
+from smart_meter_analysis.census_specs import STAGE2_PREDICTORS_47
+from smart_meter_analysis.run_manifest import write_stage2_manifest
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
-DEFAULT_PREDICTORS = [
-    "Owner_Occupied_Pct",
-    "Average_Household_Size",
-    "Old_Building_Pct",
-    "Heat_Electric_Pct",
-    "Median_Household_Income",
-    "Urban_Percent",
-]
 
 
 def load_cluster_assignments_household_day(path: Path) -> tuple[pl.DataFrame, dict]:
@@ -403,6 +397,48 @@ def attach_census_to_blockgroups(bg_comp: pl.DataFrame, census_df: pl.DataFrame)
     return demo
 
 
+def detect_predictors_from_census(demo_df: pl.DataFrame) -> list[str]:
+    """
+    Automatically detect predictor columns from census data.
+
+    Excludes identifiers and non-predictors:
+    - GEOID, block_group_geoid
+    - total_obs, total_households
+    - Cluster counts (n_cluster_*)
+    - Cluster proportions (p_cluster_*)
+    - Log-ratio columns (log_ratio_*)
+    - NAME (if present)
+
+    Returns all other columns as predictors (should be census-derived features).
+    """
+    exclude_patterns = [
+        "GEOID",
+        "block_group_geoid",
+        "total_obs",
+        "total_households",
+        "NAME",
+    ]
+    exclude_prefixes = [
+        "n_cluster_",
+        "p_cluster_",
+        "log_ratio_",
+    ]
+
+    all_cols = demo_df.columns
+    predictors = []
+
+    for col in all_cols:
+        # Skip if matches exact exclusion
+        if col in exclude_patterns:
+            continue
+        # Skip if starts with exclusion prefix
+        if any(col.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+        predictors.append(col)
+
+    return sorted(predictors)
+
+
 def prepare_regression_dataset_wide(
     demo_df: pl.DataFrame,
     predictors: list[str],
@@ -441,9 +477,10 @@ def prepare_regression_dataset_wide(
 
     # Drop rows with any null predictor values
     df = df.filter(~pl.any_horizontal(pl.col(available_predictors).is_null()))
+    bg_after_dropnull = df["block_group_geoid"].n_unique()
     logger.info(
         "  After dropping rows with null predictors: %s block groups",
-        f"{df['block_group_geoid'].n_unique():,}",
+        f"{bg_after_dropnull:,}",
     )
 
     logger.info("  Using %d predictors: %s", len(available_predictors), available_predictors)
@@ -541,6 +578,7 @@ def run_logratio_regressions(
         for a 1-unit increase in the predictor.
     """
     logger.info("Running log-ratio regressions...")
+    logger.info("  Final predictor count: %d", len(predictors))
     logger.info("  Baseline cluster: %s", baseline_cluster)
     logger.info("  Weighting by: %s", weight_col)
     logger.info("  OLS robustness check: %s", include_ols)
@@ -792,7 +830,12 @@ def main() -> int:
         default=50,
         help="Minimum household-day observations per block group (default: 50)",
     )
-    parser.add_argument("--predictors", nargs="+", default=DEFAULT_PREDICTORS, help="Predictor columns")
+    parser.add_argument(
+        "--predictors",
+        nargs="+",
+        default=None,
+        help="Predictor columns (default: auto-detect from census data; this argument is deprecated)",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -819,6 +862,13 @@ def main() -> int:
         "--no-ols",
         action="store_true",
         help="Skip OLS robustness check (only run WLS)",
+    )
+
+    parser.add_argument(
+        "--predictors-from",
+        type=str,
+        default=None,
+        help="Optional: path to a predictors_used.txt file to force an exact predictor list.",
     )
 
     args = parser.parse_args()
@@ -857,15 +907,38 @@ def main() -> int:
     )
     logger.info("  Census: %s block groups, %s columns", f"{len(census_df):,}", len(census_df.columns))
 
-    census_df = create_derived_variables(census_df)
-
     demo_df = attach_census_to_blockgroups(bg_comp, census_df)
+
+    # Track initial block group count
+    bg_total = demo_df["block_group_geoid"].n_unique()
+
+    # If user supplied predictors-from, prefer that; else use stable 47 list.
+    if args.predictors_from is not None:
+        # Load predictors from a prior run's predictors_used.txt file
+        predictors_path = Path(args.predictors_from)
+        if not predictors_path.exists():
+            logger.error("Predictors file not found: %s", predictors_path)
+            return 1
+        predictors = [line.strip() for line in predictors_path.read_text().strip().split("\n") if line.strip()]
+        logger.info("Using predictors from prior run: %s (%d predictors)", args.predictors_from, len(predictors))
+    else:
+        predictors = list(STAGE2_PREDICTORS_47)
+        logger.info("Using stable predictor list from census_specs: %d predictors", len(predictors))
+
+    # Track predictors before filtering
+    initial_predictors = set(predictors)
 
     reg_df, predictors = prepare_regression_dataset_wide(
         demo_df=demo_df,
-        predictors=args.predictors,
+        predictors=predictors,
         min_obs_per_bg=args.min_obs_per_bg,
     )
+
+    # Track block group counts and excluded predictors
+    bg_after_minobs = reg_df["block_group_geoid"].n_unique() if not reg_df.is_empty() else 0
+    excluded_all_null_predictors = sorted(initial_predictors - set(predictors))
+    predictors_detected = len(initial_predictors)
+    bg_after_dropnull = reg_df["block_group_geoid"].n_unique() if not reg_df.is_empty() else 0
 
     if reg_df.is_empty():
         logger.error("No data after filtering")
@@ -882,6 +955,24 @@ def main() -> int:
     # Save regression dataset
     reg_df2.write_parquet(args.output_dir / "regression_data_blockgroups_wide.parquet")
     logger.info("Saved regression data to %s", args.output_dir / "regression_data_blockgroups_wide.parquet")
+
+    # Validate required predictor columns exist before modeling
+    missing = [c for c in predictors if c not in reg_df2.columns]
+    if missing:
+        available = sorted([
+            c
+            for c in reg_df2.columns
+            if not c.startswith(("n_cluster_", "p_cluster_", "log_ratio_", "total_obs", "block_group_geoid", "GEOID"))
+        ])
+        raise ValueError(
+            f"Missing required predictor columns: {missing}\n"
+            f"Available columns: {available}\n"
+            f"Please check that census.py returns the expected engineered features."
+        )
+
+    # Log final predictor count before modeling
+    logger.info("Final predictor count: %d", len(predictors))
+    logger.info("Predictors: %s", predictors)
 
     # Fit models
     results = run_logratio_regressions(
@@ -927,6 +1018,30 @@ def main() -> int:
     )
 
     print(f"\nOutputs saved to: {args.output_dir}")
+
+    write_stage2_manifest(
+        output_dir=args.output_dir,
+        command=" ".join(sys.argv),
+        repo_root=".",
+        clusters_path=args.clusters,
+        crosswalk_path=args.crosswalk,
+        census_cache_path=args.census_cache,
+        baseline_cluster=baseline_cluster,
+        min_obs_per_bg=args.min_obs_per_bg,
+        alpha=args.alpha,
+        weight_column="total_obs",
+        predictors_detected=predictors_detected,
+        predictors_used=predictors,
+        predictors_excluded_all_null=excluded_all_null_predictors,
+        block_groups_total=int(bg_total),
+        block_groups_after_min_obs=int(bg_after_minobs),
+        block_groups_after_drop_null_predictors=int(bg_after_dropnull),
+        regression_data_path=args.output_dir / "regression_data_blockgroups_wide.parquet",
+        regression_report_path=args.output_dir / "regression_report_logratio_blockgroups.txt",
+        run_log_path=args.output_dir / "run.log",
+    )
+    logger.info("Wrote Stage 2 manifest and predictor lists to %s", args.output_dir)
+
     return 0
 
 
