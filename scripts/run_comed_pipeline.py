@@ -1,1029 +1,482 @@
 #!/usr/bin/env python3
-"""
-ComEd Smart Meter Analysis Pipeline
+"""ComEd Smart Meter Analysis Pipeline Orchestrator (Phase 3)
 
-Main entry point for the ComEd smart meter clustering analysis. This script
-handles the complete workflow from raw S3 data to clustered household-day
-load profiles and (optionally) Stage 2 block-group regression.
-
-================================================================================
-PIPELINE OVERVIEW
-================================================================================
-
-Stage 1: Usage Pattern Clustering (this script)
-    1. Download    - Fetch CSV files from S3
-    2. Process     - Transform wide→long, add time features, write parquet
-    3. Prepare     - Create daily load profiles per HOUSEHOLD-DAY
-                     (one 48-point profile per (household, date))
-    4. Cluster     - K-means (Euclidean) on household-day profiles
-    5. Validate    - Check data quality at each step
-
-Stage 2: Block-Group Demographic Regression (stage2_blockgroup_regression.py)
-    - Aggregate household-day observations to (block_group x cluster) counts
-    - Join with Census demographics at block-group level
-    - Run multinomial logistic regression (statsmodels for proper inference)
-    - Identify demographic predictors of the mix of clusters across household-days
-
-    Unit of analysis: ONE ROW PER (block_group, cluster), with counts over
-    household-day observations.
-
-================================================================================
-USAGE MODES
-================================================================================
-
-Typical workflow from the project root (script lives in scripts/):
-
-FULL PIPELINE (download from S3, process, cluster, validate, run Stage 2):
-    python scripts/run_comed_pipeline.py \
-      --from-s3 \
-      --year-month 202308 \
-      --num-files 10000 \
-      --sample-households 20000 \
-      --sample-days 31 \
-      --k-range 3 6 \
-      --run-stage2
-
-QUICK LOCAL TEST (fewer files, fewer households/days):
-    python scripts/run_comed_pipeline.py \
-      --from-s3 \
-      --year-month 202308 \
-      --num-files 100 \
-      --sample-households 2000 \
-      --sample-days 10 \
-      --k-range 3 4
-
-VALIDATE ONLY (check existing files for a given run):
-    python scripts/run_comed_pipeline.py \
-      --validate-only \
-      --run-name 202308_10000
-
-SPECIFIC STAGE VALIDATION:
-    python scripts/run_comed_pipeline.py \
-      --validate-only \
-      --run-name 202308_10000 \
-      --stage processed
-
-    python scripts/run_comed_pipeline.py \
-      --validate-only \
-      --run-name 202308_10000 \
-      --stage clustering
-
-================================================================================
-OUTPUT STRUCTURE
-================================================================================
-
-data/validation_runs/{run_name}/
-├── samples/                          # Raw CSV files from S3
-├── processed/
-│   └── comed_{year_month}.parquet    # Interval-level data (long format)
-├── clustering/
-│   ├── sampled_profiles.parquet      # Household-day profiles for clustering
-│   ├── household_zip4_map.parquet    # Map of households to ZIP+4s
-│   └── results/
-│       ├── cluster_assignments.parquet
-│       ├── cluster_centroids.parquet
-│       ├── k_evaluation.json
-│       ├── clustering_metadata.json
-│       ├── elbow_curve.png
-│       ├── cluster_centroids.png
-│       ├── cluster_samples.png
-│       └── stage2_blockgroups/       # (optional) Stage 2 outputs when run
-│           ├── ... block-group cluster counts, regression results, etc.
-
+Directory structure (required):
+data/runs/{run_name}/
+├── raw/                         # Downloaded CSVs
+├── processed/                   # Canonical interval parquet
+├── clustering/                  # Stage 1 outputs + clustering outputs
+├── stage2/                      # Stage 2 outputs
+├── logs/                        # All logs
+├── run_manifest.json            # Pipeline metadata
+├── download_manifest.jsonl      # S3 download record
+└── processing_manifest.jsonl    # CSV processing record
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+from smart_meter_analysis.aws_loader import download_s3_batch, list_s3_files
+
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# DEFAULT CONFIGURATION
-# =============================================================================
-
-DEFAULT_PATHS = {
-    "processed": Path("data/processed/comed_202308.parquet"),
-    "clustering_dir": Path("data/clustering"),
-    "crosswalk": Path("data/reference/2023_comed_zip4_census_crosswalk.txt"),
-}
-
-DEFAULT_S3_CONFIG = {
-    "bucket": "smart-meter-data-sb",
-    "prefix": "sharepoint-files/Zip4/",
-}
-
-DEFAULT_CLUSTERING_CONFIG = {
-    # Household/day sampling for clustering
-    "sample_days": 31,
-    "sample_households": 20_000,  # None = all; 20k is the tested high-volume default
-    "day_strategy": "stratified",
-    # K-means hyperparameters
-    "k_min": 3,
-    "k_max": 6,
-    "n_init": 10,
-    # Profile construction (streaming is always on)
-    "chunk_size": 500,  # households per chunk when building profiles
-}
+DEFAULT_RUNS_DIR = Path("data/runs")
+DEFAULT_CROSSWALK_PATH = Path("data/reference/2023_comed_zip4_census_crosswalk.txt")
+DEFAULT_STATE_FIPS = "17"
+DEFAULT_ACS_YEAR = 2023
 
 
-# =============================================================================
-# PIPELINE EXECUTOR CLASS
-# =============================================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-class ComedPipeline:
-    """
-    Orchestrates the ComEd smart meter analysis pipeline.
+def _configure_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    This class manages the complete workflow from raw S3 data to clustered
-    household-day load profiles, with validation at each step and optional
-    Stage 2 regression.
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(str(log_path), encoding="utf-8"),
+    ]
 
-    Attributes:
-        base_dir: Project root directory
-        run_name: Identifier for this pipeline run (e.g., "202308_10000")
-        run_dir: Output directory for this run
-        paths: Dictionary of file paths for this run
-    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+        force=True,
+    )
 
-    def __init__(self, base_dir: Path, run_name: str | None = None):
-        """
-        Initialize pipeline with project directory and optional run name.
 
-        Args:
-            base_dir: Root directory of the smart-meter-analysis project
-            run_name: Identifier for this run. If provided, outputs go to
-                     data/validation_runs/{run_name}/. If None, uses default paths.
-        """
-        self.base_dir = base_dir
-        self.run_name = run_name
-        self.results: dict[str, dict] = {}
+def _get_git_sha(repo_root: Path) -> str | None:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            return None
+        sha = (r.stdout or "").strip()
+        return sha or None
+    except Exception:
+        return None
 
-        if run_name:
-            self.run_dir = base_dir / "data" / "validation_runs" / run_name
-            self.year_month = run_name.split("_")[0] if "_" in run_name else run_name
-            self.paths = {
-                "samples": self.run_dir / "samples",
-                "processed": self.run_dir / "processed" / f"comed_{self.year_month}.parquet",
-                "clustering_dir": self.run_dir / "clustering",
-            }
-        else:
-            self.run_dir = None
-            self.paths = DEFAULT_PATHS.copy()
 
-    # =========================================================================
-    # PIPELINE STEPS
-    # =========================================================================
+def create_directories(run_dir: Path) -> dict[str, Path]:
+    paths = {
+        "run_dir": run_dir,
+        "raw": run_dir / "raw",
+        "processed": run_dir / "processed",
+        "clustering": run_dir / "clustering",
+        "stage2": run_dir / "stage2",
+        "logs": run_dir / "logs",
+    }
+    for p in paths.values():
+        p.mkdir(parents=True, exist_ok=True)
+    return paths
 
-    def setup_directories(self) -> None:
-        """Create directory structure for pipeline outputs."""
-        if not self.run_dir:
-            return
 
-        for subdir in ["samples", "processed", "clustering/results"]:
-            (self.run_dir / subdir).mkdir(parents=True, exist_ok=True)
+def _run_subprocess(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    logger.info("Command: %s", " ".join(cmd))
+    r = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"Command failed with return code {r.returncode}: {' '.join(cmd)}")
 
-        logger.info("Created output directory: %s", self.run_dir)
 
-    def download_from_s3(
-        self,
-        year_month: str,
-        num_files: int,
-        bucket: str = DEFAULT_S3_CONFIG["bucket"],
-        prefix: str = DEFAULT_S3_CONFIG["prefix"],
-    ) -> bool:
-        """
-        Download CSV files from S3 for processing.
+def download_from_s3(*, year_month: str, num_files: int, run_dir: Path) -> dict[str, Any]:
+    raw_dir = run_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-        Args:
-            year_month: Target month in YYYYMM format (e.g., "202308")
-            num_files: Number of CSV files to download
-            bucket: S3 bucket name
-            prefix: S3 key prefix for ComEd data
+    manifest_path = run_dir / "download_manifest.jsonl"
 
-        Returns:
-            True if download successful, False otherwise.
-        """
-        try:
-            import boto3
-        except ImportError:
-            logger.error("boto3 not installed. Run: pip install boto3")
-            return False
+    # list_s3_files MUST return keys (not URIs).
+    s3_keys = list_s3_files(year_month=year_month, max_files=num_files)
 
-        logger.info("Connecting to S3: s3://%s/%s%s/", bucket, prefix, year_month)
+    logger.info("Downloading %d files for %s into %s", len(s3_keys), year_month, raw_dir)
+    result = download_s3_batch(
+        s3_keys=s3_keys,
+        output_dir=raw_dir,
+        manifest_path=manifest_path,
+        max_files=num_files,
+        fail_fast=True,
+        max_errors=10,
+        retries=3,
+        backoff_factor=2.0,
+    )
+    logger.info(
+        "Download complete: downloaded=%s failed=%s manifest=%s",
+        result.get("downloaded"),
+        result.get("failed"),
+        result.get("manifest_path"),
+    )
+    return result
 
-        try:
-            s3 = boto3.client("s3")
-            full_prefix = f"{prefix}{year_month}/"
 
-            # List files
-            paginator = s3.get_paginator("list_objects_v2")
-            csv_keys: list[str] = []
+def process_csvs(*, run_dir: Path, year_month: str, day_mode: str = "calendar") -> Path:
+    raw_dir = run_dir / "raw"
+    processed_dir = run_dir / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
-            for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
-                if "Contents" not in page:
-                    continue
-                for obj in page["Contents"]:
-                    if obj["Key"].endswith(".csv"):
-                        csv_keys.append(obj["Key"])
-                        if len(csv_keys) >= num_files:
-                            break
-                if len(csv_keys) >= num_files:
-                    break
+    output_file = processed_dir / f"comed_{year_month}.parquet"
+    manifest_file = run_dir / "processing_manifest.jsonl"
 
-            if not csv_keys:
-                logger.error("No CSV files found in s3://%s/%s", bucket, full_prefix)
-                return False
+    cmd = [
+        sys.executable,
+        "scripts/process_csvs_batched_optimized.py",
+        "--input-dir",
+        str(raw_dir),
+        "--output",
+        str(output_file),
+        "--processing-manifest",
+        str(manifest_file),
+        "--day-mode",
+        str(day_mode),
+    ]
 
-            logger.info("Downloading %d files to %s", len(csv_keys), self.paths["samples"])
+    logger.info("Ingesting CSVs into canonical interval parquet: %s", output_file)
+    _run_subprocess(cmd)
 
-            for i, key in enumerate(csv_keys, 1):
-                filename = Path(key).name
-                local_path = self.paths["samples"] / filename
-                s3.download_file(bucket, key, str(local_path))
+    if not output_file.exists():
+        raise FileNotFoundError(f"Expected processed parquet missing: {output_file}")
 
-                if i % 100 == 0 or i == len(csv_keys):
-                    logger.info("  Downloaded %d/%d files", i, len(csv_keys))
+    return output_file
 
-            logger.info("Download complete: %d files", len(csv_keys))
-            return True
 
-        except Exception as exc:
-            logger.error("S3 download failed: %s", exc)
-            return False
+def prepare_clustering(
+    *,
+    run_dir: Path,
+    processed_parquet: Path,
+    sample_days: int,
+    sample_households: int | None,
+    seed: int,
+) -> Path:
+    clustering_dir = run_dir / "clustering"
+    clustering_dir.mkdir(parents=True, exist_ok=True)
 
-    def process_raw_data(self, year_month: str) -> bool:
-        """
-        Process raw CSV files into analysis-ready parquet format.
+    cmd = [
+        sys.executable,
+        "analysis/clustering/prepare_clustering_data_households.py",
+        "--input",
+        str(processed_parquet),
+        "--output-dir",
+        str(clustering_dir),
+        "--sample-days",
+        str(int(sample_days)),
+        "--seed",
+        str(int(seed)),
+        "--streaming",
+    ]
 
-        Transforms wide-format CSVs to long format with time features.
-        Uses lazy evaluation for memory efficiency.
+    if sample_households is not None:
+        cmd.extend(["--sample-households", str(int(sample_households))])
 
-        Args:
-            year_month: Month identifier for output file naming.
+    logger.info("Preparing Stage 1 clustering data in %s", clustering_dir)
+    _run_subprocess(cmd)
 
-        Returns:
-            True if processing successful, False otherwise.
-        """
-        csv_files = sorted(self.paths["samples"].glob("*.csv"))
-        if not csv_files:
-            logger.error("No CSV files found in %s", self.paths["samples"])
-            return False
+    profiles = clustering_dir / "sampled_profiles.parquet"
+    if not profiles.exists():
+        raise FileNotFoundError(f"Expected clustering profiles missing: {profiles}")
+    return profiles
 
-        logger.info("Processing %d CSV files", len(csv_files))
 
-        from smart_meter_analysis.aws_loader import (
-            COMED_SCHEMA,
-            add_time_columns_lazy,
-            transform_wide_to_long_lazy,
+def run_clustering(
+    *,
+    run_dir: Path,
+    profiles_path: Path,
+    k: int,
+    clustering_seed: int,
+) -> None:
+    clustering_dir = run_dir / "clustering"
+    clustering_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "analysis/clustering/euclidean_clustering_minibatch.py",
+        "--input",
+        str(profiles_path),
+        "--output-dir",
+        str(clustering_dir),
+        "--k",
+        str(int(k)),
+        "--random-state",
+        str(int(clustering_seed)),
+        "--normalize",
+        "--normalize-method",
+        "minmax",
+    ]
+
+    logger.info("Running clustering (MiniBatchKMeans) k=%d output=%s", k, clustering_dir)
+    _run_subprocess(cmd)
+
+    expected = clustering_dir / "cluster_assignments.parquet"
+    if not expected.exists():
+        raise FileNotFoundError(f"Expected clustering output missing: {expected}")
+
+
+def _default_stage2_census_cache(*, stage2_dir: Path, state_fips: str, acs_year: int) -> Path:
+    # Option 1: cache lives under the run directory
+    return stage2_dir / f"census_cache_{state_fips}_{acs_year}.parquet"
+
+
+def run_stage2_logratio(
+    *,
+    run_dir: Path,
+    crosswalk_path: Path,
+    state_fips: str,
+    acs_year: int,
+    min_obs_per_bg: int,
+    alpha: float,
+    standardize: bool,
+    fetch_census: bool,
+    no_ols: bool,
+    baseline_cluster: str | None,
+    predictors_from: Path | None,
+    census_cache_path: Path | None,
+) -> None:
+    stage2_dir = run_dir / "stage2"
+    stage2_dir.mkdir(parents=True, exist_ok=True)
+
+    clusters_path = run_dir / "clustering" / "cluster_assignments.parquet"
+    if not clusters_path.exists():
+        raise FileNotFoundError(f"Missing cluster assignments for Stage 2: {clusters_path}")
+
+    if not crosswalk_path.exists():
+        raise FileNotFoundError(f"Missing crosswalk for Stage 2: {crosswalk_path}")
+
+    script_path = Path("analysis/clustering/stage2_logratio_regression.py")
+    if not script_path.exists():
+        raise FileNotFoundError(f"Missing Stage 2 script: {script_path}")
+
+    resolved_cache = census_cache_path or _default_stage2_census_cache(
+        stage2_dir=stage2_dir,
+        state_fips=state_fips,
+        acs_year=acs_year,
+    )
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--clusters",
+        str(clusters_path),
+        "--crosswalk",
+        str(crosswalk_path),
+        "--output-dir",
+        str(stage2_dir),
+        "--census-cache",
+        str(resolved_cache),
+        "--state-fips",
+        str(state_fips),
+        "--acs-year",
+        str(int(acs_year)),
+        "--min-obs-per-bg",
+        str(int(min_obs_per_bg)),
+        "--alpha",
+        str(float(alpha)),
+    ]
+
+    if fetch_census:
+        cmd.append("--fetch-census")
+
+    if standardize:
+        cmd.append("--standardize")
+
+    if no_ols:
+        cmd.append("--no-ols")
+
+    if baseline_cluster is not None:
+        cmd.extend(["--baseline-cluster", str(baseline_cluster)])
+
+    if predictors_from is not None:
+        cmd.extend(["--predictors-from", str(predictors_from)])
+
+    logger.info("Running Stage 2 log-ratio regression output=%s", stage2_dir)
+    _run_subprocess(cmd)
+
+
+def write_run_manifest(*, run_dir: Path, args: argparse.Namespace) -> None:
+    repo_root = Path().resolve()
+
+    manifest: dict[str, Any] = {
+        "run_name": args.run_name,
+        "timestamp_utc": _utc_now_iso(),
+        "args": vars(args),
+        "git_sha": _get_git_sha(repo_root),
+        "python_version": sys.version,
+        "polars_version": pl.__version__,
+        "seeds": {
+            "sampling": args.seed,
+            "clustering": args.clustering_seed,
+        },
+        "directory_structure": "data/runs/{run_name}/",
+        "pipeline_version": "v1.0-restored-baseline",
+        "cwd": str(Path.cwd()),
+        "platform": {
+            "os_name": os.name,
+            "sys_platform": sys.platform,
+        },
+    }
+
+    out = run_dir / "run_manifest.json"
+    out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    logger.info("Wrote run manifest: %s", out)
+
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    run_dir = DEFAULT_RUNS_DIR / args.run_name
+    paths = create_directories(run_dir)
+
+    _configure_logging(paths["logs"] / "pipeline.log")
+
+    logger.info("Run directory: %s", run_dir)
+    logger.info("Year-month: %s", args.year_month)
+
+    if args.from_s3:
+        download_from_s3(year_month=args.year_month, num_files=int(args.num_files), run_dir=run_dir)
+    else:
+        logger.info("Skipping S3 download (--from-s3 not set). Expecting CSVs in: %s", paths["raw"])
+
+    processed_parquet = process_csvs(run_dir=run_dir, year_month=args.year_month, day_mode=args.day_mode)
+
+    profiles_path = prepare_clustering(
+        run_dir=run_dir,
+        processed_parquet=processed_parquet,
+        sample_days=int(args.sample_days),
+        sample_households=(int(args.sample_households) if args.sample_households is not None else None),
+        seed=int(args.seed),
+    )
+
+    run_clustering(
+        run_dir=run_dir,
+        profiles_path=profiles_path,
+        k=int(args.k),
+        clustering_seed=int(args.clustering_seed),
+    )
+
+    if bool(args.run_stage2):
+        run_stage2_logratio(
+            run_dir=run_dir,
+            crosswalk_path=Path(args.stage2_crosswalk),
+            state_fips=str(args.stage2_state_fips),
+            acs_year=int(args.stage2_acs_year),
+            min_obs_per_bg=int(args.stage2_min_obs_per_bg),
+            alpha=float(args.stage2_alpha),
+            standardize=bool(args.stage2_standardize),
+            no_ols=bool(args.stage2_no_ols),
+            fetch_census=bool(args.stage2_fetch_census),
+            baseline_cluster=(str(args.stage2_baseline_cluster) if args.stage2_baseline_cluster is not None else None),
+            predictors_from=(Path(args.stage2_predictors_from) if args.stage2_predictors_from is not None else None),
+            census_cache_path=(Path(args.stage2_census_cache) if args.stage2_census_cache is not None else None),
         )
 
-        lazy_frames: list[pl.LazyFrame] = []
-        for i, csv_path in enumerate(csv_files, 1):
-            if i % 200 == 0 or i == len(csv_files):
-                logger.info("  Scanned %d/%d files", i, len(csv_files))
-
-            try:
-                lf = pl.scan_csv(str(csv_path), schema_overrides=COMED_SCHEMA, ignore_errors=True)
-                lf = transform_wide_to_long_lazy(lf)
-                lf = add_time_columns_lazy(lf, day_mode="calendar")
-                lazy_frames.append(lf)
-            except Exception as exc:
-                logger.warning("Failed to scan %s: %s", csv_path.name, exc)
-
-        if not lazy_frames:
-            logger.error("No files successfully scanned")
-            return False
-
-        logger.info("Writing combined parquet file...")
-        self.paths["processed"].parent.mkdir(parents=True, exist_ok=True)
-
-        lf_combined = pl.concat(lazy_frames, how="diagonal_relaxed")
-        lf_combined.sink_parquet(self.paths["processed"])
-
-        row_count = pl.scan_parquet(self.paths["processed"]).select(pl.len()).collect()[0, 0]
-        logger.info("Wrote %s records to %s", f"{row_count:,}", self.paths["processed"])
-
-        return True
-
-    def prepare_clustering_data(
-        self,
-        sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
-        sample_households: int | None = DEFAULT_CLUSTERING_CONFIG.get("sample_households"),
-        day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
-        chunk_size: int = DEFAULT_CLUSTERING_CONFIG["chunk_size"],
-    ) -> bool:
-        """
-        Prepare daily household-day load profiles for clustering.
-
-        Creates 48-interval profiles for individual household-day combinations
-        using the manifest-based, chunked streaming pipeline.
-
-        Args:
-            sample_days: Number of days to sample per run.
-            sample_households: Number of households to sample (None = all).
-            day_strategy: "stratified" (70/30 weekday/weekend) or "random".
-            chunk_size: Households per chunk for the streaming profile builder.
-
-        Returns:
-            True if preparation successful, False otherwise.
-        """
-        import subprocess
-
-        input_path = self.paths["processed"]
-        output_dir = self.paths["clustering_dir"]
-
-        if not input_path.exists():
-            logger.error("Processed data not found: %s", input_path)
-            return False
-
-        cmd = [
-            sys.executable,
-            str(self.base_dir / "analysis" / "clustering" / "prepare_clustering_data_households.py"),
-            "--input",
-            str(input_path),
-            "--output-dir",
-            str(output_dir),
-            "--day-strategy",
-            day_strategy,
-            "--sample-days",
-            str(sample_days),
-            "--streaming",  # streaming is always enabled
-            "--chunk-size",
-            str(chunk_size),
-        ]
-
-        if sample_households:
-            cmd.extend(["--sample-households", str(sample_households)])
-
-        logger.info(
-            "Preparing household-day clustering data (%s households x %d days; streaming, chunk_size=%d)",
-            sample_households or "all",
-            sample_days,
-            chunk_size,
-        )
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            logger.error("Clustering prep failed: %s", result.stderr)
-            return False
-
-        logger.info("Clustering data prepared")
-        return True
-
-    def run_clustering(
-        self,
-        k_min: int = DEFAULT_CLUSTERING_CONFIG["k_min"],
-        k_max: int = DEFAULT_CLUSTERING_CONFIG["k_max"],
-        n_init: int = DEFAULT_CLUSTERING_CONFIG["n_init"],
-    ) -> bool:
-        """
-        Run k-means clustering on prepared household-day profiles.
-
-        Uses Euclidean distance since all profiles are aligned to the same
-        time grid (no time warping needed).
-
-        Args:
-            k_min: Minimum number of clusters to test.
-            k_max: Maximum number of clusters to test.
-            n_init: Number of k-means initializations.
-
-        Returns:
-            True if clustering successful, False otherwise.
-        """
-        import subprocess
-
-        profiles_path = self.paths["clustering_dir"] / "sampled_profiles.parquet"
-        results_dir = self.paths["clustering_dir"] / "results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-
-        if not profiles_path.exists():
-            logger.error("Profiles not found: %s", profiles_path)
-            return False
-
-        cmd = [
-            sys.executable,
-            str(self.base_dir / "analysis" / "clustering" / "euclidean_clustering.py"),
-            "--input",
-            str(profiles_path),
-            "--output-dir",
-            str(results_dir),
-            "--k-range",
-            str(k_min),
-            str(k_max),
-            "--find-optimal-k",
-            "--normalize",
-            "--n-init",
-            str(n_init),
-        ]
-
-        logger.info("Running k-means clustering (k=%d-%d)...", k_min, k_max)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            logger.error("Clustering failed: %s", result.stderr)
-            if result.stdout:
-                logger.error("stdout: %s", result.stdout)
-            return False
-
-        logger.info("Clustering complete")
-        return True
-
-    def run_stage2_regression(
-        self,
-        crosswalk_path: Path | None = None,
-        census_cache_path: Path | None = None,
-    ) -> bool:
-        """
-        Run Stage 2: Block-group-level regression of cluster composition.
-
-        Models how Census block-group demographics are associated with the
-        composition of household-day profiles across clusters.
-
-        Unit of analysis: ONE ROW PER (block_group, cluster), with counts over
-        household-day observations.
-
-        stage2_blockgroup_regression.py handles census fetching internally
-        if cache does not exist.
-
-        Args:
-            crosswalk_path: Path to ZIP+4 → block-group crosswalk file.
-            census_cache_path: Path to cached census data.
-
-        Returns:
-            True if regression successful, False otherwise.
-        """
-        import subprocess
-
-        clusters_path = self.paths["clustering_dir"] / "results" / "cluster_assignments.parquet"
-        output_dir = self.paths["clustering_dir"] / "results" / "stage2_blockgroups"
-
-        if not clusters_path.exists():
-            logger.error("Cluster assignments not found: %s", clusters_path)
-            logger.error("Run Stage 1 clustering first")
-            return False
-
-        # Default paths
-        if crosswalk_path is None:
-            crosswalk_path = self.base_dir / "data" / "reference" / "2023_comed_zip4_census_crosswalk.txt"
-        if census_cache_path is None:
-            census_cache_path = self.base_dir / "data" / "reference" / "census_17_2023.parquet"
-
-        if not crosswalk_path.exists():
-            logger.error("Crosswalk not found: %s", crosswalk_path)
-            return False
-
-        cmd = [
-            sys.executable,
-            str(self.base_dir / "analysis" / "clustering" / "stage2_blockgroup_regression.py"),
-            "--clusters",
-            str(clusters_path),
-            "--crosswalk",
-            str(crosswalk_path),
-            "--census-cache",
-            str(census_cache_path),
-            "--output-dir",
-            str(output_dir),
-        ]
-
-        logger.info("Running Stage 2 block-group regression...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        # Print report (stage2 script writes a human-readable summary to stdout)
-        if result.stdout:
-            print(result.stdout)
-
-        if result.returncode != 0:
-            logger.error("Stage 2 regression failed: %s", result.stderr)
-            return False
-
-        logger.info("Stage 2 complete: %s", output_dir)
-        return True
-
-    # =========================================================================
-    # VALIDATION METHODS
-    # =========================================================================
-
-    def validate_processed_data(self) -> dict:
-        """Validate processed interval-level data using lazy evaluation."""
-        path = self.paths["processed"]
-
-        if not path.exists():
-            return self._fail("processed", f"File not found: {path}")
-
-        logger.info("Validating processed data: %s", path)
-
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        try:
-            lf = pl.scan_parquet(path)
-            schema = lf.collect_schema()
-        except Exception as exc:
-            return self._fail("processed", f"Failed to read: {exc}")
-
-        # Check required columns
-        required = ["zip_code", "account_identifier", "datetime", "kwh", "date", "hour"]
-        missing = [c for c in required if c not in schema.names()]
-        if missing:
-            errors.append(f"Missing columns: {missing}")
-
-        # Get stats using lazy evaluation (no full load)
-        try:
-            stats_df = lf.select(
-                [
-                    pl.len().alias("rows"),
-                    pl.col("zip_code").n_unique().alias("zip_codes"),
-                    pl.col("account_identifier").n_unique().alias("accounts"),
-                    pl.col("kwh").min().alias("kwh_min"),
-                    pl.col("kwh").null_count().alias("kwh_nulls"),
-                ],
-            ).collect()
-
-            stats_dict = stats_df.to_dicts()[0]
-
-            # Check row count
-            if stats_dict["rows"] == 0:
-                errors.append("No data rows")
-
-            # Check for nulls
-            if stats_dict["kwh_nulls"] > 0:
-                null_pct = stats_dict["kwh_nulls"] / stats_dict["rows"] * 100
-                if null_pct > 5:
-                    errors.append(f"kwh: {null_pct:.1f}% null")
-                elif null_pct > 0:
-                    warnings.append(f"kwh: {null_pct:.1f}% null")
-
-            # Check kWh range
-            if stats_dict["kwh_min"] is not None and stats_dict["kwh_min"] < 0:
-                warnings.append(f"Negative kWh values: min={stats_dict['kwh_min']}")
-
-            stats = {
-                "rows": stats_dict["rows"],
-                "zip_codes": stats_dict["zip_codes"],
-                "accounts": stats_dict["accounts"],
-                "file_size_mb": path.stat().st_size / 1024 / 1024,
-            }
-        except Exception as exc:
-            return self._fail("processed", f"Failed to compute stats: {exc}")
-
-        return self._result("processed", errors, warnings, stats)
-
-    def validate_clustering_inputs(self) -> dict:
-        """Validate clustering input files (household-day profiles)."""
-        profiles_path = self.paths["clustering_dir"] / "sampled_profiles.parquet"
-
-        if not profiles_path.exists():
-            return self._fail("clustering_inputs", f"Profiles not found: {profiles_path}")
-
-        logger.info("Validating clustering inputs: %s", profiles_path)
-
-        try:
-            df = pl.read_parquet(profiles_path)
-        except Exception as exc:
-            return self._fail("clustering_inputs", f"Failed to read: {exc}")
-
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        # Check required columns
-        required = ["zip_code", "date", "profile"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            errors.append(f"Missing columns: {missing}")
-
-        # Check profile lengths
-        if "profile" in df.columns:
-            lengths = df.select(pl.col("profile").list.len()).unique()["profile"].to_list()
-            if len(lengths) > 1:
-                errors.append(f"Inconsistent profile lengths: {lengths}")
-            elif lengths[0] != 48:
-                errors.append(f"Expected 48-point profiles, got {lengths[0]}")
-
-        stats = {
-            "profiles": len(df),
-            "zip_codes": df["zip_code"].n_unique() if "zip_code" in df.columns else 0,
-            "dates": df["date"].n_unique() if "date" in df.columns else 0,
-        }
-
-        return self._result("clustering_inputs", errors, warnings, stats)
-
-    def validate_clustering_outputs(self) -> dict:
-        """Validate clustering output files."""
-        results_dir = self.paths["clustering_dir"] / "results"
-        assignments_path = results_dir / "cluster_assignments.parquet"
-
-        if not assignments_path.exists():
-            return self._skip("clustering_outputs", "No clustering results yet")
-
-        logger.info("Validating clustering outputs: %s", results_dir)
-
-        try:
-            assignments = pl.read_parquet(assignments_path)
-        except Exception as exc:
-            return self._fail("clustering_outputs", f"Failed to read: {exc}")
-
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        # Check required columns
-        if "cluster" not in assignments.columns:
-            errors.append("Missing 'cluster' column")
-
-        # Check cluster distribution
-        if "cluster" in assignments.columns:
-            cluster_counts = assignments["cluster"].value_counts()
-            if cluster_counts["count"].min() == 0:
-                warnings.append("Some clusters have no assignments")
-
-        stats = {
-            "n_assigned": len(assignments),
-            "k": assignments["cluster"].n_unique() if "cluster" in assignments.columns else 0,
-        }
-
-        # Load metrics if available
-        metrics_path = results_dir / "clustering_metrics.json"
-        if metrics_path.exists():
-            import json
-
-            with open(metrics_path) as f:
-                metrics = json.load(f)
-                stats["silhouette"] = metrics.get("silhouette_score")
-                stats["inertia"] = metrics.get("inertia")
-
-        return self._result("clustering_outputs", errors, warnings, stats)
-
-    # =========================================================================
-    # ORCHESTRATION METHODS
-    # =========================================================================
-
-    def run_full_pipeline(
-        self,
-        year_month: str,
-        num_files: int,
-        sample_days: int = DEFAULT_CLUSTERING_CONFIG["sample_days"],
-        sample_households: int | None = DEFAULT_CLUSTERING_CONFIG["sample_households"],
-        day_strategy: str = DEFAULT_CLUSTERING_CONFIG["day_strategy"],
-        k_min: int = DEFAULT_CLUSTERING_CONFIG["k_min"],
-        k_max: int = DEFAULT_CLUSTERING_CONFIG["k_max"],
-        n_init: int = DEFAULT_CLUSTERING_CONFIG["n_init"],
-        chunk_size: int = DEFAULT_CLUSTERING_CONFIG["chunk_size"],
-        skip_clustering: bool = False,
-        run_stage2: bool = False,
-    ) -> bool:
-        """
-        Execute the complete pipeline.
-
-        Args:
-            year_month: Target month (YYYYMM format).
-            num_files: Number of S3 files to download.
-            sample_days: Days to sample for clustering.
-            sample_households: Households to sample (None = all).
-            day_strategy: Day sampling strategy ("stratified" or "random").
-            k_min: Minimum clusters to test.
-            k_max: Maximum clusters to test.
-            n_init: Number of k-means initializations.
-            chunk_size: Households per chunk for streaming profile builder.
-            skip_clustering: If True, stop after preparing data.
-            run_stage2: If True, run demographic regression after clustering.
-
-        Returns:
-            True if all steps succeed, False otherwise.
-        """
-        self._print_header("COMED PIPELINE EXECUTION")
-        print(f"Year-Month: {year_month}")
-        print(f"Files: {num_files}")
-        print(f"Output: {self.run_dir}")
-        print(f"Clustering: {'Skipped' if skip_clustering else f'k={k_min}-{k_max}'}")
-        print(f"Stage 2: {'Yes' if run_stage2 else 'No'}")
-        print(f"Profiles: streaming (chunk_size={chunk_size})")
-
-        self.setup_directories()
-
-        # Step 1: Download
-        self._print_step("DOWNLOADING FROM S3")
-        if not self.download_from_s3(year_month, num_files):
-            return False
-
-        # Step 2: Process
-        self._print_step("PROCESSING RAW DATA")
-        if not self.process_raw_data(year_month):
-            return False
-
-        # Step 3: Prepare clustering data
-        self._print_step("PREPARING CLUSTERING DATA")
-        if not self.prepare_clustering_data(
-            sample_days=sample_days,
-            sample_households=sample_households,
-            day_strategy=day_strategy,
-            chunk_size=chunk_size,
-        ):
-            return False
-
-        # Step 4: Cluster (optional)
-        if not skip_clustering:
-            self._print_step("RUNNING K-MEANS CLUSTERING")
-            if not self.run_clustering(
-                k_min=k_min,
-                k_max=k_max,
-                n_init=n_init,
-            ):
-                return False
-
-        # Step 5: Stage 2 regression (optional)
-        if run_stage2 and not skip_clustering:
-            self._print_step("RUNNING STAGE 2: DEMOGRAPHIC REGRESSION")
-            if not self.run_stage2_regression():
-                logger.warning("Stage 2 regression failed, but Stage 1 completed successfully")
-
-        logger.info("Pipeline execution complete")
-        return True
-
-    def validate_all(self) -> bool:
-        """
-        Run all validation checks.
-
-        Returns:
-            True if all critical validations pass, False otherwise.
-        """
-        self._print_header("VALIDATION")
-
-        self.results["processed"] = self.validate_processed_data()
-        self.results["clustering_inputs"] = self.validate_clustering_inputs()
-        self.results["clustering_outputs"] = self.validate_clustering_outputs()
-
-        return self._print_summary()
-
-    def validate_stage(self, stage: str) -> bool:
-        """Validate a specific pipeline stage."""
-        if stage == "processed":
-            self.results["processed"] = self.validate_processed_data()
-        elif stage == "clustering":
-            self.results["clustering_inputs"] = self.validate_clustering_inputs()
-            self.results["clustering_outputs"] = self.validate_clustering_outputs()
-        else:
-            logger.error("Unknown stage: %s", stage)
-            return False
-
-        return self._print_summary()
-
-    # =========================================================================
-    # HELPER METHODS
-    # =========================================================================
-
-    def _print_header(self, title: str) -> None:
-        print(f"\n{'=' * 70}")
-        print(title)
-        print(f"{'=' * 70}")
-
-    def _print_step(self, title: str) -> None:
-        print(f"\n{'─' * 70}")
-        print(title)
-        print(f"{'─' * 70}")
-
-    def _result(self, stage: str, errors: list[str], warnings: list[str], stats: dict) -> dict:
-        status = "PASS" if not errors else "FAIL"
-        icon = "✅" if status == "PASS" else "❌"
-        print(f"\n{icon} {stage.upper()}: {status}")
-
-        for err in errors:
-            print(f"   Error: {err}")
-        for warn in warnings:
-            print(f"   ⚠️  {warn}")
-
-        return {"status": status, "errors": errors, "warnings": warnings, "stats": stats}
-
-    def _fail(self, stage: str, message: str) -> dict:
-        print(f"\n❌ {stage.upper()}: FAILED - {message}")
-        return {"status": "FAIL", "errors": [message], "warnings": [], "stats": {}}
-
-    def _skip(self, stage: str, message: str) -> dict:
-        print(f"\n⏭️  {stage.upper()}: SKIPPED - {message}")
-        return {"status": "SKIP", "errors": [], "warnings": [], "stats": {}}
-
-    def _print_summary(self) -> bool:
-        self._print_header("SUMMARY")
-
-        all_passed = True
-        for stage, result in self.results.items():
-            status = result.get("status", "UNKNOWN")
-            icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(status, "❓")
-            print(f"{icon} {stage}: {status}")
-
-            if status == "FAIL":
-                all_passed = False
-
-        # Show clustering summary if available
-        if "clustering_outputs" in self.results:
-            stats = self.results["clustering_outputs"].get("stats", {})
-            if stats.get("k"):
-                print("\nClustering Results:")
-                print(f"  • {stats.get('n_assigned', '?')} profiles → {stats.get('k')} clusters")
-                if stats.get("silhouette") is not None:
-                    print(f"  • Silhouette score: {stats['silhouette']:.3f}")
-
-        print()
-        return all_passed
-
-
-# =============================================================================
-# COMMAND LINE INTERFACE
-# =============================================================================
+    write_run_manifest(run_dir=run_dir, args=args)
+
+    logger.info("Pipeline completed successfully.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="ComEd Smart Meter Analysis Pipeline Orchestrator (Phase 3)")
+
+    p.add_argument("--run-name", required=True, help="Run name (directory under data/runs/)")
+    p.add_argument("--year-month", required=True, help="Target month in YYYYMM format (e.g., 202307)")
+    p.add_argument("--from-s3", action="store_true", help="Download CSVs from S3 into run_dir/raw/")
+
+    p.add_argument("--num-files", type=int, default=10, help="Number of S3 files to download (default: 10)")
+
+    p.add_argument("--sample-days", type=int, default=31, help="Days to sample for clustering (default: 31)")
+    p.add_argument(
+        "--sample-households",
+        type=int,
+        default=None,
+        help="Households to sample (default: all). Provide an integer to limit.",
+    )
+
+    p.add_argument("--seed", type=int, default=42, help="Random seed for sampling (default: 42)")
+    p.add_argument("--clustering-seed", type=int, default=42, help="Random seed for clustering (default: 42)")
+
+    p.add_argument("--k", type=int, required=True, help="Number of clusters (single k per run)")
+
+    p.add_argument("--day-mode", choices=["calendar", "billing"], default="calendar", help="Day attribution mode")
+
+    p.add_argument("--run-stage2", action="store_true", help="Run Stage 2 log-ratio regression (optional)")
+
+    # ----------------------------
+    # Stage 2 options (user-facing)
+    # ----------------------------
+    p.add_argument(
+        "--stage2-crosswalk",
+        default=str(DEFAULT_CROSSWALK_PATH),
+        help=f"ZIP+4 → block-group crosswalk path (default: {DEFAULT_CROSSWALK_PATH})",
+    )
+    p.add_argument(
+        "--stage2-state-fips",
+        default=DEFAULT_STATE_FIPS,
+        help=f"State FIPS (default: {DEFAULT_STATE_FIPS})",
+    )
+    p.add_argument(
+        "--stage2-acs-year",
+        type=int,
+        default=DEFAULT_ACS_YEAR,
+        help=f"ACS year (default: {DEFAULT_ACS_YEAR})",
+    )
+    p.add_argument(
+        "--stage2-fetch-census",
+        action="store_true",
+        help="Stage 2: force re-fetch Census data (ignore cache)",
+    )
+    p.add_argument(
+        "--stage2-census-cache",
+        default=None,
+        help=(
+            "Optional census cache parquet path. If omitted, defaults to "
+            "data/runs/{run_name}/stage2/census_cache_{state_fips}_{acs_year}.parquet (Option 1)."
+        ),
+    )
+
+    p.add_argument(
+        "--stage2-min-obs-per-bg",
+        type=int,
+        default=50,
+        help="Stage 2 minimum household-day observations per block group (default: 50)",
+    )
+    p.add_argument("--stage2-alpha", type=float, default=0.5, help="Stage 2 Laplace smoothing alpha (default: 0.5)")
+    p.add_argument("--stage2-standardize", action="store_true", help="Stage 2: standardize predictors")
+    p.add_argument("--stage2-no-ols", action="store_true", help="Stage 2: skip OLS robustness check")
+    p.add_argument(
+        "--stage2-baseline-cluster",
+        default=None,
+        help="Stage 2: optional baseline cluster label (default: most frequent cluster)",
+    )
+    p.add_argument(
+        "--stage2-predictors-from",
+        default=None,
+        help="Stage 2: optional path to predictors list (one per line) to force exact predictors",
+    )
+
+    return p
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="ComEd Smart Meter Analysis Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Quick local test (100 files, fewer households/days, no Stage 2)
-  python scripts/run_comed_pipeline.py \\
-      --from-s3 \\
-      --year-month 202308 \\
-      --num-files 100 \\
-      --sample-households 2000 \\
-      --sample-days 10 \\
-      --k-range 3 4
+    args = build_parser().parse_args()
 
-  # High-volume analysis (tested configuration, with Stage 2)
-  python scripts/run_comed_pipeline.py \\
-      --from-s3 \\
-      --year-month 202308 \\
-      --num-files 10000 \\
-      --sample-households 20000 \\
-      --sample-days 31 \\
-      --k-range 3 6 \\
-      --run-stage2
+    if int(args.num_files) <= 0 and args.from_s3:
+        raise ValueError("--num-files must be > 0 when using --from-s3")
 
-  # Validate existing results for a specific run
-  python scripts/run_comed_pipeline.py \\
-      --validate-only \\
-      --run-name 202308_10000
-        """,
-    )
+    if int(args.k) <= 1:
+        raise ValueError("--k must be >= 2")
 
-    # Mode selection
-    mode_group = parser.add_argument_group("Mode")
-    mode_group.add_argument(
-        "--from-s3",
-        action="store_true",
-        help="Run full pipeline: download from S3, process, cluster, validate",
-    )
-    mode_group.add_argument(
-        "--validate-only",
-        action="store_true",
-        help="Only validate existing files (no processing)",
-    )
-    mode_group.add_argument(
-        "--skip-clustering",
-        action="store_true",
-        help="Run pipeline but skip clustering step (useful for testing)",
-    )
-    mode_group.add_argument(
-        "--run-stage2",
-        action="store_true",
-        help="Run Stage 2 regression after clustering (requires census data)",
-    )
-
-    # Data selection
-    data_group = parser.add_argument_group("Data Selection")
-    data_group.add_argument(
-        "--year-month",
-        default="202308",
-        help="Target month in YYYYMM format (default: 202308)",
-    )
-    data_group.add_argument(
-        "--num-files",
-        type=int,
-        default=1000,
-        help="Number of S3 files to download (default: 1000)",
-    )
-
-    # Clustering parameters
-    cluster_group = parser.add_argument_group("Clustering Parameters")
-    cluster_group.add_argument(
-        "--sample-households",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["sample_households"],
-        help=(f"Households to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_households']}, use 0 for all)"),
-    )
-    cluster_group.add_argument(
-        "--sample-days",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["sample_days"],
-        help=f"Days to sample (default: {DEFAULT_CLUSTERING_CONFIG['sample_days']})",
-    )
-    cluster_group.add_argument(
-        "--k-range",
-        type=int,
-        nargs=2,
-        metavar=("MIN", "MAX"),
-        default=[DEFAULT_CLUSTERING_CONFIG["k_min"], DEFAULT_CLUSTERING_CONFIG["k_max"]],
-        help=(
-            "Cluster range to test "
-            f"(default: {DEFAULT_CLUSTERING_CONFIG['k_min']} {DEFAULT_CLUSTERING_CONFIG['k_max']})"
-        ),
-    )
-    cluster_group.add_argument(
-        "--day-strategy",
-        choices=["stratified", "random"],
-        default=DEFAULT_CLUSTERING_CONFIG["day_strategy"],
-        help="Day sampling strategy (default: stratified = 70% weekday, 30% weekend)",
-    )
-    cluster_group.add_argument(
-        "--n-init",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["n_init"],
-        help=f"Number of k-means initializations (default: {DEFAULT_CLUSTERING_CONFIG['n_init']})",
-    )
-    cluster_group.add_argument(
-        "--fast",
-        action="store_true",
-        help="Fast mode: k=3-4 (for testing)",
-    )
-    cluster_group.add_argument(
-        "--chunk-size",
-        type=int,
-        default=DEFAULT_CLUSTERING_CONFIG["chunk_size"],
-        help=(
-            f"Households per chunk for streaming profile builder (default: {DEFAULT_CLUSTERING_CONFIG['chunk_size']})"
-        ),
-    )
-
-    # Output options
-    output_group = parser.add_argument_group("Output Options")
-    output_group.add_argument(
-        "--run-name",
-        help="Name for this run (default: {year_month}_{num_files})",
-    )
-    output_group.add_argument(
-        "--base-dir",
-        type=Path,
-        default=Path("."),
-        help="Project root directory (default: current directory)",
-    )
-    output_group.add_argument(
-        "--stage",
-        choices=["processed", "clustering", "all"],
-        default="all",
-        help="Stage to validate (default: all)",
-    )
-
-    args = parser.parse_args()
-
-    # Handle --fast mode
-    if args.fast:
-        args.k_range = [3, 4]
-        logger.info("Fast mode enabled: k=3-4")
-
-    # Determine run name
-    run_name = args.run_name or (f"{args.year_month}_{args.num_files}" if args.from_s3 else args.run_name)
-
-    # Create pipeline
-    pipeline = ComedPipeline(args.base_dir, run_name)
-
-    # Handle sample_households = 0 as None (all households)
-    sample_households = args.sample_households if args.sample_households > 0 else None
-
-    # Execute based on mode
-    if args.from_s3:
-        success = pipeline.run_full_pipeline(
-            year_month=args.year_month,
-            num_files=args.num_files,
-            sample_days=args.sample_days,
-            sample_households=sample_households,
-            day_strategy=args.day_strategy,
-            k_min=args.k_range[0],
-            k_max=args.k_range[1],
-            n_init=args.n_init,
-            chunk_size=args.chunk_size,
-            skip_clustering=args.skip_clustering,
-            run_stage2=args.run_stage2,
-        )
-
-        if success:
-            pipeline.validate_all()
-    elif args.validate_only:
-        success = pipeline.validate_all() if args.stage == "all" else pipeline.validate_stage(args.stage)
-    else:
-        parser.print_help()
-        print("\n⚠️  Specify --from-s3 to run pipeline or --validate-only to check existing files")
-        sys.exit(1)
-
-    sys.exit(0 if success else 1)
+    run_pipeline(args)
 
 
 if __name__ == "__main__":
