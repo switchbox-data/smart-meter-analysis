@@ -89,11 +89,10 @@ def write_stage2_manifest(
     regression_report_path: str | Path | None,
     run_log_path: str | Path | None,
 ) -> Path:
-    """
-    Writes:
-      - stage2_manifest.json : run metadata
-      - predictors_used.txt  : final predictor list (stable across runs)
-      - predictors_excluded_all_null.txt : excluded predictors with 100% nulls
+    """Writes:
+    - stage2_manifest.json : run metadata
+    - predictors_used.txt  : final predictor list (stable across runs)
+    - predictors_excluded_all_null.txt : excluded predictors with 100% nulls
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -140,9 +139,60 @@ def write_stage2_manifest(
     return manifest_path
 
 
-def load_persisted_predictors(output_dir: str | Path) -> list[str] | None:
+def write_run_manifest(
+    *,
+    output_dir: str | Path,
+    command: str,
+    repo_root: str | Path | None = None,
+    run_name: str,
+    year_month: str,
+    num_files: int,
+    sample_days: int,
+    sample_households: int | None,
+    day_strategy: str,
+    k_min: int,
+    k_max: int,
+    n_init: int,
+) -> Path:
+    """Write a manifest file for a pipeline run.
+
+    Records all parameters and metadata for reproducibility.
+    Similar to Stage2RunManifest but for the full pipeline orchestrator.
     """
-    If `predictors_used.txt` exists, return that list to reuse exactly on a new run.
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    created_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    repo_root_path = Path(repo_root) if repo_root is not None else None
+    git_commit = _safe_git_commit(repo_root_path) if repo_root_path else None
+
+    manifest = {
+        "created_utc": created_utc,
+        "python": sys.version.replace("\n", " "),
+        "platform": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        "git_commit": git_commit,
+        "command": command,
+        "run_name": run_name,
+        "output_dir": str(out),
+        "parameters": {
+            "year_month": year_month,
+            "num_files": num_files,
+            "sample_days": sample_days,
+            "sample_households": sample_households,
+            "day_strategy": day_strategy,
+            "k_min": k_min,
+            "k_max": k_max,
+            "n_init": n_init,
+        },
+    }
+
+    manifest_path = out / "run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest_path
+
+
+def load_persisted_predictors(output_dir: str | Path) -> list[str] | None:
+    """If `predictors_used.txt` exists, return that list to reuse exactly on a new run.
     This is the "stable across runs" option.
     """
     p = Path(output_dir) / "predictors_used.txt"
