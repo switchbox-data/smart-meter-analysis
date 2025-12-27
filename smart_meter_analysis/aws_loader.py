@@ -1,297 +1,291 @@
 # smart_meter_analysis/aws_loader.py
-"""
-AWS S3 utilities for batch processing ComEd smart meter data.
+"""AWS S3 utilities for deterministic batch download of ComEd smart meter CSV files.
+
+Contract A (S3 Download only)
+----------------------------
+This module is responsible  for:
+- Deterministically listing S3 CSV keys for a given year-month (YYYYMM)
+- Downloading those keys to local disk with retry/backoff
+- Writing a JSONL download manifest for provenance and QA
+
+Downstream processing belongs to scripts/process_csvs_batched_optimized.py and
+smart_meter_analysis/transformation.py.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import polars as pl
-
-# Local dtype alias for mypy
-DType = Any
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
-# S3 Configuration
 S3_BUCKET = "smart-meter-data-sb"
 S3_PREFIX = "sharepoint-files/Zip4/"
 
-# Error messages
+ERR_BAD_YEAR_MONTH = "year_month must be YYYYMM (e.g., 202308); got: {}"
 ERR_NO_FILES_FOUND = "No files found for month: {}"
-ERR_NO_SUCCESSFUL_PROCESS = "No files were successfully processed"
-
-# ID columns with explicit dtypes
-COMED_SCHEMA_OVERRIDES: dict[str, DType] = {
-    "ZIP_CODE": pl.Utf8,
-    "DELIVERY_SERVICE_CLASS": pl.Utf8,
-    "DELIVERY_SERVICE_NAME": pl.Utf8,
-    "ACCOUNT_IDENTIFIER": pl.Utf8,
-    "INTERVAL_READING_DATE": pl.Utf8,  # parsed later
-    "INTERVAL_LENGTH": pl.Utf8,
-    "TOTAL_REGISTERED_ENERGY": pl.Float64,
-    "PLC_VALUE": pl.Utf8,
-    "NSPL_VALUE": pl.Utf8,
-}
-
-COMED_INTERVAL_COLUMNS: list[str] = [
-    f"INTERVAL_HR{m // 60:02d}{m % 60:02d}_ENERGY_QTY" for m in range(30, 24 * 60 + 1, 30)
-]
 
 
-_INTERVAL_SCHEMA: dict[str, DType] = dict.fromkeys(COMED_INTERVAL_COLUMNS, pl.Float64)
-COMED_SCHEMA: dict[str, DType] = {**COMED_SCHEMA_OVERRIDES, **_INTERVAL_SCHEMA}
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _validate_year_month(year_month: str) -> None:
+    if not re.fullmatch(r"\d{6}", year_month):
+        raise ValueError(ERR_BAD_YEAR_MONTH.format(year_month))
 
 
 def list_s3_files(
     year_month: str,
+    *,
     bucket: str = S3_BUCKET,
     prefix: str = S3_PREFIX,
     max_files: int | None = None,
 ) -> list[str]:
-    """
-    List CSV files in S3 for a given year-month.
-
-    Args:
-        year_month: 'YYYYMM' (e.g., '202308')
-        max_files: optional limit for testing
+    """List CSV files in S3 for a given year-month.
 
     Returns:
-        S3 URIs as s3://bucket/key
+        Deterministically sorted S3 *keys* (e.g., "sharepoint-files/Zip4/202307/file.csv"),
+        NOT URIs. These keys are intended to be passed directly to download_s3_batch().
+
+    Determinism:
+        - Collect ALL keys for the prefix
+        - Sort the full list
+        - Then apply max_files slicing
+
     """
-    import boto3
+    _validate_year_month(year_month)
 
     s3 = boto3.client("s3")
     full_prefix = f"{prefix}{year_month}/"
 
-    logger.info(f"Listing files from s3://{bucket}/{full_prefix}")
+    logger.info("Listing files from s3://%s/%s", bucket, full_prefix)
 
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=bucket, Prefix=full_prefix)
 
-    s3_uris: list[str] = []
+    keys: list[str] = []
     for page in pages:
-        if "Contents" not in page:
-            continue
-        for obj in page["Contents"]:
-            key = obj["Key"]
-            if key.endswith(".csv"):
-                s3_uri = f"s3://{bucket}/{key}"
-                s3_uris.append(s3_uri)
-                if max_files and len(s3_uris) >= max_files:
-                    logger.info(f"Limited to {max_files} files for testing")
-                    return s3_uris
+        for obj in page.get("Contents", []):
+            key = obj.get("Key")
+            if key and key.endswith(".csv"):
+                keys.append(key)
 
-    logger.info(f"Found {len(s3_uris)} CSV files")
-    return s3_uris
+    keys = sorted(keys)
 
+    if max_files is not None:
+        keys = keys[: int(max_files)]
 
-def scan_single_csv_lazy(
-    s3_uri: str, schema: dict[str, DType] | None = None, day_mode: str = "calendar"
-) -> pl.LazyFrame:
-    """
-    Lazily scan a single CSV from S3 and apply transformations using a fixed schema.
-    """
-    schema = COMED_SCHEMA if schema is None else schema
-    lf = pl.scan_csv(s3_uri, schema_overrides=schema, ignore_errors=True)
-    lf_long = transform_wide_to_long_lazy(lf)
-    return add_time_columns_lazy(lf_long, day_mode=day_mode)
-
-
-def transform_wide_to_long_lazy(
-    lf: pl.LazyFrame,
-    date_col: str = "INTERVAL_READING_DATE",
-) -> pl.LazyFrame:
-    """
-    Transform wide ComEd interval file to long format with timestamps.
-    """
-    id_cols = [
-        "ZIP_CODE",
-        "DELIVERY_SERVICE_CLASS",
-        "DELIVERY_SERVICE_NAME",
-        "ACCOUNT_IDENTIFIER",
-        "INTERVAL_READING_DATE",
-        "INTERVAL_LENGTH",
-        "TOTAL_REGISTERED_ENERGY",
-        "PLC_VALUE",
-        "NSPL_VALUE",
-    ]
-
-    requested_cols = id_cols + COMED_INTERVAL_COLUMNS
-
-    lf_long = (
-        lf.select(requested_cols)
-        .unpivot(
-            index=id_cols,
-            on=COMED_INTERVAL_COLUMNS,
-            variable_name="interval_col",
-            value_name="kwh",
-        )
-        .filter(pl.col("kwh").is_not_null())
-        .with_columns(pl.col("interval_col").str.extract(r"HR(\d{4})", 1).alias("time_str"))
-        .with_columns([
-            pl.col(date_col).str.strptime(pl.Date, format="%m/%d/%Y", strict=False).alias("service_date"),
-            pl.col("time_str").str.slice(0, 2).cast(pl.Int16).alias("hour_raw"),
-            pl.col("time_str").str.slice(2, 2).cast(pl.Int16).alias("minute"),
-        ])
-        .with_columns([
-            (pl.col("hour_raw") // 24).alias("days_offset"),
-            (pl.col("hour_raw") % 24).alias("hour"),
-        ])
-        .with_columns([
-            (
-                pl.col("service_date").cast(pl.Datetime)
-                + pl.duration(days=pl.col("days_offset"), hours=pl.col("hour"), minutes=pl.col("minute"))
-            ).alias("datetime")
-        ])
-        .select([
-            pl.col("ZIP_CODE").alias("zip_code"),
-            pl.col("DELIVERY_SERVICE_CLASS").alias("delivery_service_class"),
-            pl.col("DELIVERY_SERVICE_NAME").alias("delivery_service_name"),
-            pl.col("ACCOUNT_IDENTIFIER").alias("account_identifier"),
-            pl.col("datetime"),
-            pl.col("kwh").cast(pl.Float64),
-        ])
-    )
-    return lf_long
-
-
-def add_time_columns_lazy(lf: pl.LazyFrame, day_mode: str = "calendar") -> pl.LazyFrame:
-    """
-    Add derived time columns and day-attribution flags.
-
-    Day attribution modes:
-    - "calendar": date == datetime.date()
-    - "billing":  date == datetime.date(), except 00:00 rows are shifted to the previous date
-                (so HR2400 is attributed to the prior day).
-    """
-    from datetime import date as _date
-
-    if day_mode not in {"calendar", "billing"}:
-        raise ValueError("day_mode must be 'calendar' or 'billing'")
-
-    DST_SPRING_2023 = _date(2023, 3, 12)
-    DST_FALL_2023 = _date(2023, 11, 5)
-
-    dt = pl.col("datetime")
-
-    if day_mode == "calendar":
-        date_expr = dt.dt.date()
-    else:
-        date_expr = (
-            pl.when((dt.dt.hour() == 0) & (dt.dt.minute() == 0))
-            .then((dt - pl.duration(days=1)).dt.date())
-            .otherwise(dt.dt.date())
-        )
-
-    weekday_expr = pl.col("date").dt.weekday()  # Polars: Mon=1 ... Sun=7
-
-    return (
-        lf.with_columns([
-            date_expr.alias("date"),
-            dt.dt.hour().alias("hour"),
-        ])
-        .with_columns([
-            weekday_expr.alias("weekday"),
-            (weekday_expr >= 6).alias("is_weekend"),
-        ])
-        .with_columns([
-            (pl.col("date") == DST_SPRING_2023).alias("is_spring_forward_day"),
-            (pl.col("date") == DST_FALL_2023).alias("is_fall_back_day"),
-            ((pl.col("date") == DST_SPRING_2023) | (pl.col("date") == DST_FALL_2023)).alias("is_dst_day"),
-        ])
-    )
-
-
-def process_month_batch(
-    year_month: str,
-    output_path: Path,
-    max_files: int | None = None,
-    bucket: str = S3_BUCKET,
-    prefix: str = S3_PREFIX,
-    sort_output: bool = False,
-    day_mode: str = "calendar",
-) -> None:
-    """
-    Process all CSVs for a month and save as a single Parquet file.
-
-    Args:
-        year_month: Month in 'YYYYMM' format.
-        output_path: Path to the Parquet file to write.
-        max_files: Optional limit for testing.
-        bucket: S3 bucket name.
-        prefix: S3 prefix path.
-        sort_output: Whether to sort by datetime before writing.
-        day_mode: Day attribution mode ('calendar' or 'billing').
-    """
-    logger.info(f"Processing month: {year_month}")
-
-    s3_uris = list_s3_files(year_month, bucket, prefix, max_files)
-    if not s3_uris:
+    if not keys:
         raise ValueError(ERR_NO_FILES_FOUND.format(year_month))
 
-    logger.info(f"Scanning {len(s3_uris)} files lazily...")
+    logger.info("Found %d CSV files (after limit)", len(keys))
+    return keys
 
-    lazy_frames: list[pl.LazyFrame] = []
-    for i, s3_uri in enumerate(s3_uris, 1):
-        filename = s3_uri.split("/")[-1]
-        logger.debug(f"Scanning {i}/{len(s3_uris)}: {filename}")
-        try:
-            lf = scan_single_csv_lazy(s3_uri, day_mode=day_mode)
-            lazy_frames.append(lf)
-        except Exception:
-            logger.exception(f"Failed to scan {s3_uri}")
-            continue
 
-    if not lazy_frames:
-        raise ValueError(ERR_NO_SUCCESSFUL_PROCESS)
+def _write_manifest_line(fp: Any, record: dict[str, Any]) -> None:
+    fp.write(json.dumps(record, sort_keys=True) + "\n")
+    fp.flush()
 
-    logger.info(f"Concatenating {len(lazy_frames)} lazy frames...")
-    lf_combined = pl.concat(lazy_frames, how="diagonal_relaxed")
 
-    if sort_output:
-        logger.info("Sorting by datetime (this will materialize data)...")
-        lf_combined = lf_combined.sort("datetime")
+def _validate_manifest(manifest_path: Path) -> bool:
+    """Best-effort validation that the manifest is valid JSONL and contains required fields.
+    Non-fatal: returns False on any issue.
+    """
+    required_fields = {"s3_key", "status", "timestamp"}
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if not required_fields.issubset(rec.keys()):
+                    raise ValueError(f"Line {i} missing required fields: {required_fields - set(rec.keys())}")
+        return True
+    except Exception as exc:
+        logger.error("Invalid manifest JSONL at %s: %s", manifest_path, exc)
+        return False
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Collecting and writing to Parquet (this is where execution happens)...")
-    lf_combined.sink_parquet(output_path)
-    logger.info(f"Successfully wrote data to {output_path}")
+def download_s3_batch(
+    *,
+    s3_keys: list[str],
+    output_dir: Path,
+    manifest_path: Path,
+    bucket: str = S3_BUCKET,
+    max_files: int | None = None,
+    fail_fast: bool = True,
+    max_errors: int = 10,
+    retries: int = 3,
+    backoff_factor: float = 2.0,
+    log_every: int = 100,
+) -> dict[str, Any]:
+    """Download S3 keys to local directory with manifest tracking.
+
+    Args:
+        s3_keys: S3 keys (NOT URIs). Example: "sharepoint-files/Zip4/202307/file.csv"
+        output_dir: Local directory to write downloaded CSVs
+        manifest_path: JSONL manifest path (overwritten for determinism)
+        bucket: S3 bucket
+        max_files: Optional cap (applied after s3_keys is already deterministic/sorted upstream)
+        fail_fast: Stop immediately on first error
+        max_errors: Allowed errors before aborting when fail_fast=False
+        retries: Number of retry attempts per file (in addition to the initial attempt)
+        backoff_factor: Exponential backoff multiplier (seconds: 1, 2, 4, ...)
+        log_every: Progress logging interval
+
+    Returns:
+        dict with keys: downloaded, failed, manifest_path
+
+    """
+    if max_files is not None:
+        s3_keys = s3_keys[: int(max_files)]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    s3 = boto3.client("s3")
+
+    downloaded = 0
+    failed = 0
+
+    # Overwrite for determinism: reruns produce byte-identical manifests given identical outcomes.
+    with manifest_path.open("w", encoding="utf-8") as mf:
+        for i, key in enumerate(s3_keys, 1):
+            if log_every > 0 and (i == 1 or i % log_every == 0 or i == len(s3_keys)):
+                logger.info("Downloading %d/%d", i, len(s3_keys))
+
+            local_path = output_dir / Path(key).name
+            s3_uri = f"s3://{bucket}/{key}"
+            ts = _utc_now_iso()
+
+            attempt = 0
+            last_exc: Exception | None = None
+            while attempt <= retries:
+                try:
+                    attempt += 1
+                    s3.download_file(bucket, key, str(local_path))
+
+                    size_bytes = None
+                    try:
+                        size_bytes = local_path.stat().st_size
+                    except OSError:
+                        size_bytes = None
+
+                    _write_manifest_line(
+                        mf,
+                        {
+                            "s3_key": key,
+                            "s3_uri": s3_uri,
+                            "local_path": str(local_path),
+                            "status": "success",
+                            "size_bytes": size_bytes,
+                            "timestamp": ts,
+                            "attempt": attempt,
+                        },
+                    )
+                    downloaded += 1
+                    last_exc = None
+                    break
+
+                except (ClientError, BotoCoreError, OSError) as exc:
+                    last_exc = exc
+                    if attempt > retries:
+                        break
+
+                    sleep_s = float(backoff_factor) ** float(attempt - 1)
+                    logger.warning(
+                        "Download failed (attempt %d/%d) for %s: %s; backing off %.1fs",
+                        attempt,
+                        retries + 1,
+                        key,
+                        type(exc).__name__,
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+
+            if last_exc is not None:
+                failed += 1
+                _write_manifest_line(
+                    mf,
+                    {
+                        "s3_key": key,
+                        "s3_uri": s3_uri,
+                        "local_path": str(local_path),
+                        "status": "error",
+                        "error": f"{type(last_exc).__name__}: {last_exc}",
+                        "timestamp": ts,
+                        "attempt": attempt,
+                    },
+                )
+
+                msg = f"Failed to download {key} after {attempt} attempt(s): {type(last_exc).__name__}: {last_exc}"
+                if fail_fast:
+                    raise RuntimeError(msg) from last_exc
+
+                if failed > max_errors:
+                    raise RuntimeError(
+                        f"Exceeded max_errors={max_errors} during S3 download. "
+                        f"Downloaded={downloaded} Failed={failed}. Last error: {msg}",
+                    ) from last_exc
+
+    logger.info("Download complete. Success=%d Failed=%d Manifest=%s", downloaded, failed, manifest_path)
+
+    if not _validate_manifest(manifest_path):
+        logger.warning("Manifest validation failed (non-fatal): %s", manifest_path)
+
+    return {"downloaded": downloaded, "failed": failed, "manifest_path": str(manifest_path)}
 
 
 def main() -> None:
-    """Command-line entry point for processing ComEd smart meter data from S3."""
-    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+    parser = argparse.ArgumentParser(description="Deterministically list and download ComEd CSVs from S3.")
+    parser.add_argument("year_month", help="Month in YYYYMM format (e.g., 202307)")
+    parser.add_argument("--bucket", default=S3_BUCKET)
+    parser.add_argument("--prefix", default=S3_PREFIX)
+    parser.add_argument("--max-files", type=int, default=None, help="Limit number of files (testing)")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/runs/manual/raw"))
+    parser.add_argument("--manifest", type=Path, default=Path("data/runs/manual/download_manifest.jsonl"))
+    parser.add_argument("--no-fail-fast", action="store_true", help="Allow errors up to --max-errors")
+    parser.add_argument("--max-errors", type=int, default=10)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--backoff-factor", type=float, default=2.0)
+    parser.add_argument("--log-every", type=int, default=100)
+
+    args = parser.parse_args()
+    _validate_year_month(args.year_month)
+
+    keys = list_s3_files(
+        args.year_month,
+        bucket=args.bucket,
+        prefix=args.prefix,
+        max_files=args.max_files,
     )
 
-    if len(sys.argv) < 2:
-        print("Usage: python -m smart_meter_analysis.aws_loader YYYYMM [max_files] [calendar|billing]")
-        sys.exit(1)
-
-    year_month = sys.argv[1]
-    max_files = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
-    day_mode = sys.argv[3] if len(sys.argv) > 3 else "calendar"
-
-    if day_mode not in {"calendar", "billing"}:
-        print("Error: day_mode must be either 'calendar' or 'billing'")
-        sys.exit(1)
-
-    output_path = Path(f"data/processed/comed_{year_month}.parquet")
-
-    process_month_batch(
-        year_month=year_month,
-        output_path=output_path,
-        max_files=max_files,
-        sort_output=False,
-        day_mode=day_mode,
+    download_s3_batch(
+        s3_keys=keys,
+        output_dir=args.output_dir,
+        manifest_path=args.manifest,
+        bucket=args.bucket,
+        max_files=args.max_files,
+        fail_fast=not args.no_fail_fast,
+        max_errors=args.max_errors,
+        retries=args.retries,
+        backoff_factor=args.backoff_factor,
+        log_every=args.log_every,
     )
 
-    logger.info(f"✓ Successfully processed {year_month} in '{day_mode}' mode")
+
+if __name__ == "__main__":
+    main()

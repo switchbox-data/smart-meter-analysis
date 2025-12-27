@@ -1,6 +1,5 @@
 # smart_meter_analysis/census.py
-"""
-Census data fetcher for demographic analysis.
+"""Census data fetcher for demographic analysis.
 
 Fetches:
 - ACS 5-year (detailed tables) data at Block Group level via the official Census API
@@ -42,8 +41,7 @@ def chunk_list(items: list[Any], size: int) -> list[list[Any]]:
 
 
 def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Build 12-digit Block Group GEOID from components.
+    """Build 12-digit Block Group GEOID from components.
 
     GEOID format: State(2) + County(3) + Tract(6) + BlockGroup(1) = 12 digits
     """
@@ -53,7 +51,7 @@ def build_geoid(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("county").cast(pl.Utf8).str.zfill(3),
             pl.col("tract").cast(pl.Utf8).str.zfill(6),
             pl.col("block group").cast(pl.Utf8).str.zfill(1),
-        ]).alias("GEOID")
+        ]).alias("GEOID"),
     )
 
 
@@ -78,8 +76,7 @@ def clean_census_values(df: pl.DataFrame) -> pl.DataFrame:
 # Spec-driven helpers
 # -----------------------------------------------------------------------------
 def extract_raw_codes(expr: str | None) -> set[str]:
-    """
-    Extract ACS raw variable codes (e.g., B25040_002E) from a spec string.
+    """Extract ACS raw variable codes (e.g., B25040_002E) from a spec string.
 
     Supports expressions like:
       "B25070_007E + B25070_008E"
@@ -90,8 +87,7 @@ def extract_raw_codes(expr: str | None) -> set[str]:
 
 
 def gather_acs_codes(variable_specs: list[dict[str, Any]]) -> list[str]:
-    """
-    Gather the full set of ACS variable codes required to compute VARIABLE_SPECS.
+    """Gather the full set of ACS variable codes required to compute VARIABLE_SPECS.
 
     We parse:
     - spec["numerator"]
@@ -107,8 +103,7 @@ def gather_acs_codes(variable_specs: list[dict[str, Any]]) -> list[str]:
 
 
 def expr_to_polars(expr: str) -> pl.Expr:
-    """
-    Convert a simple linear expression into a Polars expression.
+    """Convert a simple linear expression into a Polars expression.
 
     Supported grammar:
       - "A"
@@ -117,6 +112,7 @@ def expr_to_polars(expr: str) -> pl.Expr:
     Notes:
       - Inputs are expected to be ACS codes present in the DataFrame.
       - Each term is cast to Float64 to avoid integer division issues.
+
     """
     parts = [p.strip() for p in expr.split("+")]
     out = pl.lit(0.0)
@@ -128,8 +124,7 @@ def expr_to_polars(expr: str) -> pl.Expr:
 
 
 def is_acs_only_spec(spec: dict[str, Any]) -> bool:
-    """
-    Check if a spec is ACS-only (excludes Decennial H2_*N variables).
+    """Check if a spec is ACS-only (excludes Decennial H2_*N variables).
 
     Returns True if the spec does not reference any H2_*N variables in its
     numerator or denominator expressions.
@@ -144,9 +139,9 @@ def is_acs_only_spec(spec: dict[str, Any]) -> bool:
 
 
 def build_feature_columns(variable_specs: list[dict[str, Any]]) -> list[pl.Expr]:
-    """
-    Build Polars expressions for engineered features defined by VARIABLE_SPECS.
+    """Build Polars expressions for engineered features defined by VARIABLE_SPECS.
 
+    - If "variable" exists: use it directly (single ACS code)
     - If denominator exists: compute percent = numerator / denominator * 100 (safe_percent).
     - If denominator is None: use numerator directly.
     - transformation:
@@ -157,20 +152,27 @@ def build_feature_columns(variable_specs: list[dict[str, Any]]) -> list[pl.Expr]
 
     for spec in variable_specs:
         name = spec["name"]
+        variable = spec.get("variable")  # Single variable (no ratio)
         numer = spec.get("numerator")
         denom = spec.get("denominator")
         transform = spec.get("transformation", "none")
 
-        if not numer:
-            raise ValueError(f"Missing numerator for spec: {name}")
-
-        if denom:
+        # Determine the base value expression
+        if variable:
+            # Single variable (e.g., median_household_income)
+            value = expr_to_polars(variable)
+        elif numer:
+            # Ratio (e.g., unemployment_rate, pct_owner_occupied)
             numer_expr = expr_to_polars(numer)
-            denom_expr = expr_to_polars(denom)
-            value = safe_percent(numer_expr, denom_expr)
+            if denom:
+                denom_expr = expr_to_polars(denom)
+                value = safe_percent(numer_expr, denom_expr)
+            else:
+                value = numer_expr
         else:
-            value = expr_to_polars(numer)
+            raise ValueError(f"Spec '{name}' must have either 'variable' or 'numerator'")
 
+        # Apply transformation
         if transform == "log":
             value = pl.when(value.is_not_null() & (value >= 0)).then((value + 1.0).log()).otherwise(None)
         elif transform == "none":
@@ -186,14 +188,13 @@ def build_feature_columns(variable_specs: list[dict[str, Any]]) -> list[pl.Expr]
 # -----------------------------------------------------------------------------
 # Fetchers
 # -----------------------------------------------------------------------------
-def fetch_acs_data(  # noqa: C901
+def fetch_acs_data(
     state_fips: str = "17",
     year: int = 2023,
     county_fips: str | None = None,
     keep_raw_debug_cols: list[str] | None = None,
 ) -> pl.DataFrame:
-    """
-    Fetch ACS 5-Year *detailed table* raw variables needed for VARIABLE_SPECS at Block Group level,
+    """Fetch ACS 5-Year *detailed table* raw variables needed for VARIABLE_SPECS at Block Group level,
     then compute engineered features.
 
     Args:
@@ -210,6 +211,7 @@ def fetch_acs_data(  # noqa: C901
           - GEOID, NAME
           - engineered ACS features defined by VARIABLE_SPECS (ACS-only specs)
           - optionally, raw ACS variables specified in keep_raw_debug_cols
+
     """
     suffix = f", county {county_fips}" if county_fips else ""
     logger.info(f"Fetching ACS {year} detailed-table data for state {state_fips}{suffix}")
@@ -254,7 +256,7 @@ def fetch_acs_data(  # noqa: C901
             response_body = resp.text[:500] if resp.text else str(e)
             raise RuntimeError(
                 f"ACS API chunk {i + 1}/{len(code_chunks)} failed with HTTP {status_code}.\n"
-                f"Response body (first 500 chars): {response_body}"
+                f"Response body (first 500 chars): {response_body}",
             ) from e
         except Exception as e:
             raise RuntimeError(f"ACS API chunk {i + 1}/{len(code_chunks)} failed with error: {e}") from e
@@ -271,7 +273,7 @@ def fetch_acs_data(  # noqa: C901
         if missing_in_response:
             logger.warning(
                 f"  Chunk {i + 1}: Variables requested but not in API response: {missing_in_response[:5]}"
-                + (f" (and {len(missing_in_response) - 5} more)" if len(missing_in_response) > 5 else "")
+                + (f" (and {len(missing_in_response) - 5} more)" if len(missing_in_response) > 5 else ""),
             )
 
         chunk_df = pl.DataFrame(rows, schema=header, orient="row")
@@ -332,8 +334,7 @@ def fetch_acs_data(  # noqa: C901
 
 
 def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFrame:
-    """
-    Fetch Decennial Census DHC H2 (Urban and Rural) at Block Group level, then compute urban_percent.
+    """Fetch Decennial Census DHC H2 (Urban and Rural) at Block Group level, then compute urban_percent.
 
     Args:
         state_fips: State FIPS code (default '17' for Illinois)
@@ -345,6 +346,7 @@ def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFra
           - Urban_Housing_Units
           - Rural_Housing_Units
           - urban_percent
+
     """
     logger.info(f"Fetching Decennial {year} DHC H2 data for state {state_fips}")
 
@@ -384,7 +386,7 @@ def fetch_decennial_data(state_fips: str = "17", year: int = 2020) -> pl.DataFra
         safe_percent(
             pl.col("Urban_Housing_Units"),
             pl.col("Urban_Housing_Units") + pl.col("Rural_Housing_Units"),
-        ).alias("urban_percent")
+        ).alias("urban_percent"),
     ])
 
     return df.select(["GEOID", "Urban_Housing_Units", "Rural_Housing_Units", "urban_percent"])
@@ -398,8 +400,7 @@ def fetch_census_data(
     output_path: Path | str | None = None,
     keep_raw_debug_cols: list[str] | None = None,
 ) -> pl.DataFrame:
-    """
-    Fetch and combine ACS (engineered features) and Decennial (urban_percent) at Block Group level.
+    """Fetch and combine ACS (engineered features) and Decennial (urban_percent) at Block Group level.
 
     Args:
         state_fips: State FIPS code (default: '17' for Illinois)
@@ -415,6 +416,7 @@ def fetch_census_data(
     Returns:
         Combined DataFrame with all engineered ACS features + urban_percent by block group.
         Optionally includes raw ACS variables specified in keep_raw_debug_cols.
+
     """
     acs_df = fetch_acs_data(
         state_fips=state_fips,
@@ -445,11 +447,11 @@ def fetch_census_data(
 
 
 def validate_census_data(df: pl.DataFrame) -> dict[str, Any]:
-    """
-    Validate census data quality.
+    """Validate census data quality.
 
     Returns:
         Dict with validation metrics.
+
     """
     # Percent columns are conventionally named with "pct_" or explicitly "urban_percent"
     pct_cols = [c for c in df.columns if c.startswith("pct_")] + (
