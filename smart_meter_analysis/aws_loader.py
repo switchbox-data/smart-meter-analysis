@@ -3,13 +3,21 @@
 
 Contract A (S3 Download only)
 ----------------------------
-This module is responsible  for:
+This module is responsible for:
 - Deterministically listing S3 CSV keys for a given year-month (YYYYMM)
 - Downloading those keys to local disk with retry/backoff
 - Writing a JSONL download manifest for provenance and QA
 
 Downstream processing belongs to scripts/process_csvs_batched_optimized.py and
 smart_meter_analysis/transformation.py.
+
+Operational scaling note
+------------------------
+For full-scale runs (e.g., ~700k files), downloads must be resumable.
+Accordingly, this module supports:
+- Appending to an existing manifest (default)
+- Skipping downloads for files that already exist on disk (default)
+- Optional manifest overwrite for clean-room re-runs
 """
 
 from __future__ import annotations
@@ -61,7 +69,6 @@ def list_s3_files(
         - Collect ALL keys for the prefix
         - Sort the full list
         - Then apply max_files slicing
-
     """
     _validate_year_month(year_month)
 
@@ -117,36 +124,73 @@ def _validate_manifest(manifest_path: Path) -> bool:
         return False
 
 
+def _local_path_for_key(*, key: str, output_dir: Path, prefix: str) -> Path:
+    """Map an S3 key to a deterministic local path under output_dir.
+
+    We preserve the key's structure beneath the configured prefix to avoid filename collisions.
+    Example:
+        key:    sharepoint-files/Zip4/202307/foo.csv
+        prefix: sharepoint-files/Zip4/
+        local:  <output_dir>/202307/foo.csv
+    """
+    key_path = Path(key)
+    prefix_path = Path(prefix.rstrip("/"))
+
+    try:
+        rel = key_path.relative_to(prefix_path)
+    except ValueError:
+        # Fallback if key does not start with prefix as a Path.
+        rel = key_path
+
+    return output_dir / rel
+
+
+def _is_existing_nonempty(path: Path) -> tuple[bool, int | None]:
+    """Return (exists_and_nonempty, size_bytes_if_known)."""
+    try:
+        if path.exists():
+            size = path.stat().st_size
+            return (size > 0, size)
+        return (False, None)
+    except OSError:
+        return (False, None)
+
+
 def download_s3_batch(
     *,
     s3_keys: list[str],
     output_dir: Path,
     manifest_path: Path,
     bucket: str = S3_BUCKET,
+    prefix: str = S3_PREFIX,
     max_files: int | None = None,
     fail_fast: bool = True,
     max_errors: int = 10,
     retries: int = 3,
     backoff_factor: float = 2.0,
     log_every: int = 100,
+    overwrite_manifest: bool = False,
+    skip_existing: bool = True,
 ) -> dict[str, Any]:
     """Download S3 keys to local directory with manifest tracking.
 
     Args:
         s3_keys: S3 keys (NOT URIs). Example: "sharepoint-files/Zip4/202307/file.csv"
         output_dir: Local directory to write downloaded CSVs
-        manifest_path: JSONL manifest path (overwritten for determinism)
+        manifest_path: JSONL manifest path (append by default; optionally overwritten)
         bucket: S3 bucket
+        prefix: S3 prefix used to compute deterministic local paths
         max_files: Optional cap (applied after s3_keys is already deterministic/sorted upstream)
         fail_fast: Stop immediately on first error
         max_errors: Allowed errors before aborting when fail_fast=False
         retries: Number of retry attempts per file (in addition to the initial attempt)
         backoff_factor: Exponential backoff multiplier (seconds: 1, 2, 4, ...)
         log_every: Progress logging interval
+        overwrite_manifest: If True, truncate and rewrite manifest (clean-room rerun)
+        skip_existing: If True, skip download when local_path exists and is non-empty
 
     Returns:
-        dict with keys: downloaded, failed, manifest_path
-
+        dict with keys: downloaded, failed, skipped, manifest_path
     """
     if max_files is not None:
         s3_keys = s3_keys[: int(max_files)]
@@ -158,16 +202,45 @@ def download_s3_batch(
 
     downloaded = 0
     failed = 0
+    skipped = 0
 
-    # Overwrite for determinism: reruns produce byte-identical manifests given identical outcomes.
-    with manifest_path.open("w", encoding="utf-8") as mf:
+    mode = "w" if overwrite_manifest else "a"
+    if overwrite_manifest:
+        logger.info("Overwriting manifest (clean run): %s", manifest_path)
+    else:
+        if manifest_path.exists():
+            logger.info("Appending to existing manifest (resume mode): %s", manifest_path)
+        else:
+            logger.info("Creating new manifest: %s", manifest_path)
+
+    with manifest_path.open(mode, encoding="utf-8") as mf:
         for i, key in enumerate(s3_keys, 1):
             if log_every > 0 and (i == 1 or i % log_every == 0 or i == len(s3_keys)):
                 logger.info("Downloading %d/%d", i, len(s3_keys))
 
-            local_path = output_dir / Path(key).name
+            local_path = _local_path_for_key(key=key, output_dir=output_dir, prefix=prefix)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+
             s3_uri = f"s3://{bucket}/{key}"
             ts = _utc_now_iso()
+
+            if skip_existing:
+                exists_nonempty, size_bytes = _is_existing_nonempty(local_path)
+                if exists_nonempty:
+                    _write_manifest_line(
+                        mf,
+                        {
+                            "s3_key": key,
+                            "s3_uri": s3_uri,
+                            "local_path": str(local_path),
+                            "status": "skipped_exists",
+                            "size_bytes": size_bytes,
+                            "timestamp": ts,
+                            "attempt": 0,
+                        },
+                    )
+                    skipped += 1
+                    continue
 
             attempt = 0
             last_exc: Exception | None = None
@@ -236,15 +309,21 @@ def download_s3_batch(
                 if failed > max_errors:
                     raise RuntimeError(
                         f"Exceeded max_errors={max_errors} during S3 download. "
-                        f"Downloaded={downloaded} Failed={failed}. Last error: {msg}",
+                        f"Downloaded={downloaded} Skipped={skipped} Failed={failed}. Last error: {msg}",
                     ) from last_exc
 
-    logger.info("Download complete. Success=%d Failed=%d Manifest=%s", downloaded, failed, manifest_path)
+    logger.info(
+        "Download complete. Success=%d Skipped=%d Failed=%d Manifest=%s",
+        downloaded,
+        skipped,
+        failed,
+        manifest_path,
+    )
 
     if not _validate_manifest(manifest_path):
         logger.warning("Manifest validation failed (non-fatal): %s", manifest_path)
 
-    return {"downloaded": downloaded, "failed": failed, "manifest_path": str(manifest_path)}
+    return {"downloaded": downloaded, "skipped": skipped, "failed": failed, "manifest_path": str(manifest_path)}
 
 
 def main() -> None:
@@ -257,6 +336,16 @@ def main() -> None:
     parser.add_argument("--max-files", type=int, default=None, help="Limit number of files (testing)")
     parser.add_argument("--output-dir", type=Path, default=Path("data/runs/manual/raw"))
     parser.add_argument("--manifest", type=Path, default=Path("data/runs/manual/download_manifest.jsonl"))
+    parser.add_argument(
+        "--overwrite-manifest",
+        action="store_true",
+        help="Overwrite (truncate) the manifest instead of appending (clean-room rerun).",
+    )
+    parser.add_argument(
+        "--no-skip-existing",
+        action="store_true",
+        help="Do not skip downloads for existing non-empty local files.",
+    )
     parser.add_argument("--no-fail-fast", action="store_true", help="Allow errors up to --max-errors")
     parser.add_argument("--max-errors", type=int, default=10)
     parser.add_argument("--retries", type=int, default=3)
@@ -278,12 +367,15 @@ def main() -> None:
         output_dir=args.output_dir,
         manifest_path=args.manifest,
         bucket=args.bucket,
+        prefix=args.prefix,
         max_files=args.max_files,
         fail_fast=not args.no_fail_fast,
         max_errors=args.max_errors,
         retries=args.retries,
         backoff_factor=args.backoff_factor,
         log_every=args.log_every,
+        overwrite_manifest=bool(args.overwrite_manifest),
+        skip_existing=not bool(args.no_skip_existing),
     )
 
 
