@@ -59,7 +59,7 @@ DEP002 = [
   "snakeviz",
   "tslearn",
 ]
-DEP003 = ["botocore", "analysis", "smart_meter_analysis"]
+DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
 DEP004 = ["botocore"]
 
 [dependency-groups]
@@ -105,6 +105,10 @@ ignore_missing_imports = true
 module = ["statsmodels.*", "sklearn.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["pandas.*", "scipy.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
@@ -141,6 +145,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "scripts/data_collection/*" = ["C901"]
 "analysis/clustering/clustering_validation.py" = ["C901", "F841", "RUF015"]
 "analysis/clustering/stage2_logratio_regression.py" = ["C901"]
+"analysis/clustering/stage2_multinomial.py" = ["C901"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
 "tests/*" = ["S101", "RUF001"]
