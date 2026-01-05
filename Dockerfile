@@ -19,3 +19,8 @@ COPY . /app
 RUN uv sync --frozen
 
 CMD [ "python", "smart_meter_analysis/foo.py" ]
+
+# R installation
+RUN apt-get update \
+  && apt-get install -y r-base r-base-dev \
+  && rm -rf /var/lib/apt/lists/*
