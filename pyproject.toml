@@ -57,8 +57,9 @@ DEP002 = [
   "pyarrow",
   "memory-profiler",
   "snakeviz",
+  "tslearn",
 ]
-DEP003 = ["botocore", "analysis"]
+DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
 DEP004 = ["botocore"]
 
 [dependency-groups]
@@ -100,6 +101,14 @@ show_error_codes = true
 module = "boto3.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["statsmodels.*", "sklearn.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pandas.*", "scipy.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
@@ -125,13 +134,18 @@ ignore = ["E501", "E731"]
 extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.lint.per-file-ignores]
-"scripts/run_comed_pipeline.py" = ["C901", "S603"]
+"scripts/run_comed_pipeline.py" = ["C901", "S603", "S607"]
 "scripts/diagnostics/*.py" = ["C901"]
 "smart_meter_analysis/pipeline_validator.py" = ["C901", "PGH003"]
+"smart_meter_analysis/run_manifest.py" = ["S603", "S607"]
+"smart_meter_analysis/aws_loader.py" = ["C901", "TRY301"]
+"smart_meter_analysis/census.py" = ["C901"]
 "tests/test_aws_transform.py" = ["E402"]
 "tests/test_census.py" = ["E402"]
 "scripts/data_collection/*" = ["C901"]
 "analysis/clustering/clustering_validation.py" = ["C901", "F841", "RUF015"]
+"analysis/clustering/stage2_logratio_regression.py" = ["C901"]
+"analysis/clustering/stage2_multinomial.py" = ["C901"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
 "tests/*" = ["S101", "RUF001"]

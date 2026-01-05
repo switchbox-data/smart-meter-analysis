@@ -83,38 +83,101 @@ window.Quarto = {
 <h2 class="anchored" data-anchor-id="data">Data</h2>
 <section id="load-profiles" class="level3">
 <h3 class="anchored" data-anchor-id="load-profiles">Load profiles</h3>
-<p>Our ComEd and Ameren Illinois data consists of kWh load profiles in 30-minute increments for the complete set of households across the entire Chicago metro area. To preserve anonymity, TK.</p>
-<p>As a result, we only get consistent household identifiers for a given calendar month. Since Chicago’s grid is summer-peaking, we choose load profiles for the month of TK. We denote load profiles as <span class="math inline">\(L_i\)</span> (for each <span class="math inline">\(i\)</span> household). Each <span class="math inline">\(L_i\)</span> is a TK point time series, for every 30 minutes in the month.</p>
+<p>Our ComEd Illinois data consists of kWh load profiles in 30-minute increments for the complete set of households across the entire ComEd service area. To preserve anonymity per rules set by the Illinois Chamber of Commerce, customer data can only be included in a data release from a utility company if it passes a screening process. In this case, a customer’s individual data cannot be released if there are 15 or fewer customers in the given geographic area, or if they represent more than 15% of that area’s load. In our case, the geographic area of interest is the nine-digit Zip+4 postal code.</p>
+<div class="callout callout-style-default callout-note callout-empty-content callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Ameren data was also grabbed for a hypothetical second project with CUB. It’s not part of the scope of this round of work–CUB explicitly asked for the ComEd data first and separately
+</div>
+</div>
+<div class="callout-body-container callout-body">
+
+</div>
+</div>
+<p>Furthermore, even when individual customers’ usage data is provided, the identification number associated with each customer is not retained month to month. In other words, while the usage data may feature the same customers in September as they did in August, ComEd assigns each customer a new account ID for each month. As a result, we only get consistent household identifiers for a given calendar month.</p>
+<p>Since Illinois’s grid peaked in July 2023, for our initial test analysis we choose load profiles for the month of July 2023. We denote a household’s <strong>monthly</strong> 30-minute interval usage series as <span class="math inline">\(L_i\)</span> (for household <span class="math inline">\(i\)</span>). For July 2023, each <span class="math inline">\(L_i\)</span> is a 1,488-point time series observed at 30-minute intervals (48 half-hour readings per day over 31 days).</p>
+<p>For clustering, however, we work with <strong>household-day observations</strong> derived from these monthly series. Specifically, we partition each <span class="math inline">\(L_i\)</span> into daily 48-point vectors <span class="math inline">\(L_{id}\)</span>, where <span class="math inline">\(d\in\{1,\ldots,31\}\)</span> indexes days in July. Each household-day vector <span class="math inline">\(L_{id}\)</span> is then normalized to a daily load-shape vector <span class="math inline">\(S_{id}\)</span> prior to clustering. In our clustering implementation, this normalization is performed row-wise and can be specified as min–max scaling (primary specification), z-score scaling (robustness check), or no additional scaling.</p>
+<p>These normalized household-day observations <span class="math inline">\(\{S_{id}\}\)</span> are the inputs to k-means, and all subsequent aggregation and regression in Stage 2 is performed at the household-day level.</p>
+<div class="callout callout-style-default callout-note callout-empty-content callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>I am still unsure about the scale of the final analysis. Will we show a full year of data, or a particular month/set of months? Or 12 months as a series of sub-analyses.
+</div>
+</div>
+<div class="callout-body-container callout-body">
+
+</div>
+</div>
 </section>
 <section id="demographic-information" class="level3">
 <h3 class="anchored" data-anchor-id="demographic-information">Demographic information</h3>
-<p>The highest spatial resolution demographic data available for our analysis is the 5-year TK (2024?) US Census Bureau American Community Survey (2024 ACS) at the block group level. From this, we derive a number of block-group level demographic features:</p>
+<p>The highest spatial resolution demographic data available for our analysis is the 5-year 2023 US Census Bureau American Community Survey (2023 ACS) and the decennial 2020 Census Supplemental Demographic and Housing Characteristics File (2020 DHS) at the block group level (DHS 2020).</p>
+<p>From this, we derive 47 block-group level demographic features across five categories (all sourced from ACS unless otherwise noted):</p>
 <ul>
-<li>TK</li>
+<li><p>Spatial (1 variable): <code>urban_percent</code>.</p></li>
+<li><p>Economic (7 variables): <code>median_household_income</code>, <code>unemployment_rate</code>, <code>pct_in_civilian_labor_force</code>, <code>pct_not_in_labor_force</code>, <code>pct_income_under_25k</code>, <code>pct_income_25k_to_75k</code>, <code>pct_income_75k_plus</code>.</p></li>
+<li><p>Housing (24 variables): <code>pct_owner_occupied</code>, <code>pct_renter_occupied</code>, <code>pct_heat_utility_gas</code>, <code>pct_heat_electric</code>, <code>pct_housing_built_2000_plus</code>, <code>pct_housing_built_1980_1999</code>, <code>old_building_pct</code>, <code>pct_structure_single_family_detached</code>, <code>pct_structure_single_family_attached</code>, <code>pct_structure_multifamily_2_to_4</code>, <code>pct_structure_multifamily_5_to_19</code>, <code>pct_structure_multifamily_10_plus</code>, <code>pct_structure_multifamily_20_plus</code>, <code>pct_structure_mobile_home</code>, <code>pct_vacant_housing_units</code>, <code>pct_home_value_under_150k</code>, <code>pct_home_value_150k_to_299k</code>, <code>pct_home_value_300k_plus</code>, <code>pct_rent_burden_30_plus</code>, <code>pct_rent_burden_50_plus</code>, <code>pct_owner_cost_burden_30_plus_mortgage</code>, <code>pct_owner_cost_burden_50_plus_mortgage</code>, <code>pct_owner_overcrowded_2plus_per_room</code>, <code>pct_renter_overcrowded_2plus_per_room</code>.</p></li>
+<li><p>Household (3 variables): <code>avg_household_size</code>, <code>avg_family_size</code>, <code>pct_single_parent_households</code>.</p></li>
+<li><p>Demographic (12 variables): <code>median_age</code>, <code>pct_white_alone</code>, <code>pct_black_alone</code>, <code>pct_asian_alone</code>, <code>pct_two_or_more_races</code>, <code>pct_population_under_5</code>, <code>pct_population_5_to_17</code>, <code>pct_population_18_to_24</code>, <code>pct_population_25_to_44</code>, <code>pct_population_45_to_64</code>, <code>pct_population_65_plus</code>, <code>pct_female</code>.</p></li>
 </ul>
+<div class="callout callout-style-default callout-note callout-empty-content callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Variable list to be cleaned up and made more readable.
+</div>
+</div>
+<div class="callout-body-container callout-body">
+
+</div>
+</div>
+<p>The full variable list, including Census ACS table references and calculation methods, is specified in <code>census_specs.py</code>.</p>
 </section>
 <section id="geographical-crosswalk" class="level3">
 <h3 class="anchored" data-anchor-id="geographical-crosswalk">Geographical crosswalk</h3>
-<p>Load profiles are identified by ZIP+4. Our demographic information from the TK (2024?) ACS is available at the Census block group level. To join the two, we use a crosswalk from Melissa. TK details of crosswalk.</p>
-<p>TK ZIP+4 and Census Block group spaital overlap to show that it’s a reasonable mapping.</p>
+<p>Load profiles are identified by ZIP+4. Our demographic information from the 2023ACS and 2020 DHS is available at the Census block group level. To join the two, we use a crosswalk from commercial data firm: Melissa. That crosswalk matches every Zip+4 postal code in Illinois to the Census Block that it was associated with in 2023. From here we aggregate the Census Blocks to their Block Groups–allowing them to be associated with our demographic information. Thus, we are able to characterize Block Groups both demographically and by the usage data of their residents.</p>
+<p>When a ZIP+4 maps to multiple block groups and crosswalk weights are unavailable, we enforce a deterministic 1-to-1 linkage by assigning each ZIP+4 to a single block group (selecting the smallest GEOID) to avoid double-counting household-day observations; this introduces potential geographic misclassification that we treat as a limitation.</p>
 </section>
 <section id="clusters" class="level3">
 <h3 class="anchored" data-anchor-id="clusters">Clusters</h3>
-<p>We cluster the load profiles into clusters via k-means. We use Euclidean distance on normalized load profiles, to focus on load shape rather than overall levels. We are aiming for a small number of clusters (4-10) to aid in interpretation. We chose <span class="math inline">\(k=\textrm{TK}\)</span> via the gap statistic <span class="citation" data-cites="tibshiraniEstimatingNumberClusters2001">[@tibshiraniEstimatingNumberClusters2001]</span>, using the <code>GapStatistics</code> package(TK citation).</p>
+<p>We cluster the load profiles into clusters via k-means. We use Euclidean distance on normalized load profiles, to focus on load shape rather than overall levels. We are aiming for a small number of clusters (4–10) to aid in interpretation. We selected <span class="math inline">\(k=4\)</span> using a combination of quantitative diagnostics and interpretability considerations. Quantitatively, we compared candidate values of <span class="math inline">\(k\)</span> using (i) the silhouette score to assess separation and cohesion of clusters, and (ii) the within-cluster sum of squares (WCSS) “elbow” curve to identify diminishing returns in fit as <span class="math inline">\(k\)</span> increases. Substantively, we also inspected average normalized load shapes by cluster to ensure that the resulting patterns were distinct and interpretable, and that clusters were not degenerate (e.g., extremely small or poorly separated).</p>
 <p>TK details on each cluster, and brief description of each shape.</p>
-<p>TK selection of cluster 1 as baseline.</p>
+<p>We selected cluster 1 as the baseline (reference category) because it contains the largest share of household-day observations and exhibits the most stable and representative load-shape pattern among the clusters, providing a stable comparison point for the log-ratio regressions.</p>
 </section>
 </section>
 <section id="demographic-predictors-of-load-profile-mix" class="level2">
 <h2 class="anchored" data-anchor-id="demographic-predictors-of-load-profile-mix">Demographic predictors of load profile mix</h2>
-<p>We begin by aggregating load profile clusters at the block group level. If <span class="math inline">\(j\)</span> is the block group, and <span class="math inline">\(q\)</span> is the cluster <span class="math inline">\((q\in\{1,\ldots,k\})\)</span>, then</p>
-<p><span class="math display">\[C_{jq} = \sum_{i\in \textrm{bg(j)}}\textrm{I}(c_i = q)\]</span></p>
-<p>is the count of households per cluster in each block group. We further normalize these to <span class="math inline">\(\pi_{jq} = \frac{C_{jq}}{\sum_qC_{jq}}\)</span>, the proportion of cluster assignments in each block group.</p>
-<p>Our aim is to understand how block group level demographics predict the load cluster mix. To that end, we fit a series of multinomial logistic regression models, estimating the log probabilty of a cluster assignment relative to our baseline cluster 1,</p>
+<p>We begin by aggregating load profile clusters at the block group level. If <span class="math inline">\(j\)</span> is the block group, and <span class="math inline">\(q\)</span> is the cluster (<span class="math inline">\(q\in\{1,\ldots,k\}\)</span>), then</p>
 <p><span class="math display">\[
-\log\left(\frac{\pi_{jq}}{\pi_{jK}}\right) = \beta_{0q} + \beta_{1q} \cdot \textrm{median\_income}_q + \beta_{2q} \textrm{pct\_hispanic}_q + \ldots
+C_{jq} = \sum_{i\in \mathrm{bg}(j)} \mathrm{I}(c_i = q)
 \]</span></p>
-<p>for each <span class="math inline">\(q\in\{1,\ldots,k\}\)</span>. We use the <code>MNLogit</code> function in the Python package <code>statsmodels</code> to fit these models.</p>
+<p>is the count of household-day observations assigned to cluster <span class="math inline">\(q\)</span> in block group <span class="math inline">\(j\)</span>, where <span class="math inline">\(c_i\)</span> denotes the cluster assignment for household-day observation <span class="math inline">\(i\)</span>. Under this aggregation, a single household with multiple sampled days contributes multiple observations to the block group totals.</p>
+<p>We further normalize these to <span class="math inline">\(\pi_{jq} = \frac{C_{jq}}{\sum_q C_{jq}}\)</span>, the proportion of cluster assignments in each block group.</p>
+<p>Our aim is to understand how block group level demographics predict the load cluster mix. Because <span class="math inline">\((\pi_{j1},\ldots,\pi_{jk})\)</span> are compositional proportions that must sum to 1, we model log-ratios of cluster proportions. To prevent numerical instability from zero proportions, we apply Laplace smoothing (<span class="math inline">\(\alpha = 0.5\)</span> pseudocount) before computing log-ratios. Specifically, we define smoothed proportions</p>
+<p><span class="math display">\[
+\tilde{\pi}_{jq} = \frac{C_{jq} + \alpha}{\sum_{q=1}^{k} C_{jq} + k\alpha},
+\qquad \alpha = 0.5,
+\]</span></p>
+<p>which ensures <span class="math inline">\(\tilde{\pi}_{jq} &gt; 0\)</span> for all <span class="math inline">\(q\)</span> and prevents <span class="math inline">\(\log(0) = -\infty\)</span>.</p>
+<p>We fit one model per cluster outcome (except the baseline), modeling the log-ratio of each cluster’s share relative to baseline cluster 1. Specifically, for each <span class="math inline">\(q\in\{2,\ldots,k\}\)</span>, we fit:</p>
+<p><span class="math display">\[
+\log\left(\frac{\tilde{\pi}_{jq}}{\tilde{\pi}_{j1}}\right)
+= \beta_{0q}
++ \beta_{1q} X_{1j}
++ \beta_{2q} X_{2j}
++ \cdots
++ \varepsilon_{jq}.
+\]</span></p>
+<p>We estimate these as separate weighted least squares (WLS) regressions, weighting each block group <span class="math inline">\(j\)</span> by <span class="math inline">\(\mathrm{total\_obs}_j\)</span>, the total number of household-day observations available for that block group. This weighting gives greater influence to block groups with more observed data. As a robustness check, we also estimate unweighted OLS versions of the same log-ratio regressions; large differences between WLS and OLS estimates would indicate results are disproportionately driven by high-observation block groups.</p>
+<p>Coefficients are interpreted on the log-ratio scale: <span class="math inline">\(\beta_{pq}\)</span> is the expected change in <span class="math inline">\(\log(\tilde{\pi}_{jq}/\tilde{\pi}_{j1})\)</span> for a one-unit increase in predictor <span class="math inline">\(X_{pj}\)</span>, holding other predictors constant. Equivalently, <span class="math inline">\(\exp(\beta_{pq})\)</span> is the multiplicative effect on the proportion ratio <span class="math inline">\(\tilde{\pi}_{jq}/\tilde{\pi}_{j1}\)</span> for a one-unit increase in <span class="math inline">\(X_{pj}\)</span>.</p>
 </section>
 </section>
 
