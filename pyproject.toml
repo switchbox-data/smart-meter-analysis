@@ -20,6 +20,7 @@ dependencies = [
     "boto3>=1.40.46",
     "botocore>=1.40.47",
     "cenpy>=1.0.1",
+    "git-filter-repo>=2.47.0",
     "ipykernel>=6.30.1",
     "matplotlib>=3.9.4",
     "memory-profiler>=0.61.0",
