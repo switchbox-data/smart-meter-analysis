@@ -155,29 +155,91 @@ window.Quarto = {
 </section>
 <section id="demographic-predictors-of-load-profile-mix" class="level2">
 <h2 class="anchored" data-anchor-id="demographic-predictors-of-load-profile-mix">Demographic predictors of load profile mix</h2>
-<p>We begin by aggregating load profile clusters at the block group level. If <span class="math inline">\(j\)</span> is the block group, and <span class="math inline">\(q\)</span> is the cluster (<span class="math inline">\(q\in\{1,\ldots,k\}\)</span>), then</p>
+<p>We begin by aggregating load profile clusters at the block group level. If <span class="math inline">\(j\)</span> is the block group, and <span class="math inline">\(q\)</span> is the cluster (<span class="math inline">\(q\in\{0,1,2,3\}\)</span>), then</p>
 <p><span class="math display">\[
 C_{jq} = \sum_{i\in \mathrm{bg}(j)} \mathrm{I}(c_i = q)
 \]</span></p>
 <p>is the count of household-day observations assigned to cluster <span class="math inline">\(q\)</span> in block group <span class="math inline">\(j\)</span>, where <span class="math inline">\(c_i\)</span> denotes the cluster assignment for household-day observation <span class="math inline">\(i\)</span>. Under this aggregation, a single household with multiple sampled days contributes multiple observations to the block group totals.</p>
 <p>We further normalize these to <span class="math inline">\(\pi_{jq} = \frac{C_{jq}}{\sum_q C_{jq}}\)</span>, the proportion of cluster assignments in each block group.</p>
-<p>Our aim is to understand how block group level demographics predict the load cluster mix. Because <span class="math inline">\((\pi_{j1},\ldots,\pi_{jk})\)</span> are compositional proportions that must sum to 1, we model log-ratios of cluster proportions. To prevent numerical instability from zero proportions, we apply Laplace smoothing (<span class="math inline">\(\alpha = 0.5\)</span> pseudocount) before computing log-ratios. Specifically, we define smoothed proportions</p>
+<p>Our aim is to understand how block group level demographics predict the load cluster mix. Because <span class="math inline">\((\pi_{j0},\pi_{j1},\pi_{j2},\pi_{j3})\)</span> are compositional proportions that must sum to 1, we use <strong>multinomial logistic regression</strong> to model the distribution of cluster assignments. This approach properly accounts for the compositional constraint, handles zero counts naturally through the multinomial likelihood, and provides statistically correct standard errors and hypothesis tests.</p>
+<section id="model-specification" class="level3">
+<h3 class="anchored" data-anchor-id="model-specification">Model specification</h3>
+<p>We model the counts <span class="math inline">\((C_{j0}, C_{j1}, C_{j2}, C_{j3})\)</span> as following a multinomial distribution:</p>
 <p><span class="math display">\[
-\tilde{\pi}_{jq} = \frac{C_{jq} + \alpha}{\sum_{q=1}^{k} C_{jq} + k\alpha},
-\qquad \alpha = 0.5,
+(C_{j0}, C_{j1}, C_{j2}, C_{j3}) \sim \mathrm{Multinomial}\left(\sum_q C_{jq}; \pi_{j0}, \pi_{j1}, \pi_{j2}, \pi_{j3}\right)
 \]</span></p>
-<p>which ensures <span class="math inline">\(\tilde{\pi}_{jq} &gt; 0\)</span> for all <span class="math inline">\(q\)</span> and prevents <span class="math inline">\(\log(0) = -\infty\)</span>.</p>
-<p>We fit one model per cluster outcome (except the baseline), modeling the log-ratio of each cluster’s share relative to baseline cluster 1. Specifically, for each <span class="math inline">\(q\in\{2,\ldots,k\}\)</span>, we fit:</p>
+<p>We fit a single unified multinomial logit model with <strong>Cluster 2 as the baseline (reference) category</strong>. This cluster contains the largest share of household-day observations and exhibits the most stable and representative load-shape pattern among the clusters, providing a stable comparison point for the log-ratio regressions. The model estimates coefficients for Clusters 0, 1, and 3 relative to this baseline, parameterizing the log-odds as:</p>
 <p><span class="math display">\[
-\log\left(\frac{\tilde{\pi}_{jq}}{\tilde{\pi}_{j1}}\right)
-= \beta_{0q}
-+ \beta_{1q} X_{1j}
-+ \beta_{2q} X_{2j}
-+ \cdots
-+ \varepsilon_{jq}.
+\log\left(\frac{\pi_{jq}}{\pi_{j2}}\right) = \beta_{0q} + \beta_{1q} X_{1j} + \beta_{2q} X_{2j} + \cdots + \beta_{pq} X_{pj}
 \]</span></p>
-<p>We estimate these as separate weighted least squares (WLS) regressions, weighting each block group <span class="math inline">\(j\)</span> by <span class="math inline">\(\mathrm{total\_obs}_j\)</span>, the total number of household-day observations available for that block group. This weighting gives greater influence to block groups with more observed data. As a robustness check, we also estimate unweighted OLS versions of the same log-ratio regressions; large differences between WLS and OLS estimates would indicate results are disproportionately driven by high-observation block groups.</p>
-<p>Coefficients are interpreted on the log-ratio scale: <span class="math inline">\(\beta_{pq}\)</span> is the expected change in <span class="math inline">\(\log(\tilde{\pi}_{jq}/\tilde{\pi}_{j1})\)</span> for a one-unit increase in predictor <span class="math inline">\(X_{pj}\)</span>, holding other predictors constant. Equivalently, <span class="math inline">\(\exp(\beta_{pq})\)</span> is the multiplicative effect on the proportion ratio <span class="math inline">\(\tilde{\pi}_{jq}/\tilde{\pi}_{j1}\)</span> for a one-unit increase in <span class="math inline">\(X_{pj}\)</span>.</p>
+<p>for <span class="math inline">\(q \in \{0, 1, 3\}\)</span> (i.e., all non-baseline clusters).</p>
+<p>This parameterization ensures that:</p>
+<ul>
+<li>All predicted probabilities are positive: <span class="math inline">\(\pi_{jq} &gt; 0\)</span></li>
+<li>Probabilities sum to 1: <span class="math inline">\(\sum_q \pi_{jq} = 1\)</span></li>
+<li>The baseline cluster probability is determined by the constraint: <span class="math inline">\(\pi_{j2} = \frac{1}{1 + \sum_{q \in \{0,1,3\}} \exp(\beta_{0q} + \beta_{1q} X_{1j} + \cdots)}\)</span></li>
+</ul>
+<p>We estimate this model via <strong>maximum likelihood</strong> using the VGAM package in R, which implements iteratively reweighted least squares (IRLS) optimization. The multinomial likelihood naturally weights observations by their sample size—block groups with more household-day observations contribute more to the likelihood and thus have greater influence on parameter estimates.</p>
+</section>
+<section id="why-multinomial-logit" class="level3">
+<h3 class="anchored" data-anchor-id="why-multinomial-logit">Why multinomial logit?</h3>
+<p>An alternative approach would be to compute empirical log-ratios <span class="math inline">\(\log(C_{jq}/C_{j2})\)</span> and model them using separate weighted ordinary least squares (OLS) regressions. However, this approach has several statistical problems:</p>
+<ol type="1">
+<li><strong>Zero counts:</strong> Log-ratios are undefined when counts are zero, requiring arbitrary smoothing constants</li>
+<li><strong>Dependent errors:</strong> Log-ratios for different clusters share a common denominator and are thus correlated, violating OLS independence assumptions</li>
+<li><strong>Heteroskedasticity:</strong> The variance of log-ratios depends on unknown proportions, creating heteroskedasticity that weighted OLS only partially addresses</li>
+<li><strong>Invalid predictions:</strong> Predicted proportions may not sum to 1</li>
+</ol>
+<p>Multinomial logit avoids all these issues by using the correct likelihood for multinomial count data.</p>
+</section>
+<section id="predictor-variables-and-rank-deficiency" class="level3">
+<h3 class="anchored" data-anchor-id="predictor-variables-and-rank-deficiency">Predictor variables and rank deficiency</h3>
+<p>Our analysis includes 47 demographic predictor variables across five categories (spatial, economic, housing, household, and demographic characteristics). However, several of these variables form <strong>compositional groups</strong> where predictors sum to a constant (e.g., income brackets sum to 100% of households). This creates linear dependencies (rank deficiency) in the design matrix.</p>
+<p>To handle this, we:</p>
+<ol type="1">
+<li><strong>Detect rank deficiency</strong> via QR decomposition of the predictor matrix</li>
+<li><strong>Drop redundant predictors</strong> that are exact linear combinations of others</li>
+<li>In practice, this reduces our predictor set from 47 to approximately <strong>42 active predictors</strong> (plus an intercept term)</li>
+</ol>
+<p>The final model includes <strong>43 terms per cluster equation</strong> (42 predictors + 1 intercept), yielding <strong>129 total coefficients</strong> across the 3 non-baseline cluster equations.</p>
+<div class="callout callout-style-default callout-note callout-empty-content callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Variable Selection is still in progress.
+</div>
+</div>
+<div class="callout-body-container callout-body">
+
+</div>
+</div>
+</section>
+<section id="interpretation" class="level3">
+<h3 class="anchored" data-anchor-id="interpretation">Interpretation</h3>
+<p>Coefficients are interpreted on the <strong>log-odds scale</strong>: <span class="math inline">\(\beta_{pq}\)</span> is the expected change in <span class="math inline">\(\log(\pi_{jq}/\pi_{j2})\)</span> for a one-unit increase in predictor <span class="math inline">\(X_{pj}\)</span>, holding other predictors constant.</p>
+<p>Equivalently, <span class="math inline">\(\exp(\beta_{pq})\)</span> is the <strong>multiplicative effect</strong> on the odds ratio <span class="math inline">\(\pi_{jq}/\pi_{j2}\)</span> for a one-unit increase in <span class="math inline">\(X_{pj}\)</span>. For example:</p>
+<ul>
+<li>If <span class="math inline">\(\beta_{pq} = 0.02\)</span> for median household income (in thousands of dollars), then a $10k increase in income multiplies the odds of cluster <span class="math inline">\(q\)</span> vs.&nbsp;baseline by <span class="math inline">\(\exp(0.02 \times 10) = e^{0.2} \approx 1.22\)</span> (a 22% increase in odds).</li>
+</ul>
+<p>To obtain <strong>predicted probabilities</strong> for a block group with covariates <span class="math inline">\(X_j\)</span>, we use the softmax transformation:</p>
+<p><span class="math display">\[
+\hat{\pi}_{jq} = \begin{cases}
+\frac{\exp(\hat{\beta}_{0q} + \hat{\beta}_{1q} X_{1j} + \cdots)}
+{1 + \sum_{m \in \{0,1,3\}} \exp(\hat{\beta}_{0m} + \hat{\beta}_{1m} X_{1j} + \cdots)}
+&amp; \text{if } q \in \{0,1,3\} \\[1em]
+\frac{1}
+{1 + \sum_{m \in \{0,1,3\}} \exp(\hat{\beta}_{0m} + \hat{\beta}_{1m} X_{1j} + \cdots)}
+&amp; \text{if } q = 2 \text{ (baseline)}
+\end{cases}
+\]</span></p>
+<p>These predicted probabilities automatically sum to 1 and are guaranteed to be positive.</p>
+</section>
+<section id="model-performance" class="level3">
+<h3 class="anchored" data-anchor-id="model-performance">Model performance</h3>
+<p>Our final model achieves a <strong>pseudo-R² of 0.567</strong> (McFadden’s R²), indicating that demographic predictors explain approximately 57% of the variation in cluster distributions across block groups. The model successfully converged using VGAM’s IRLS optimizer, and all coefficients have valid standard errors for hypothesis testing.</p>
+</section>
 </section>
 </section>
 

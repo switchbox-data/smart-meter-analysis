@@ -59,7 +59,7 @@ DEP002 = [
   "snakeviz",
   "tslearn",
 ]
-DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
+DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy", "psutil"]
 DEP004 = ["botocore"]
 
 [dependency-groups]
