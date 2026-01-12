@@ -16,10 +16,14 @@ Outputs (written to --output-dir):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
+import os
+import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,15 +33,118 @@ import pyarrow.parquet as pq
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 
+try:
+    import psutil  # optional
+except Exception:
+    psutil = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+_BASELINE_CGROUP_EVENTS: dict[str, int] = {}
+
+
+# =============================================================================
+# MEMORY TELEMETRY (unprivileged container-safe)
+# =============================================================================
+def _read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _read_int_file(path: Path) -> int | None:
+    s = _read_text_file(path)
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+def _get_rss_bytes() -> int | None:
+    try:
+        if psutil is not None:
+            return int(psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:  # noqa: S110
+        pass
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _read_cgroup_memory_bytes() -> dict[str, int | None]:
+    cur = _read_int_file(CGROUP_ROOT / "memory.current")
+    peak = _read_int_file(CGROUP_ROOT / "memory.peak")
+    maxv = _read_text_file(CGROUP_ROOT / "memory.max")
+    limit = None
+    if maxv is not None and maxv != "max":
+        try:
+            limit = int(maxv)
+        except Exception:
+            limit = None
+    return {"current": cur, "peak": peak, "limit": limit}
+
+
+def _read_cgroup_memory_events() -> dict[str, int]:
+    out: dict[str, int] = {}
+    try:
+        txt = (CGROUP_ROOT / "memory.events").read_text(encoding="utf-8")
+        for line in txt.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                out[parts[0]] = int(parts[1])
+    except Exception:  # noqa: S110
+        pass
+    return out
+
+
+def _mb(x: int | None) -> float | None:
+    if x is None:
+        return None
+    return round(x / (1024.0 * 1024.0), 3)
+
+
+def log_memory(stage: str, extra: dict[str, Any] | None = None) -> None:
+    global _BASELINE_CGROUP_EVENTS
+    if not _BASELINE_CGROUP_EVENTS:
+        _BASELINE_CGROUP_EVENTS = _read_cgroup_memory_events()
+
+    rss_b = _get_rss_bytes()
+    cg = _read_cgroup_memory_bytes()
+    ev = _read_cgroup_memory_events()
+    keys = set(_BASELINE_CGROUP_EVENTS) | set(ev)
+    delta = {k: ev.get(k, 0) - _BASELINE_CGROUP_EVENTS.get(k, 0) for k in keys}
+
+    payload: dict[str, Any] = {
+        "ts": round(time.time(), 3),
+        "event": "mem",
+        "stage": stage,
+        "rss_mb": _mb(rss_b),
+        "cgroup_current_mb": _mb(cg.get("current")),
+        "cgroup_peak_mb": _mb(cg.get("peak")),
+        "cgroup_limit_mb": _mb(cg.get("limit")),
+        "cgroup_oom_kill_delta": delta.get("oom_kill", 0),
+        "cgroup_events_delta": delta,
+    }
+    if extra:
+        payload.update(extra)
+
+    logger.info("[MEMORY] %s", json.dumps(payload, separators=(",", ":"), sort_keys=True))
 
 
 # =============================================================================
 # IO + batch utilities
 # =============================================================================
-
-
 def parquet_num_rows(path: Path) -> int:
     """Return Parquet row count from file metadata (no full scan)."""
     pf = pq.ParquetFile(path)
@@ -57,15 +164,82 @@ def iter_profile_batches(path: Path, batch_size: int, columns: list[str] | None)
     yield from pf.iter_batches(batch_size=batch_size, columns=columns)
 
 
+def _list_array_to_numpy_matrix(arr: pa.Array) -> np.ndarray:
+    """
+    Convert Arrow list-like array (List/LargeList/FixedSizeList) to a 2D NumPy array
+    WITHOUT materializing Python lists.
+
+    Assumes lists are uniform length within the batch (true for 48-pt profiles).
+    """
+    if isinstance(arr, pa.FixedSizeListArray):
+        n = len(arr)
+        list_size = int(arr.type.list_size)
+        values = arr.values
+        v = values.to_numpy(zero_copy_only=False)
+        if v.size != n * list_size:
+            raise ValueError(f"Unexpected FixedSizeList flatten size={v.size} for n={n}, list_size={list_size}")
+        X = v.reshape((n, list_size))
+        return X
+
+    if not (pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type)):
+        raise TypeError(f"Expected List/LargeList/FixedSizeList; got {arr.type}")
+
+    n = len(arr)
+    if n == 0:
+        return np.empty((0, 0), dtype=np.float64)
+
+    # ListArray / LargeListArray: use offsets + values
+    # Offsets length = n+1; differences must be constant (48) for this dataset.
+    offsets = arr.offsets.to_numpy(zero_copy_only=False)
+    diffs = np.diff(offsets)
+    if diffs.size == 0:
+        return np.empty((0, 0), dtype=np.float64)
+
+    first = int(diffs[0])
+    if not np.all(diffs == first):
+        raise ValueError("Non-uniform list lengths detected in profile column within a batch; cannot reshape safely.")
+    if first <= 0:
+        raise ValueError(f"Invalid list length inferred from offsets: {first}")
+
+    values = arr.values
+    v = values.to_numpy(zero_copy_only=False)
+    expected = int(n * first)
+    if v.size < expected:
+        raise ValueError(f"Flattened values too short: {v.size} < expected {expected}")
+    if v.size != expected:
+        # This should not happen for uniform lists; fail loud to avoid silent corruption.
+        raise ValueError(f"Flattened values size mismatch: {v.size} != expected {expected}")
+
+    X = v.reshape((n, first))
+    return X
+
+
 def recordbatch_profiles_to_numpy(rb: pa.RecordBatch, profile_col: str = "profile") -> np.ndarray:
-    """Convert RecordBatch `profile` list column into a 2D float64 NumPy array."""
+    """
+    Convert RecordBatch `profile` list column into a 2D float64 NumPy array,
+    avoiding Python object materialization.
+    """
     idx = rb.schema.get_field_index(profile_col)
     if idx < 0:
         raise ValueError(f"RecordBatch missing required column '{profile_col}'")
-    profiles = rb.column(idx).to_pylist()
-    X = np.asarray(profiles, dtype=np.float64)
+    col = rb.column(idx)
+
+    # RecordBatch columns are typically Array, not ChunkedArray; handle defensively.
+    if isinstance(col, pa.ChunkedArray):
+        if col.num_chunks != 1:
+            # Concatenate chunks cheaply in Arrow-space (still bounded by batch size).
+            col = pa.chunked_array(col.chunks).combine_chunks()
+        col_arr = col.chunk(0)
+    else:
+        col_arr = col
+
+    X = _list_array_to_numpy_matrix(col_arr).astype(np.float64, copy=False)
     if X.ndim != 2:
         raise ValueError(f"Expected 2D profile array; got shape={X.shape}")
+
+    if not np.isfinite(X).all():
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
     return X
 
 
@@ -96,8 +270,6 @@ def parse_output_columns(spec: str) -> list[str] | None:
 # =============================================================================
 # Normalization
 # =============================================================================
-
-
 def normalize_batch(X: np.ndarray, method: str) -> np.ndarray:
     """Row-wise normalization: minmax, zscore, or none. Constant rows -> zeros."""
     if method in ("none", "", None):
@@ -126,8 +298,6 @@ def normalize_batch(X: np.ndarray, method: str) -> np.ndarray:
 # =============================================================================
 # Clustering
 # =============================================================================
-
-
 def fit_minibatch_kmeans(
     input_path: Path,
     k: int,
@@ -139,6 +309,7 @@ def fit_minibatch_kmeans(
 ) -> MiniBatchKMeans:
     """Fit MiniBatchKMeans by streaming over `profile` batches and calling partial_fit()."""
     logger.info("Fitting MiniBatchKMeans (k=%d, batch_size=%s, n_init=%d)...", k, f"{batch_size:,}", n_init)
+    log_memory("fit_start", {"k": int(k), "batch_size": int(batch_size), "n_init": int(n_init)})
 
     model = MiniBatchKMeans(
         n_clusters=k,
@@ -159,10 +330,15 @@ def fit_minibatch_kmeans(
             X = normalize_batch(X, normalize_method)
         model.partial_fit(X)
         seen += int(X.shape[0])
-        if bi % 10 == 0 or bi == n_batches:
-            logger.info("    Trained batch %d/%d (seen=%s)", bi, n_batches, f"{seen:,}")
+
+        if bi == 1 or bi == n_batches or bi % 10 == 0:
+            log_memory("fit_progress", {"batch_i": int(bi), "n_batches": int(n_batches), "seen": int(seen)})
+
+        del X, rb
+        gc.collect()
 
     logger.info("  Training complete. Inertia: %s", f"{float(model.inertia_):,.2f}")
+    log_memory("fit_done", {"seen": int(seen), "inertia": float(model.inertia_)})
     return model
 
 
@@ -200,6 +376,7 @@ def predict_write_and_optional_silhouette(  # noqa: C901
     """
     logger.info("Predicting labels + writing assignments streaming: %s", output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_memory("predict_start", {"batch_size": int(batch_size)})
 
     k = int(model.n_clusters)
     counts = np.zeros(k, dtype=np.int64)
@@ -211,15 +388,15 @@ def predict_write_and_optional_silhouette(  # noqa: C901
     global_row = 0
 
     writer: pq.ParquetWriter | None = None
-    out_schema: pa.Schema | None = None
 
     try:
-        for rb in iter_profile_batches(input_path, batch_size=batch_size, columns=read_columns):
+        for bi, rb in enumerate(iter_profile_batches(input_path, batch_size=batch_size, columns=read_columns), start=1):
             # Compute labels (requires profile)
             X = recordbatch_profiles_to_numpy(rb, profile_col="profile")
             if normalize and normalize_method != "none":
                 X = normalize_batch(X, normalize_method)
-            labels = model.predict(X).astype(np.int32)
+
+            labels = model.predict(X).astype(np.int32, copy=False)
             counts += np.bincount(labels, minlength=k)
 
             # Silhouette sampling (uses labels on this pass; avoids a second scan)
@@ -236,9 +413,10 @@ def predict_write_and_optional_silhouette(  # noqa: C901
 
                 if sample_pos > start:
                     idx_in_batch = silhouette_sample_idx[start:sample_pos] - global_row
+                    # Copy rows into a compact array later; these are small (<=5000).
                     for j in idx_in_batch:
                         jj = int(j)
-                        sample_X.append(X[jj])
+                        sample_X.append(X[jj].copy())
                         sample_y.append(int(labels[jj]))
 
             # Build output batch: select write columns (or all columns), then append cluster
@@ -255,13 +433,17 @@ def predict_write_and_optional_silhouette(  # noqa: C901
 
             out_rb = out_rb.append_column("cluster", pa.array(labels, type=pa.int32()))
 
-            # Initialize writer lazily from first out_rb schema
             if writer is None:
-                out_schema = out_rb.schema
-                writer = pq.ParquetWriter(output_path, out_schema, compression="zstd")
-            writer.write_batch(out_rb)
+                writer = pq.ParquetWriter(output_path, out_rb.schema, compression="snappy")
 
+            writer.write_batch(out_rb)
             global_row += int(labels.shape[0])
+
+            if bi == 1 or (bi % 10 == 0):
+                log_memory("predict_progress", {"batch_i": int(bi), "rows_written": int(global_row)})
+
+            del out_rb, labels, X, rb
+            gc.collect()
 
     finally:
         if writer is not None:
@@ -279,21 +461,22 @@ def predict_write_and_optional_silhouette(  # noqa: C901
         if np.unique(ys).size >= 2:
             Xs = np.asarray(sample_X, dtype=np.float64)
             logger.info("Computing silhouette on sample_size=%s ...", f"{len(ys):,}")
+            log_memory("silhouette_start", {"sample_size": len(ys)})
             sil = float(silhouette_score(Xs, ys, metric="euclidean"))
             logger.info("  Silhouette score (sample): %.3f", sil)
+            log_memory("silhouette_done", {"silhouette": float(sil)})
         else:
             logger.info("Silhouette: skipped (sample fell into a single cluster)")
     elif use_sil:
         logger.info("Silhouette: skipped (insufficient sample)")
 
+    log_memory("predict_done", {"rows_written": int(total)})
     return counts, sil
 
 
 # =============================================================================
 # Plotting + outputs
 # =============================================================================
-
-
 def plot_centroids(centroids: np.ndarray, output_path: Path) -> None:
     """Save a line plot of cluster centroids."""
     k = int(centroids.shape[0])
@@ -306,7 +489,7 @@ def plot_centroids(centroids: np.ndarray, output_path: Path) -> None:
         x = np.arange(n_timepoints)
         xlabel = "Time Interval"
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
     for i in range(k):
         ax.plot(x, centroids[i], label=f"Cluster {i}", linewidth=2)
 
@@ -348,8 +531,6 @@ def save_metadata(metadata: dict[str, object], output_path: Path) -> None:
 # =============================================================================
 # Main
 # =============================================================================
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Memory-Efficient K-Means Clustering (MiniBatch, PyArrow-batched)",
@@ -412,18 +593,16 @@ def main() -> int:
 
     n_profiles = parquet_num_rows(args.input)
     logger.info("Profiles (from parquet metadata): %s", f"{n_profiles:,}")
+    log_memory("start", {"n_profiles": int(n_profiles)})
 
-    # Output column handling
     requested_out_cols = parse_output_columns(args.output_columns)
 
-    # Read columns must include profile for prediction; if requested_out_cols is None -> read all columns.
-    # If a subset was requested, read only: requested_out_cols + profile (deduped).
     if requested_out_cols is None:
         read_columns = None
-        write_columns = None  # write everything we read (which is everything)
+        write_columns = None
         logger.info("Assignments output columns: ALL (default)")
     else:
-        read_columns = []
+        read_columns: list[str] = []
         seen = set()
         for c in [*requested_out_cols, "profile"]:
             if c not in seen:
@@ -432,7 +611,6 @@ def main() -> int:
         write_columns = requested_out_cols
         logger.info("Assignments output columns: %s (+cluster)", ",".join(write_columns))
 
-    # Fit
     model = fit_minibatch_kmeans(
         input_path=args.input,
         k=int(args.k),
@@ -444,14 +622,12 @@ def main() -> int:
     )
     centroids = model.cluster_centers_
 
-    # Deterministic silhouette sample indices (optional)
     sample_idx = make_silhouette_sample_idx(int(n_profiles), int(args.silhouette_sample_size), int(args.seed))
     if sample_idx.size > 0:
         logger.info("Silhouette sample size: %s", f"{sample_idx.size:,}")
     else:
         logger.info("Silhouette: disabled")
 
-    # Predict + write assignments (and optional silhouette)
     assignments_path = args.output_dir / "cluster_assignments.parquet"
     counts, sil_score = predict_write_and_optional_silhouette(
         model=model,
@@ -465,7 +641,6 @@ def main() -> int:
         silhouette_sample_idx=sample_idx,
     )
 
-    # Save artifacts
     centroids_plot_path = args.output_dir / "cluster_centroids.png"
     centroids_parquet_path = args.output_dir / "cluster_centroids.parquet"
     metadata_path = args.output_dir / "clustering_metadata.json"
@@ -503,6 +678,7 @@ def main() -> int:
     if sil_score is not None:
         logger.info("Silhouette (sample): %.3f", float(sil_score))
     logger.info("Output: %s", args.output_dir)
+    log_memory("end")
 
     return 0
 
