@@ -172,3 +172,15 @@ results/
 profiles/
 docs/*.html
 docs/index_files/
+
+# --- Local junk / scratch artifacts (root) ---
+sample*.csv
+*.log
+Untitled
+tl_2023_17_bg.zip
+
+# --- Quarantine area (local) ---
+archive_quarantine/
+
+# Legacy artifacts (do not track)
+archive/
