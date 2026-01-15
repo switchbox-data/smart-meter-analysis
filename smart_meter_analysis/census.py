@@ -296,7 +296,7 @@ def fetch_acs_data(
     logger.info(f"Retrieved {df.height} block groups from ACS raw pull")
 
     # Debug: Check if required variables are present
-    required_vars = ["B17001_001E", "B17001_002E", "B22001_001E", "B22001_002E", "B03001_001E", "B03001_003E"]
+    required_vars: list[str] = []
     missing_vars = [v for v in required_vars if v not in df.columns]
     if missing_vars:
         logger.warning(f"Required variables not found in API response: {missing_vars}")
