@@ -140,4 +140,4 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 preview = true
 
 [tool.deptry.per_rule_ignores]
-DEP002 = ["git-filter-repo", "statsmodels"]
+DEP002 = ["git-filter-repo", "statsmodels", "ipykernel", "memory-profiler", "openpyxl", "snakeviz", "tslearn"]
