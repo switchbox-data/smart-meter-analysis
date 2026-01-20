@@ -46,23 +46,6 @@ Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 [tool.deptry]
 exclude = ["archive", ".venv", "tests"]
 
-[tool.deptry.per_rule_ignores]
-DEP002 = [
-  "ipykernel",
-  "cenpy",
-  "openpyxl",
-  "scikit-learn",
-  "quarto",
-  "beautifulsoup4",
-  "webdriver-manager",
-  "pyarrow",
-  "memory-profiler",
-  "snakeviz",
-  "tslearn",
-]
-DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy", "psutil"]
-DEP004 = ["botocore"]
-
 [dependency-groups]
 dev = [
     "pytest>=7.2.0",
@@ -154,3 +137,6 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["git-filter-repo", "statsmodels"]
