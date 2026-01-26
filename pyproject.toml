@@ -20,6 +20,7 @@ dependencies = [
     "boto3>=1.40.46",
     "botocore>=1.40.47",
     "cenpy>=1.0.1",
+    "fsspec>=2026.1.0",
     "ipykernel>=6.30.1",
     "matplotlib>=3.9.4",
     "memory-profiler>=0.61.0",
@@ -29,6 +30,7 @@ dependencies = [
     "pyarrow>=14.0.0",
     "pyyaml>=6.0.3",
     "requests>=2.32.5",
+    "s3fs>=0.4.2",
     "scikit-learn>=1.6.1",
     "seaborn>=0.13.2",
     "selenium>=4.37.0",
@@ -109,6 +111,11 @@ ignore_missing_imports = true
 module = ["pandas.*", "scipy.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "polars.*"
+ignore_missing_imports = true
+
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
@@ -148,6 +155,9 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "analysis/clustering/stage2_multinomial.py" = ["C901"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
+"scripts/csv_to_parquet/migrate_month_runner.py" = ["C901"]
+"scripts/validate_wide_to_long_batched.py" = []
+"smart_meter_analysis/wide_to_long.py" = ["C901"]
 "tests/*" = ["S101", "RUF001"]
 
 
