@@ -11,8 +11,6 @@ This is the repo for the smart-meter-analysis project
 - **Github repository**: <https://github.com/switchbox-data/smart-meter-analysis/>
 - **Documentation** <https://switchbox-data.github.io/smart-meter-analysis/>
 
-## 🚀 Quick Start: Using the Development VM
-
 For data scientists working on this project, we provide a shared EC2 VM with all dependencies pre-configured. This is the easiest way to get started.
 
 ### Prerequisites
@@ -281,14 +279,9 @@ To finalize the set-up for publishing to PyPI, see [here](https://fpgmaas.github
 For activating the automatic documentation with MkDocs, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/mkdocs/#enabling-the-documentation-on-github).
 To enable the code coverage reports, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/codecov/).
 
-## Releasing a new version
+## 🚀 Running on AWS: Using the Development VM
 
-- Create an API Token on [PyPI](https://pypi.org/).
-- Add the API Token to your projects secrets with the name `PYPI_TOKEN` by visiting [this page](https://github.com/switchbox-data/smart-meter-analysis/settings/secrets/actions/new).
-- Create a [new release](https://github.com/switchbox-data/smart-meter-analysis/releases/new) on Github.
-- Create a new tag in the form `*.*.*`.
-
-For more details, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/cicd/#how-to-trigger-a-release).
+If you want to run this code on AWS instead of locally, we provide a shared EC2 VM with all dependencies pre-configured. This is especially useful for data scientists who need more compute power or access to large datasets stored in S3.
 
 ---
 
