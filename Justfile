@@ -17,6 +17,41 @@ update:
     uv lock --upgrade
 
 # =============================================================================
+# 🔍 AWS
+# =============================================================================
+
+# Authenticate with AWS via SSO (for manual AWS CLI usage like S3 access)
+# Automatically configures SSO if not already configured
+aws:
+    .devcontainer/devpod/aws.sh
+
+# =============================================================================
+# 🚀 DEVELOPMENT ENVIRONMENT
+# =============================================================================
+
+# Ensure Terraform is installed (internal dependency). Depends on aws so credentials
+# are valid before any Terraform or infra script runs.
+_terraform: aws
+    bash infra/install-terraform.sh
+
+# Set up EC2 instance (run once by admin)
+# Idempotent: safe to run multiple times
+dev-setup: _terraform
+    bash infra/dev-setup.sh
+
+# Destroy EC2 instance but preserve data volume (to recreate, run dev-setup again)
+dev-teardown: _terraform
+    bash infra/dev-teardown.sh
+
+# Destroy everything including data volume (WARNING: destroys all data!)
+dev-teardown-all: _terraform
+    bash infra/dev-teardown-all.sh
+
+# User login (run by any authorized user)
+dev-login: aws
+    bash infra/dev-login.sh
+
+# =============================================================================
 # 🔄 DATA PIPELINE
 # =============================================================================
 
