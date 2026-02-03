@@ -27,10 +27,10 @@ git push -u origin main
 
 ### 2. Set Up Your Development Environment
 
-Then, install the environment and the pre-commit hooks with
+Then, install [just](https://github.com/casey/just) and use it to install our python packages and the pre-commit hooks with
 
 ```bash
-make install
+just install
 ```
 
 This will also generate your `uv.lock` file
