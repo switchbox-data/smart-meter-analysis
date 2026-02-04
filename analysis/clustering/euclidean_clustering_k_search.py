@@ -228,7 +228,7 @@ def predict_and_write_assignments_streaming(
 
     pf = pq.ParquetFile(input_path)
     out_schema = pf.schema_arrow.append(pa.field("cluster", pa.int32()))
-    writer = pq.ParquetWriter(output_path, out_schema, compression="zstd")
+    writer = pq.ParquetWriter(output_path, out_schema, compression="snappy")
 
     k = int(model.n_clusters)
     counts = np.zeros(k, dtype=np.int64)
@@ -273,7 +273,7 @@ def plot_centroids(centroids: np.ndarray, output_path: Path) -> None:
         x = np.arange(n_timepoints)
         xlabel = "Time Interval"
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
     for i in range(k):
         ax.plot(x, centroids[i], label=f"Cluster {i}", linewidth=2)
 

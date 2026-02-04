@@ -3,7 +3,9 @@
 
 - VARIABLE_SPECS is the spec-driven registry used by census.py to decide which ACS/Decennial
   variables to request and how to engineer features.
-- STAGE2_PREDICTORS_47 is the *stable* final predictor list used by Stage 2 regression.
+- STAGE2_PREDICTORS_47 is the stable, documented predictor inventory.
+- STAGE2_PREDICTORS_MODEL_42 is the deterministic model input list after omitting one
+  reference variable per compositional share group (to ensure identifiability).
 """
 
 from __future__ import annotations
@@ -62,6 +64,80 @@ STAGE2_PREDICTORS_47: list[str] = [
     "unemployment_rate",
     "urban_percent",
 ]
+
+EXPECTED_STAGE2_PREDICTOR_COUNT = len(STAGE2_PREDICTORS_47)
+
+# -----------------------------------------------------------------------------
+# Deterministic compositional reference specification
+# -----------------------------------------------------------------------------
+# These groups contain "shares" that sum to (approximately) 100 within a block group.
+# To avoid a non-unique regression (perfect multicollinearity), we omit one reference
+# variable per group from the model input list. The omitted share is documented and
+# can be derived from the included shares:
+#   reference_share = 100 - sum(other_shares_in_group)
+STAGE2_COMPOSITION_GROUPS: list[dict[str, Any]] = [
+    {
+        "group_id": "income_3bin",
+        "group_name": "Household income distribution (3 bins)",
+        "variables": ["pct_income_under_25k", "pct_income_25k_to_75k", "pct_income_75k_plus"],
+        "reference": "pct_income_75k_plus",
+        "rationale": (
+            "Shares sum to 100; omit one bin to ensure identifiability. "
+            "Highest-income share provides a stable reference for interpreting lower/middle shares."
+        ),
+    },
+    {
+        "group_id": "tenure_2bin",
+        "group_name": "Housing tenure (occupied units)",
+        "variables": ["pct_owner_occupied", "pct_renter_occupied"],
+        "reference": "pct_owner_occupied",
+        "rationale": "Owner + renter shares sum to 100; omit owners so renter share is interpreted relative to owners.",
+    },
+    {
+        "group_id": "vintage_3bin",
+        "group_name": "Housing vintage distribution (3 bins)",
+        "variables": ["pct_housing_built_2000_plus", "pct_housing_built_1980_1999", "old_building_pct"],
+        "reference": "pct_housing_built_2000_plus",
+        "rationale": "Shares sum to 100; omit newest stock so older stock shares are interpreted relative to newer construction.",
+    },
+    {
+        "group_id": "home_value_3bin",
+        "group_name": "Owner-occupied home value distribution (3 bins)",
+        "variables": ["pct_home_value_under_150k", "pct_home_value_150k_to_299k", "pct_home_value_300k_plus"],
+        "reference": "pct_home_value_300k_plus",
+        "rationale": "Shares sum to 100; omit highest-value share so lower/middle shares are interpreted relative to highest-value homes.",
+    },
+    {
+        "group_id": "age_6bin",
+        "group_name": "Population age distribution (6 bins)",
+        "variables": [
+            "pct_population_under_5",
+            "pct_population_5_to_17",
+            "pct_population_18_to_24",
+            "pct_population_25_to_44",
+            "pct_population_45_to_64",
+            "pct_population_65_plus",
+        ],
+        "reference": "pct_population_25_to_44",
+        "rationale": "Shares sum to 100; omit 25-44 as a central working-age reference group.",
+    },
+]
+
+STAGE2_REFERENCE_PREDICTORS: set[str] = {g["reference"] for g in STAGE2_COMPOSITION_GROUPS}
+
+# Validate references exist in the 47-list (fail fast if someone edits lists incorrectly)
+_missing_refs = sorted([r for r in STAGE2_REFERENCE_PREDICTORS if r not in STAGE2_PREDICTORS_47])
+if _missing_refs:
+    raise ValueError(f"Reference predictors not found in STAGE2_PREDICTORS_47: {_missing_refs}")
+
+# Model input list: keep original order but omit references deterministically
+STAGE2_PREDICTORS_MODEL_42: list[str] = [p for p in STAGE2_PREDICTORS_47 if p not in STAGE2_REFERENCE_PREDICTORS]
+
+EXPECTED_STAGE2_MODEL_PREDICTOR_COUNT = len(STAGE2_PREDICTORS_MODEL_42)
+if EXPECTED_STAGE2_PREDICTOR_COUNT != 47:
+    raise ValueError(f"Expected 47 predictors, found {EXPECTED_STAGE2_PREDICTOR_COUNT}")
+if EXPECTED_STAGE2_MODEL_PREDICTOR_COUNT != 42:
+    raise ValueError(f"Expected 42 model predictors, found {EXPECTED_STAGE2_MODEL_PREDICTOR_COUNT}")
 
 # -----------------------------------------------------------------------------
 # Complete spec registry with ACS variable codes
@@ -172,7 +248,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_housing_built_2000_plus",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25034_002E + B25034_003E + B25034_004E + B25034_005E",  # 2000-2009, 2010-2013, 2014-2017, 2018-2020+
+        "numerator": "B25034_002E + B25034_003E + B25034_004E + B25034_005E",
         "denominator": "B25034_001E",
         "transformation": "none",
     },
@@ -180,7 +256,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_housing_built_1980_1999",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25034_006E + B25034_007E",  # 1990-1999, 1980-1989
+        "numerator": "B25034_006E + B25034_007E",
         "denominator": "B25034_001E",
         "transformation": "none",
     },
@@ -188,7 +264,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "old_building_pct",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25034_008E + B25034_009E + B25034_010E + B25034_011E",  # Pre-1980
+        "numerator": "B25034_008E + B25034_009E + B25034_010E + B25034_011E",
         "denominator": "B25034_001E",
         "transformation": "none",
     },
@@ -196,7 +272,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_single_family_detached",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_002E",  # 1-unit detached
+        "numerator": "B25024_002E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -204,7 +280,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_single_family_attached",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_003E",  # 1-unit attached
+        "numerator": "B25024_003E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -212,7 +288,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_multifamily_2_to_4",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_004E + B25024_005E",  # 2 units + 3-4 units
+        "numerator": "B25024_004E + B25024_005E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -220,7 +296,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_multifamily_5_to_19",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_006E + B25024_007E",  # 5-9 units + 10-19 units
+        "numerator": "B25024_006E + B25024_007E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -228,7 +304,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_multifamily_20_plus",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_008E + B25024_009E",  # 20-49 units + 50+ units
+        "numerator": "B25024_008E + B25024_009E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -236,7 +312,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_multifamily_10_plus",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_007E + B25024_008E + B25024_009E",  # 10-19, 20-49, 50+
+        "numerator": "B25024_007E + B25024_008E + B25024_009E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -244,7 +320,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_structure_mobile_home",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25024_010E",  # Mobile home
+        "numerator": "B25024_010E",
         "denominator": "B25024_001E",
         "transformation": "none",
     },
@@ -276,7 +352,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_rent_burden_30_plus",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25070_007E + B25070_008E + B25070_009E + B25070_010E",  # 30-34.9%, 35-39.9%, 40-49.9%, 50%+
+        "numerator": "B25070_007E + B25070_008E + B25070_009E + B25070_010E",
         "denominator": "B25070_001E",
         "transformation": "none",
     },
@@ -284,7 +360,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_rent_burden_50_plus",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25070_010E",  # 50%+
+        "numerator": "B25070_010E",
         "denominator": "B25070_001E",
         "transformation": "none",
     },
@@ -292,15 +368,15 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_owner_cost_burden_30_plus_mortgage",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25091_008E + B25091_009E + B25091_010E + B25091_011E",  # With mortgage: 30-34.9%, 35-39.9%, 40-49.9%, 50%+
-        "denominator": "B25091_002E",  # With mortgage total
+        "numerator": "B25091_008E + B25091_009E + B25091_010E + B25091_011E",
+        "denominator": "B25091_002E",
         "transformation": "none",
     },
     {
         "name": "pct_owner_cost_burden_50_plus_mortgage",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25091_011E",  # With mortgage: 50%+
+        "numerator": "B25091_011E",
         "denominator": "B25091_002E",
         "transformation": "none",
     },
@@ -308,16 +384,16 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_owner_overcrowded_2plus_per_room",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25014_007E",  # Owner: 2+ persons per room
-        "denominator": "B25014_002E",  # Owner total
+        "numerator": "B25014_007E",
+        "denominator": "B25014_002E",
         "transformation": "none",
     },
     {
         "name": "pct_renter_overcrowded_2plus_per_room",
         "category": "housing",
         "source": "acs",
-        "numerator": "B25014_013E",  # Renter: 2+ persons per room
-        "denominator": "B25014_008E",  # Renter total
+        "numerator": "B25014_013E",
+        "denominator": "B25014_008E",
         "transformation": "none",
     },
     # -------------------------------------------------------------------------
@@ -341,8 +417,8 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_single_parent_households",
         "category": "household",
         "source": "acs",
-        "numerator": "B11001_006E + B11001_007E",  # Male householder + Female householder, no spouse
-        "denominator": "B11001_001E",  # Total households
+        "numerator": "B11001_006E + B11001_007E",
+        "denominator": "B11001_001E",
         "transformation": "none",
     },
     # -------------------------------------------------------------------------
@@ -359,15 +435,15 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_female",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B01001_026E",  # Female total
-        "denominator": "B01001_001E",  # Total population
+        "numerator": "B01001_026E",
+        "denominator": "B01001_001E",
         "transformation": "none",
     },
     {
         "name": "pct_white_alone",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B03002_003E",  # White alone, not Hispanic/Latino
+        "numerator": "B03002_003E",
         "denominator": "B03002_001E",
         "transformation": "none",
     },
@@ -375,7 +451,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_black_alone",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B03002_004E",  # Black alone, not Hispanic/Latino
+        "numerator": "B03002_004E",
         "denominator": "B03002_001E",
         "transformation": "none",
     },
@@ -383,7 +459,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_asian_alone",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B03002_006E",  # Asian alone, not Hispanic/Latino
+        "numerator": "B03002_006E",
         "denominator": "B03002_001E",
         "transformation": "none",
     },
@@ -391,7 +467,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_two_or_more_races",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B03002_009E",  # Two or more races, not Hispanic/Latino
+        "numerator": "B03002_009E",
         "denominator": "B03002_001E",
         "transformation": "none",
     },
@@ -399,7 +475,7 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "pct_population_under_5",
         "category": "demographic",
         "source": "acs",
-        "numerator": "B01001_003E + B01001_027E",  # Male + Female under 5
+        "numerator": "B01001_003E + B01001_027E",
         "denominator": "B01001_001E",
         "transformation": "none",
     },
@@ -450,11 +526,8 @@ VARIABLE_SPECS: list[dict[str, Any]] = [
         "name": "urban_percent",
         "category": "spatial",
         "source": "decennial",
-        "numerator": "H2_002N",  # Urban housing units
-        "denominator": "H2_002N + H2_003N",  # Total (urban + rural)
+        "numerator": "H2_002N",
+        "denominator": "H2_002N + H2_003N",
         "transformation": "none",
     },
 ]
-
-# Optional convenience: expose the expected count
-EXPECTED_STAGE2_PREDICTOR_COUNT = len(STAGE2_PREDICTORS_47)

@@ -20,12 +20,14 @@ dependencies = [
     "boto3>=1.40.46",
     "botocore>=1.40.47",
     "cenpy>=1.0.1",
+    "git-filter-repo>=2.47.0",
     "ipykernel>=6.30.1",
     "matplotlib>=3.9.4",
     "memory-profiler>=0.61.0",
     "numpy>=2.2.6",
     "openpyxl>=3.1.5",
     "polars>=1.31.0",
+    "psutil>=7.1.3",
     "pyarrow>=14.0.0",
     "pyyaml>=6.0.3",
     "requests>=2.32.5",
@@ -44,23 +46,6 @@ Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [tool.deptry]
 exclude = ["archive", ".venv", "tests"]
-
-[tool.deptry.per_rule_ignores]
-DEP002 = [
-  "ipykernel",
-  "cenpy",
-  "openpyxl",
-  "scikit-learn",
-  "quarto",
-  "beautifulsoup4",
-  "webdriver-manager",
-  "pyarrow",
-  "memory-profiler",
-  "snakeviz",
-  "tslearn",
-]
-DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
-DEP004 = ["botocore"]
 
 [dependency-groups]
 dev = [
@@ -89,6 +74,7 @@ packages = ["smart_meter_analysis"]
 
 [tool.mypy]
 files = ["smart_meter_analysis"]
+exclude = "^(archive/|analysis/|scripts/|\\.git/|\\.venv/|__pycache__/)"
 disallow_untyped_defs = true
 disallow_any_unimported = true
 no_implicit_optional = true
@@ -99,6 +85,10 @@ show_error_codes = true
 
 [[tool.mypy.overrides]]
 module = "boto3.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -153,3 +143,6 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.format]
 preview = true
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["git-filter-repo", "statsmodels", "ipykernel", "memory-profiler", "openpyxl", "snakeviz", "tslearn"]

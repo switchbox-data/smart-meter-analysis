@@ -4,36 +4,24 @@
 # Stage 2 Multinomial Logit (Block Group): Cluster Composition ~ Census Predictors
 # =============================================================================
 #
-# What this script does (high-level)
-# ----------------------------------
-# 1) Reads household-day cluster assignments (ZIP+4 resolution) from a Parquet file.
-# 2) Aggregates these household-days into ZIP+4 × cluster counts using Arrow compute
-#    (i.e., without loading the full row-level data into memory).
-# 3) Joins ZIP+4 to Census Block Group using a crosswalk, then aggregates to
-#    Block Group × cluster counts and total household-days per Block Group.
-# 4) Joins Block Group-level census predictors (Parquet output from upstream census pipeline).
-# 5) Fits a multinomial logit model with COUNT response:
-#       Y_bg = (n_bg,clusterA, n_bg,clusterB, ..., n_bg,clusterBaseline)
-#    where cluster probabilities are modeled as a function of BG predictors.
-#
-# Why this structure
-# ------------------
-# - The regression is formulated at the Block Group level to avoid per-row modeling at the
-#   household-day level while still leveraging the full count information (multinomial likelihood).
-# - Arrow Dataset aggregation avoids memory blowups when the input Parquet is very large.
-# - Predictors are inferred from the census parquet to reduce coupling / hardcoding.
-# - VGAM is used by default because it is typically more numerically stable at large scale than
-#   nnet::multinom, but VGAM requires a full-rank design matrix; rank-deficient terms are dropped
-#   deterministically to satisfy that constraint.
+# Key principles for regulatory defensibility
+# -------------------------------------------
+# - Predictors are inferred from the census parquet to avoid fragile hard-coding.
+# - Some predictors are "shares" that sum to 100 within a group (compositional).
+#   To ensure a unique model, one pre-specified reference share per group is omitted
+#   from estimation. Omitted shares are documented explicitly in outputs.
+# - Predictors are NOT mean-centered. Optional scaling divides by SD only.
+# - If VGAM is used, any remaining rank-deficient terms are dropped deterministically.
 #
 # Outputs
 # -------
-# - regression_results.parquet: coefficient table with cluster, predictor, estimate, SE, z, p, q.
-# - regression_diagnostics.json: model fit diagnostics (LL, deviance, pseudo-R2, AIC/BIC, etc.)
-# - stage2_input_qc.json: data lineage + drop counts + inferred/used predictor lists
-# - regression_data_blockgroups_wide.parquet: the modeled BG dataset (counts + predictors)
-# - stage2_manifest.json: paths of all outputs
-# - stage2_metadata.json: runtime + package versions (provenance)
+# - regression_results.parquet
+# - regression_diagnostics.json
+# - stage2_input_qc.json
+# - regression_data_blockgroups_wide.parquet
+# - omitted_predictors.parquet   <-- NEW: documents reference omissions + rank drops
+# - stage2_manifest.json
+# - stage2_metadata.json
 #
 # =============================================================================
 
@@ -41,9 +29,6 @@
 # -----------------------------
 # CLI args (no external deps)
 # -----------------------------
-# Notes:
-# - Avoids argparse-style dependencies in R, keeping the script self-contained.
-# - Supports both "--flag value" and "--flag=value".
 print_help_and_exit <- function(exit_code = 0) {
   cat(
     paste0(
@@ -59,24 +44,17 @@ print_help_and_exit <- function(exit_code = 0) {
       "  --baseline-cluster K           Baseline cluster label (default: choose most frequent)\n",
       "  --min-obs-per-bg N             Drop BGs with total household-days < N (default: 50)\n",
       "  --allow-missing-predictors 0|1 If 0, abort if predictor NA would drop any BGs (default: 0)\n",
-      "  --standardize 0|1              Z-score standardize predictors (default: 0)\n",
+      "  --standardize 0|1              If 1, divide predictors by SD (NO mean-centering) (default: 0)\n",
       "  --use-vgam 0|1                 Use VGAM::vglm() (IRLS) instead of nnet::multinom (default: 1)\n",
       "  --verbose 0|1                  Verbose logging (default: 1)\n",
       "  --no-emoji 0|1                 Disable unicode icons (default: 0)\n",
       "  --help                         Print this help and exit\n\n",
       "Notes:\n",
       "  - Predictors are inferred from the census parquet columns.\n",
+      "  - Some predictors are compositional shares; one reference share per group is omitted\n",
+      "    deterministically and documented in omitted_predictors.parquet.\n",
       "  - Model uses COUNT response: cbind(count_clusterA, count_clusterB, ...)\n",
-      "  - Zeros are handled naturally by the multinomial likelihood; no smoothing is applied.\n",
-      "  - Standardization (--standardize=1) is STRONGLY RECOMMENDED for numerical stability.\n",
-      "  - VGAM requires a full-rank design matrix; this script drops rank-deficient terms deterministically.\n",
-      "  - Outputs written under out-dir:\n",
-      "      regression_results.parquet\n",
-      "      regression_diagnostics.json\n",
-      "      stage2_input_qc.json\n",
-      "      regression_data_blockgroups_wide.parquet\n",
-      "      stage2_manifest.json\n",
-      "      stage2_metadata.json\n\n"
+      "  - Zeros are handled naturally by the multinomial likelihood; no smoothing is applied.\n\n"
     )
   )
   quit(status = exit_code)
@@ -134,12 +112,6 @@ if (is.null(CLUSTERS_PATH) || is.null(CROSSWALK_PATH) || is.null(CENSUS_PATH) ||
 # -----------------------------
 # Deps
 # -----------------------------
-# The approach uses:
-# - arrow: efficient parquet I/O and dataset aggregation
-# - dplyr/tibble: data manipulation
-# - jsonlite: writing QC/diagnostics
-# - nnet: fallback multinomial logit solver
-# - VGAM: default multinomial logit solver for stability (full-rank requirement)
 require_pkg <- function(pkg) requireNamespace(pkg, quietly = TRUE)
 
 if (!require_pkg("arrow")) stopf("Missing R package 'arrow'. Install with: install.packages('arrow')")
@@ -177,12 +149,71 @@ t_total_start <- Sys.time()
 
 
 # -----------------------------
+# Reference-category specification (deterministic omissions)
+# -----------------------------
+REFERENCE_GROUPS <- list(
+  list(
+    group_id = "income_3bin",
+    group_name = "Household income distribution (3 bins)",
+    variables = c("pct_income_under_25k", "pct_income_25k_to_75k", "pct_income_75k_plus"),
+    reference = "pct_income_75k_plus",
+    rationale = "Shares sum to 100; omit one bin to ensure a unique model. Highest-income share is a stable reference for policy interpretation."
+  ),
+  list(
+    group_id = "tenure_2bin",
+    group_name = "Housing tenure (occupied units)",
+    variables = c("pct_owner_occupied", "pct_renter_occupied"),
+    reference = "pct_owner_occupied",
+    rationale = "Owner + renter shares sum to 100; omit owners so renter share is interpreted relative to owners."
+  ),
+  list(
+    group_id = "vintage_3bin",
+    group_name = "Housing vintage distribution (3 bins)",
+    variables = c("pct_housing_built_2000_plus", "pct_housing_built_1980_1999", "old_building_pct"),
+    reference = "pct_housing_built_2000_plus",
+    rationale = "Shares sum to 100; omit newest stock so older stock shares are interpreted relative to newer construction."
+  ),
+  list(
+    group_id = "home_value_3bin",
+    group_name = "Owner-occupied home value distribution (3 bins)",
+    variables = c("pct_home_value_under_150k", "pct_home_value_150k_to_299k", "pct_home_value_300k_plus"),
+    reference = "pct_home_value_300k_plus",
+    rationale = "Shares sum to 100; omit highest-value share so lower/middle value shares are interpreted relative to highest-value homes."
+  ),
+  list(
+    group_id = "age_6bin",
+    group_name = "Population age distribution (6 bins)",
+    variables = c(
+      "pct_population_under_5", "pct_population_5_to_17", "pct_population_18_to_24",
+      "pct_population_25_to_44", "pct_population_45_to_64", "pct_population_65_plus"
+    ),
+    reference = "pct_population_25_to_44",
+    rationale = "Shares sum to 100; omit 25–44 as a central working-age reference group."
+  )
+)
+
+REFERENCE_VARS <- unique(vapply(REFERENCE_GROUPS, function(g) g$reference, character(1)))
+
+implied_definitions <- lapply(REFERENCE_GROUPS, function(g) {
+  incl <- setdiff(g$variables, g$reference)
+  list(
+    group_id = g$group_id,
+    group_name = g$group_name,
+    reference = g$reference,
+    implied_as = paste0(g$reference, " = 100 - (", paste(incl, collapse = " + "), ")")
+  )
+})
+
+REFERENCE_CAVEAT <- paste(
+  "Some predictors are shares that sum to 100 within a group (compositional).",
+  "To ensure a unique multinomial logit model, one pre-specified reference share per group is omitted from estimation.",
+  "The omitted share is not independently estimated; it is implied by the included shares via the identity in the diagnostics."
+)
+
+
+# -----------------------------
 # Helpers: keys + inference
 # -----------------------------
-# ZIP+4 normalization:
-# - Cluster parquet uses "zip_code" which can appear as:
-#   - "60601-1234" or "606011234" or other string forms.
-# - Crosswalk expects Zip + Zip4 columns; we standardize to "#####-####".
 normalize_zip4 <- function(x) {
   s <- as.character(x)
   s <- trimws(s)
@@ -193,7 +224,6 @@ normalize_zip4 <- function(x) {
   out
 }
 
-# Ensure Zip4 is exactly 4 digits, leading zeros preserved.
 zfill4 <- function(x) {
   s <- as.character(x)
   s <- trimws(s)
@@ -203,8 +233,6 @@ zfill4 <- function(x) {
   s
 }
 
-# Census GEOID column inference:
-# - Upstream data may name the key GEOID, CensusKey2023, CensusKey2020, etc.
 infer_geoid_col <- function(df) {
   nms <- names(df)
   low <- tolower(nms)
@@ -214,10 +242,6 @@ infer_geoid_col <- function(df) {
   NULL
 }
 
-# Predictor inference:
-# - Uses numeric/integer/logical columns as candidate predictors.
-# - Excludes id-like columns (GEOID/NAME + the inferred geoid key).
-# - Drops columns that are entirely NA.
 infer_predictors <- function(census_df) {
   geoid_col <- infer_geoid_col(census_df)
   if (is.null(geoid_col)) {
@@ -240,16 +264,6 @@ infer_predictors <- function(census_df) {
   list(geoid_col = geoid_col, predictors = preds, dropped_all_na = all_na)
 }
 
-# Rank-deficiency handling for VGAM:
-# - VGAM::vglm(multinomial()) requires a full-rank model matrix.
-# - We build a standard model.matrix with intercept and remove:
-#   (a) constant columns (excluding intercept)
-#   (b) columns beyond QR rank using pivot ordering
-#
-# Note: This is deterministic and reproducible, but may drop terms that are
-# substantively meaningful if predictors are highly collinear. Treat as a
-# pragmatic requirement for full-rank MLE and revisit for a more principled
-# approach if needed.
 drop_rank_deficient_terms <- function(model_df, predictors) {
   ftmp <- stats::as.formula(paste0("~ ", paste(predictors, collapse = " + ")))
   Xmm <- stats::model.matrix(ftmp, data = model_df)
@@ -311,9 +325,6 @@ drop_rank_deficient_terms <- function(model_df, predictors) {
 # -----------------------------
 # Read + aggregate clusters (memory-safe)
 # -----------------------------
-# Key point:
-# - We do not read the full household-day dataset into memory.
-# - Instead we open it as an Arrow dataset and aggregate "zip_code × cluster" counts.
 if (!file.exists(CLUSTERS_PATH)) stopf("Clusters parquet not found: %s", CLUSTERS_PATH)
 if (!file.exists(CROSSWALK_PATH)) stopf("Crosswalk file not found: %s", CROSSWALK_PATH)
 if (!file.exists(CENSUS_PATH)) stopf("Census predictors parquet not found: %s", CENSUS_PATH)
@@ -333,11 +344,6 @@ zip_cluster_counts <- clusters_ds %>%
   dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
   dplyr::collect()
 
-if (!("zip_code" %in% names(zip_cluster_counts))) stopf("Clusters parquet must include column 'zip_code'")
-if (!("cluster" %in% names(zip_cluster_counts))) stopf("Clusters parquet must include column 'cluster'")
-if (!("n" %in% names(zip_cluster_counts))) stopf("Internal error: missing 'n' after aggregation")
-
-# Normalize and sanitize types
 zip_cluster_counts <- zip_cluster_counts %>%
   dplyr::mutate(
     zip4 = normalize_zip4(zip_code),
@@ -353,14 +359,6 @@ household_day_rows_total <- sum(zip_cluster_counts$n, na.rm = TRUE)
 # -----------------------------
 # Read crosswalk
 # -----------------------------
-# Crosswalk requirements:
-# - Must include Zip, Zip4, and CensusKey2023 (or equivalent).
-# - We standardize to "zip4" = "#####-####" and "block_group_geoid" = 12-char BG GEOID.
-#
-# Design choice:
-# - If multiple BGs map to the same ZIP+4, we deterministically pick the first after sorting.
-#   This enforces a single mapping and avoids row inflation, but it should be reviewed for whether
-#   a probabilistic or fractional allocation is preferable.
 logi("%s Reading crosswalk: %s", IC$ok, CROSSWALK_PATH)
 
 cw_tbl <- tryCatch(
@@ -403,7 +401,6 @@ cw <- cw %>%
 
 if (nrow(cw) == 0) stopf("Crosswalk produced 0 usable rows after cleaning/filtering.")
 
-# Deterministic one-to-one ZIP+4 → BG mapping
 cw <- cw %>%
   dplyr::arrange(zip4, block_group_geoid) %>%
   dplyr::group_by(zip4) %>%
@@ -417,10 +414,6 @@ if (nrow(dup_zip4) > 0) stopf("Crosswalk still has non-unique zip4 after determi
 # -----------------------------
 # Join + aggregate to BG counts
 # -----------------------------
-# After joining the crosswalk, we can compute:
-# - BG×cluster counts
-# - BG total household-days
-# and optionally drop BGs with too few observations (min_obs_per_bg).
 logi("%s Joining ZIP+4×cluster counts to crosswalk...", IC$ok)
 
 clusters2 <- zip_cluster_counts %>%
@@ -445,7 +438,6 @@ total_by_bg <- clusters2 %>%
 clusters_observed <- sort(unique(bg_counts$cluster))
 if (length(clusters_observed) < 2) stopf("Need at least 2 clusters observed after aggregation; found: %s", paste(clusters_observed, collapse = ","))
 
-# Wide BG frame: GEOID + total + one column per cluster count
 bg_wide <- total_by_bg %>% dplyr::rename(GEOID = block_group_geoid)
 
 for (k in clusters_observed) {
@@ -460,11 +452,9 @@ for (k in clusters_observed) {
     dplyr::select(-n)
 }
 
-# Observation floor: avoids fragile inference for tiny BG totals.
 bg_wide <- bg_wide %>% dplyr::filter(total_household_days >= as.integer(MIN_OBS_PER_BG))
 if (nrow(bg_wide) == 0) stopf("No block groups remain after --min-obs-per-bg filtering (N=%d).", MIN_OBS_PER_BG)
 
-# Zero count diagnostic: proportion of BGs with zero count in each cluster column.
 zero_stats <- list()
 for (k in clusters_observed) {
   colname <- paste0("cluster_", k)
@@ -479,31 +469,26 @@ for (k in clusters_observed) {
 # -----------------------------
 # Read census predictors + infer predictors
 # -----------------------------
-# This step establishes the modeling covariate set at the BG level.
-# Predictors are inferred (numeric/integer/logical columns) rather than hard-coded.
 logi("%s Reading census predictors: %s", IC$ok, CENSUS_PATH)
 
 census <- arrow::read_parquet(CENSUS_PATH, as_data_frame = TRUE)
 inf <- infer_predictors(census)
 CENSUS_GEOID_COL <- inf$geoid_col
-PREDICTORS <- inf$predictors
+PREDICTORS_RAW <- inf$predictors
 DROPPED_ALL_NA <- inf$dropped_all_na
 
-if (length(PREDICTORS) == 0) stopf("No usable numeric predictors inferred from census parquet.")
+if (length(PREDICTORS_RAW) == 0) stopf("No usable numeric predictors inferred from census parquet.")
 
-# Deduplicate by GEOID defensively; keep only inferred predictors.
 census <- census %>%
   dplyr::mutate(GEOID = as.character(.data[[CENSUS_GEOID_COL]])) %>%
-  dplyr::select(GEOID, dplyr::any_of(PREDICTORS)) %>%
+  dplyr::select(GEOID, dplyr::any_of(PREDICTORS_RAW)) %>%
   dplyr::distinct(GEOID, .keep_all = TRUE)
 
 logi("%s Joining census predictors to BG counts...", IC$ok)
 bg_model <- bg_wide %>% dplyr::inner_join(census, by = "GEOID")
 
-# Missing predictor handling:
-# - If allow_missing_predictors=0: fail fast if any BG would be dropped by NA.
-# - If allow_missing_predictors=1: drop incomplete BGs (complete-case analysis).
-pred_mat <- bg_model %>% dplyr::select(dplyr::any_of(PREDICTORS))
+# Missing predictor handling
+pred_mat <- bg_model %>% dplyr::select(dplyr::any_of(PREDICTORS_RAW))
 any_na <- apply(is.na(pred_mat), 1, any)
 
 drop_missing_pred_bg <- sum(any_na)
@@ -522,17 +507,26 @@ if (nrow(bg_model) == 0) stopf("No block groups remain after predictor missingne
 
 
 # -----------------------------
-# Optional: standardize predictors (z-score)
+# Deterministic reference-variable omission (if present)
 # -----------------------------
-# Rationale:
-# - Improves numerical conditioning for optimization / IRLS.
-# - Makes coefficients more comparable (effect per 1 SD change).
-# - Retains original scale parameters in scaling_info for provenance.
+omit_refs_present <- intersect(REFERENCE_VARS, PREDICTORS_RAW)
+PREDICTORS <- setdiff(PREDICTORS_RAW, omit_refs_present)
+
+if (length(omit_refs_present) > 0) {
+  logi("%s Omitted %d reference-share predictor(s): %s", IC$warn, length(omit_refs_present), paste(omit_refs_present, collapse = ", "))
+}
+
+if (length(PREDICTORS) == 0) stopf("No predictors remain after reference omissions.")
+
+
+# -----------------------------
+# Optional: scale by SD only (NO mean-centering)
+# -----------------------------
 scaling_info <- NULL
 zero_var_predictors <- character(0)
 
 if (STANDARDIZE == 1L) {
-  logi("%s Standardizing %d predictors (z-score: mean=0, sd=1)...", IC$ok, length(PREDICTORS))
+  logi("%s Scaling %d predictors by SD only (no mean-centering)...", IC$ok, length(PREDICTORS))
   scaling_info <- list()
 
   for (col in PREDICTORS) {
@@ -540,16 +534,14 @@ if (STANDARDIZE == 1L) {
     x <- bg_model[[col]]
     if (is.logical(x)) x <- as.numeric(x)
 
-    mu <- mean(x, na.rm = TRUE)
     sigma <- stats::sd(x, na.rm = TRUE)
-    scaling_info[[col]] <- list(mean = as.numeric(mu), sd = as.numeric(sigma))
+    scaling_info[[col]] <- list(sd = as.numeric(sigma), centered = FALSE)
 
     if (is.finite(sigma) && sigma > 1e-10) {
-      bg_model[[col]] <- (x - mu) / sigma
+      bg_model[[col]] <- x / sigma
     } else {
-      # Retain original scale if SD ~ 0; keep a list for QC outputs.
       zero_var_predictors <- c(zero_var_predictors, col)
-      cat(sprintf("%s Predictor '%s' has ~zero variance; not standardized.\n", IC$warn, col))
+      cat(sprintf("%s Predictor '%s' has ~zero variance; not scaled.\n", IC$warn, col))
       bg_model[[col]] <- x
     }
   }
@@ -559,11 +551,6 @@ if (STANDARDIZE == 1L) {
 # -----------------------------
 # Choose baseline + response matrix
 # -----------------------------
-# The response is a matrix of counts per BG across clusters:
-# - Columns are ordered so the baseline cluster is last, matching the refLevel config for VGAM.
-# - Baseline selection:
-#   - If user specifies --baseline-cluster, use it.
-#   - Otherwise choose the most frequent cluster by total count.
 resp_cols <- paste0("cluster_", clusters_observed)
 resp_cols <- resp_cols[resp_cols %in% names(bg_model)]
 if (length(resp_cols) < 2) stopf("Need >=2 cluster count columns; found: %s", paste(resp_cols, collapse = ","))
@@ -586,7 +573,6 @@ if (!paste0("cluster_", baseline_cluster) %in% resp_cols) {
 resp_cols_ordered <- c(setdiff(resp_cols, paste0("cluster_", baseline_cluster)), paste0("cluster_", baseline_cluster))
 Y <- as.matrix(bg_model[, resp_cols_ordered, drop = FALSE])
 
-# Basic response validation
 if (any(is.na(Y))) stopf("NA values detected in response matrix.")
 if (any(Y < 0, na.rm = TRUE)) stopf("Negative counts detected in response matrix.")
 rs <- rowSums(Y)
@@ -595,13 +581,9 @@ if (any(rs <= 0, na.rm = TRUE)) {
   stopf("Block groups with non-positive total counts. Example row indices: %s", paste(head(bad_rows, 10), collapse = ", "))
 }
 
-# Model frame for fitting
 model_df <- bg_model[, c("GEOID", "total_household_days", PREDICTORS), drop = FALSE]
 model_df$Y <- I(Y)
 
-# Map “equations” to cluster labels:
-# - Multinomial logit has one linear predictor per non-baseline outcome.
-# - Here, eq index i corresponds to nonbase_clusters[i].
 nonbase_cols <- resp_cols_ordered[resp_cols_ordered != paste0("cluster_", baseline_cluster)]
 nonbase_clusters <- as.integer(sub("^cluster_", "", nonbase_cols))
 
@@ -620,21 +602,16 @@ if (USE_VGAM == 1L) {
   design_rank <- as.integer(rk$rank)
   design_ncol <- as.integer(rk$ncol_design)
 
-  # Rebuild with kept predictors only
   model_df <- bg_model[, c("GEOID", "total_household_days", PREDICTORS), drop = FALSE]
   model_df$Y <- I(Y)
 }
+
+if (length(PREDICTORS) == 0) stopf("No predictors remain after rank-deficiency handling.")
 
 
 # -----------------------------
 # Fit model
 # -----------------------------
-# Model form:
-#   Y ~ X1 + X2 + ... + Xp
-#
-# For VGAM::vglm:
-# - family = multinomial(refLevel = K) where K is the last column (baseline).
-# - IRLS typically handles scale better than nnet::multinom in large-count settings.
 logi(
   "%s Fitting multinomial logit (counts) with %d BGs, %d predictors, %d clusters (baseline=%d)...",
   IC$ok, nrow(model_df), length(PREDICTORS), length(resp_cols_ordered), baseline_cluster
@@ -658,7 +635,6 @@ if (USE_VGAM == 1L) {
     error = function(e) stopf("Model fit failed (VGAM::vglm): %s", e$message)
   )
 
-  # Null model (intercept-only): provides baseline for pseudo-R2 and deviance comparisons
   fit0 <- tryCatch(
     withCallingHandlers(
       VGAM::vglm(Y ~ 1, family = VGAM::multinomial(refLevel = length(resp_cols_ordered)), data = model_df),
@@ -692,10 +668,6 @@ logi("%s Model fit completed in %.1f seconds", IC$ok, fit_duration)
 # -----------------------------
 # Convergence heuristics
 # -----------------------------
-# Approach:
-# - Primary: check warnings that suggest iteration/step issues.
-# - Secondary: compare deviance_full vs deviance_null; if too close, signal weak fit or instability.
-# Note: VGAM is S4; we avoid `$iter` or similar direct slot assumptions here.
 convergence_ok <- TRUE
 convergence_message <- "Model converged successfully"
 
@@ -733,42 +705,8 @@ if (is.finite(deviance_ratio) && deviance_ratio > 0.95) {
 
 
 # -----------------------------
-# Correlations (diagnostic)
-# -----------------------------
-# This is a quick heuristic to identify predictors correlated with observed cluster proportions.
-# It is not used for modeling; it is logged for reviewer sanity-checking and interpretation guidance.
-if (all(c("cluster_0", "cluster_1", "cluster_3") %in% names(bg_model))) {
-  bg_tmp <- bg_model %>%
-    dplyr::mutate(
-      prop_cluster_0 = cluster_0 / total_household_days,
-      prop_cluster_1 = cluster_1 / total_household_days,
-      prop_cluster_3 = cluster_3 / total_household_days
-    )
-
-  cor_matrix <- tryCatch(
-    stats::cor(
-      bg_tmp[, PREDICTORS, drop = FALSE],
-      bg_tmp[, c("prop_cluster_0", "prop_cluster_1", "prop_cluster_3"), drop = FALSE],
-      use = "complete.obs"
-    ),
-    error = function(e) NULL
-  )
-
-  if (!is.null(cor_matrix)) {
-    strong_cors <- apply(abs(cor_matrix), 1, max)
-    cat("\nPredictors with |correlation| > 0.1 to any cluster proportion:\n")
-    print(sort(strong_cors[strong_cors > 0.1], decreasing = TRUE))
-  }
-}
-
-
-# -----------------------------
 # Core stats
 # -----------------------------
-# McFadden pseudo-R2:
-#   1 - (LL_full / LL_null)
-# Interpreted as improvement over intercept-only baseline on the log-likelihood scale.
-# Not directly comparable to OLS R^2; treat as a relative fit measure.
 ll_full <- as.numeric(stats::logLik(fit))
 ll_null <- as.numeric(stats::logLik(fit0))
 pseudo_r2 <- 1.0 - (ll_full / ll_null)
@@ -777,15 +715,6 @@ pseudo_r2 <- 1.0 - (ll_full / ll_null)
 # -----------------------------
 # Coefficients table (nnet + VGAM) -> ALWAYS returns 'cluster'
 # -----------------------------
-# This function normalizes output format across engines:
-# - Each row: (cluster, predictor, coefficient, std_err, z_stat, p_value)
-# - cluster indicates the non-baseline outcome corresponding to the equation.
-#
-# For VGAM:
-# - We use vcov(fit) for SEs and align by exact coefficient names.
-# - We robustly parse equation indices from coefficient naming conventions:
-#     A) "term:1" style
-#     B) "log(mu[,1]/mu[,K]):term" style
 extract_coef_table <- function(fit_obj, nonbase_clusters) {
   if (inherits(fit_obj, "multinom")) {
     coefs <- summary(fit_obj)$coefficients
@@ -841,7 +770,6 @@ extract_coef_table <- function(fit_obj, nonbase_clusters) {
       eq <- rep(NA_integer_, length(nm_vec))
       term <- rep(NA_character_, length(nm_vec))
 
-      # A) "term:1"
       m_a <- regexec("^(.*):([0-9]+)$", nm_vec)
       r_a <- regmatches(nm_vec, m_a)
       has_a <- lengths(r_a) == 3
@@ -850,7 +778,6 @@ extract_coef_table <- function(fit_obj, nonbase_clusters) {
         eq[has_a] <- suppressWarnings(as.integer(vapply(r_a[has_a], function(x) x[[3]], character(1))))
       }
 
-      # B) "log(mu[,k]/mu[,K]):term"
       need_b <- !has_a
       if (any(need_b)) {
         nm_b <- nm_vec[need_b]
@@ -898,9 +825,6 @@ extract_coef_table <- function(fit_obj, nonbase_clusters) {
 
 res_tbl <- extract_coef_table(fit, nonbase_clusters)
 
-# Multiple testing control:
-# - BH q-values computed within each cluster equation (i.e., within each non-baseline outcome),
-#   which is a sensible default for “per-equation” screening.
 res_tbl <- res_tbl %>%
   dplyr::group_by(cluster) %>%
   dplyr::mutate(q_value = p.adjust(p_value, method = "BH")) %>%
@@ -918,11 +842,38 @@ res_tbl <- res_tbl %>%
 # -----------------------------
 # QC + metadata outputs
 # -----------------------------
-# This section writes:
-# - input_qc: what was dropped and why; predictor inference outcomes; configuration
-# - diag: fit diagnostics and cluster marginals
-# - manifest: file path registry for downstream automation
 household_day_rows_modeled <- sum(bg_model$total_household_days, na.rm = TRUE)
+
+# New omitted predictors artifact (reference omissions + rank drops)
+omitted_tbl <- tibble::tibble(
+  predictor = c(omit_refs_present, dropped_predictors_rank),
+  reason = c(
+    rep("omitted_reference_share", length(omit_refs_present)),
+    rep("dropped_rank_deficient", length(dropped_predictors_rank))
+  )
+) %>%
+  dplyr::mutate(
+    caveat = dplyr::case_when(
+      reason == "omitted_reference_share" ~ REFERENCE_CAVEAT,
+      TRUE ~ "Dropped because the fitted design matrix was not full rank (VGAM full-rank requirement)."
+    )
+  )
+
+# Add group metadata for reference omissions
+if (nrow(omitted_tbl) > 0) {
+  ref_map <- do.call(rbind.data.frame, lapply(REFERENCE_GROUPS, function(g) {
+    data.frame(
+      predictor = g$reference,
+      group_id = g$group_id,
+      group_name = g$group_name,
+      implied_definition = implied_definitions[[which(vapply(implied_definitions, function(x) x$group_id, character(1)) == g$group_id)[1]]]$implied_as,
+      rationale = g$rationale,
+      stringsAsFactors = FALSE
+    )
+  }))
+  omitted_tbl <- omitted_tbl %>%
+    dplyr::left_join(ref_map, by = "predictor")
+}
 
 input_qc <- list(
   inputs = list(
@@ -934,7 +885,15 @@ input_qc <- list(
     "Predictors are inferred from the census parquet columns (numeric/logical), excluding GEOID/NAME.",
     "Counts are computed memory-safely using Arrow Dataset aggregation; the full household-day parquet is not read into RAM.",
     "Zero counts are expected in BG×cluster composition; multinomial likelihood handles zeros naturally (no smoothing/alpha).",
-    "If VGAM is used, rank-deficient predictors are dropped to satisfy full-rank design requirement."
+    "Reference-share variables (compositional groups) are omitted deterministically when present to ensure identifiability.",
+    "If VGAM is used, remaining rank-deficient predictors are dropped deterministically to satisfy full-rank design requirement."
+  ),
+  reference_categories = list(
+    reference_groups = REFERENCE_GROUPS,
+    reference_variables = REFERENCE_VARS,
+    reference_variables_present_in_input = omit_refs_present,
+    implied_definitions = implied_definitions,
+    caveat = REFERENCE_CAVEAT
   ),
   counts = list(
     household_day_rows_total_after_basic_filter = as.integer(household_day_rows_total),
@@ -950,9 +909,10 @@ input_qc <- list(
     geoid_column = CENSUS_GEOID_COL,
     predictors_inferred = inf$predictors,
     predictors_used = PREDICTORS,
+    predictors_omitted_reference_share = omit_refs_present,
     predictors_dropped_all_na = DROPPED_ALL_NA,
     predictors_dropped_rank_deficient = dropped_predictors_rank,
-    predictors_zero_variance_not_standardized = zero_var_predictors
+    predictors_zero_variance_not_scaled = zero_var_predictors
   ),
   model = list(
     clusters_observed = as.integer(clusters_observed),
@@ -998,6 +958,17 @@ diag <- list(
     clusters_observed = as.integer(clusters_observed),
     baseline_cluster = as.integer(baseline_cluster)
   ),
+  reference_categories = list(
+    reference_groups = REFERENCE_GROUPS,
+    reference_variables = REFERENCE_VARS,
+    reference_variables_present_in_input = omit_refs_present,
+    implied_definitions = implied_definitions,
+    caveat = REFERENCE_CAVEAT
+  ),
+  omitted_predictors_summary = list(
+    n_omitted_reference_share = as.integer(length(omit_refs_present)),
+    n_dropped_rank_deficient = as.integer(length(dropped_predictors_rank))
+  ),
   cluster_marginal_distributions = lapply(names(cluster_totals), function(cn) {
     k <- as.integer(sub("^cluster_", "", cn))
     list(cluster = k, household_days = as.integer(cluster_totals[[cn]]), proportion = as.numeric(cluster_props[[cn]]))
@@ -1011,6 +982,7 @@ manifest <- list(
     regression_diagnostics = file.path(OUT_DIR, "regression_diagnostics.json"),
     stage2_input_qc = file.path(OUT_DIR, "stage2_input_qc.json"),
     regression_data_blockgroups_wide = file.path(OUT_DIR, "regression_data_blockgroups_wide.parquet"),
+    omitted_predictors = file.path(OUT_DIR, "omitted_predictors.parquet"),
     stage2_manifest = file.path(OUT_DIR, "stage2_manifest.json"),
     stage2_metadata = file.path(OUT_DIR, "stage2_metadata.json")
   )
@@ -1020,6 +992,7 @@ logi("%s Writing outputs to: %s", IC$ok, OUT_DIR)
 
 arrow::write_parquet(res_tbl, file.path(OUT_DIR, "regression_results.parquet"))
 arrow::write_parquet(bg_model, file.path(OUT_DIR, "regression_data_blockgroups_wide.parquet"))
+arrow::write_parquet(omitted_tbl, file.path(OUT_DIR, "omitted_predictors.parquet"))
 safe_write_json(diag, file.path(OUT_DIR, "regression_diagnostics.json"))
 safe_write_json(input_qc, file.path(OUT_DIR, "stage2_input_qc.json"))
 safe_write_json(manifest, file.path(OUT_DIR, "stage2_manifest.json"))
@@ -1047,6 +1020,8 @@ cat(sprintf("%s Stage 2 multinomial logit complete.\n", IC$ok))
 cat(sprintf("  Block Groups (modeled): %d\n", nrow(bg_model)))
 cat(sprintf("  Household-days (modeled): %s\n", format(household_day_rows_modeled, big.mark = ",")))
 cat(sprintf("  Predictors (used): %d\n", length(PREDICTORS)))
+cat(sprintf("  Omitted reference predictors (present): %d\n", length(omit_refs_present)))
+cat(sprintf("  Rank-deficient predictors dropped: %d\n", length(dropped_predictors_rank)))
 cat(sprintf("  Pseudo R^2 (McFadden): %.4f\n", pseudo_r2))
 cat(sprintf("  Converged: %s\n", ifelse(convergence_ok, "true", "false")))
 cat("\n")
