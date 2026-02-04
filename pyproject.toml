@@ -60,6 +60,8 @@ DEP002 = [
   "memory-profiler",
   "snakeviz",
   "tslearn",
+  "s3fs",
+  "statsmodels",
 ]
 DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
 DEP004 = ["botocore"]
@@ -113,6 +115,31 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "polars.*"
+ignore_missing_imports = true
+
+# Modules using polars (no stubs) or other untyped deps; allow Any from unfollowed imports
+[[tool.mypy.overrides]]
+module = ["smart_meter_analysis.wide_to_long", "smart_meter_analysis.transformation", "smart_meter_analysis.pipeline_validator", "smart_meter_analysis.census"]
+disallow_any_unimported = false
+
+[[tool.mypy.overrides]]
+module = "cenpy"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "smart_meter_analysis.census"
+disable_error_code = ["import-untyped", "import-not-found", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = "smart_meter_analysis.config"
+disable_error_code = ["import-untyped"]
+
+[[tool.mypy.overrides]]
+module = "smart_meter_analysis.manifests"
+disable_error_code = ["no-any-return"]
+
+[[tool.mypy.overrides]]
+module = "botocore.exceptions"
 ignore_missing_imports = true
 
 
