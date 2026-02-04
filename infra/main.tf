@@ -144,12 +144,18 @@ resource "aws_iam_role_policy" "s3_access" {
           "s3:DeleteObject",
           "s3:ListBucket"
         ]
-        Resource = [
-          "arn:aws:s3:::${var.s3_bucket_name}",
-          "arn:aws:s3:::${var.s3_bucket_name}/*",
-          "arn:aws:s3:::smart-meter-data-sb",
-          "arn:aws:s3:::smart-meter-data-sb/*"
-        ]
+        Resource = concat(
+          [
+            "arn:aws:s3:::${var.s3_bucket_name}",
+            "arn:aws:s3:::${var.s3_bucket_name}/*"
+          ],
+          flatten([
+            for bucket in var.additional_s3_buckets : [
+              "arn:aws:s3:::${bucket}",
+              "arn:aws:s3:::${bucket}/*"
+            ]
+          ])
+        )
       }
     ]
   })

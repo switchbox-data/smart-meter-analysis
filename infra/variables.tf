@@ -52,6 +52,12 @@ variable "s3_mount_path" {
   default     = "/data.sb"
 }
 
+variable "additional_s3_buckets" {
+  description = "Additional S3 buckets that the instance needs access to (beyond the mounted bucket)"
+  type        = list(string)
+  default     = ["smart-meter-data-sb"]
+}
+
 variable "project_name" {
   description = "Name prefix for resources"
   type        = string
