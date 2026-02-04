@@ -146,7 +146,9 @@ resource "aws_iam_role_policy" "s3_access" {
         ]
         Resource = [
           "arn:aws:s3:::${var.s3_bucket_name}",
-          "arn:aws:s3:::${var.s3_bucket_name}/*"
+          "arn:aws:s3:::${var.s3_bucket_name}/*",
+          "arn:aws:s3:::smart-meter-data-sb",
+          "arn:aws:s3:::smart-meter-data-sb/*"
         ]
       }
     ]
