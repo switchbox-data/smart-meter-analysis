@@ -10,8 +10,11 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import polars as pl
+
+JsonDict = dict[str, Any]
 
 """
 Month-output Validator (QA + determinism + contract enforcement) for ComEd CSV→Parquet migration.
@@ -327,6 +330,49 @@ def _validate_dst_option_b_partition(part: Partition, files: Sequence[Path]) -> 
         )
 
 
+def _validate_no_duplicates_file(path: Path) -> int:
+    """Check for duplicate (zip_code, account_identifier, datetime) within a single parquet file.
+
+    Returns the row count for the file (used by row-count sanity reporting).
+    Raises ValueError if duplicates are found.
+    """
+    lf = pl.scan_parquet(str(path))
+    stats = lf.select([
+        pl.len().alias("total_rows"),
+        pl.struct(["zip_code", "account_identifier", "datetime"]).n_unique().alias("unique_keys"),
+    ])
+    try:
+        row = stats.collect(streaming=True).row(0)
+    except Exception as e:
+        _fail(f"Failed to collect duplicate-check stats for {path}: {e}")
+
+    total_rows, unique_keys = row
+    if total_rows == 0:
+        _fail(f"Empty parquet file (0 rows): {path}")
+
+    if unique_keys < total_rows:
+        n_dups = total_rows - unique_keys
+        # Grab a small sample of duplicate keys for diagnostics.
+        dup_sample = (
+            lf.group_by(["zip_code", "account_identifier", "datetime"])
+            .agg(pl.len().alias("cnt"))
+            .filter(pl.col("cnt") > 1)
+            .sort("cnt", descending=True)
+            .head(5)
+        )
+        try:
+            sample_dicts = dup_sample.collect(streaming=True).to_dicts()
+        except Exception:
+            sample_dicts = []
+        _fail(
+            f"Duplicate (zip_code, account_identifier, datetime) rows in {path}: "
+            f"total_rows={total_rows}, unique_keys={unique_keys}, duplicates={n_dups}. "
+            f"Top duplicates (up to 5): {sample_dicts}"
+        )
+
+    return int(total_rows)
+
+
 def _composite_key_expr() -> pl.Expr:
     # Build a lexicographically comparable composite key without sorting.
     # datetime is included via cast to UTF-8 (stable ordering for ISO-like timestamp representation in Polars).
@@ -547,6 +593,128 @@ def _compare_roots(root_a: Path, root_b: Path, max_files: int | None, seed: int)
         _fail("Determinism compare failed: row counts differ.\n  " + "\n  ".join(row_mismatches))
 
 
+def _validate_run_artifacts(run_dir: Path, expected_parquet_count: int | None = None) -> JsonDict:  # noqa: C901
+    """Validate runner artifacts under a _runs/<YYYYMM>/<run_id>/ directory.
+
+    Checks:
+    - plan.json exists and is valid JSON
+    - run_summary.json exists, is valid JSON, and reports total_failure=0
+    - Manifest JSONL files exist; all file-level entries are success or skip
+    - If expected_parquet_count is provided, cross-checks batches_written
+
+    Returns a dict of artifact-check results for inclusion in the validation report.
+    """
+    if not run_dir.exists() or not run_dir.is_dir():
+        _fail(f"--run-dir does not exist or is not a directory: {run_dir}")
+
+    results: JsonDict = {"run_dir": str(run_dir)}
+
+    # -- plan.json --
+    plan_path = run_dir / "plan.json"
+    if not plan_path.exists():
+        _fail(f"Missing plan.json in run artifacts: {plan_path}")
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        _fail(f"Invalid plan.json: {plan_path}: {e}")
+    results["plan_n_inputs"] = len(plan.get("inputs_sorted", []))
+    results["plan_n_batches"] = len(plan.get("batches", []))
+
+    # -- run_summary.json --
+    summary_path = run_dir / "run_summary.json"
+    if not summary_path.exists():
+        _fail(f"Missing run_summary.json in run artifacts: {summary_path}")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        _fail(f"Invalid run_summary.json: {summary_path}: {e}")
+
+    total_failure = int(summary.get("total_failure", -1))
+    total_success = int(summary.get("total_success", 0))
+    total_skip = int(summary.get("total_skip", 0))
+    batches_written = int(summary.get("batches_written", 0))
+    stop_requested = summary.get("stop_requested", False)
+
+    if total_failure != 0:
+        _fail(
+            f"run_summary.json reports total_failure={total_failure} (must be 0). "
+            f"total_success={total_success}, total_skip={total_skip}. "
+            f"Investigate logs at: {run_dir / 'logs' / 'run_log.jsonl'}"
+        )
+
+    if stop_requested:
+        _fail(f"run_summary.json reports stop_requested=True. Run was interrupted: {summary_path}")
+
+    results["summary_total_success"] = total_success
+    results["summary_total_failure"] = total_failure
+    results["summary_total_skip"] = total_skip
+    results["summary_batches_written"] = batches_written
+
+    if expected_parquet_count is not None and batches_written != expected_parquet_count:
+        _fail(
+            f"Batch count mismatch: run_summary.json reports batches_written={batches_written} "
+            f"but discovered {expected_parquet_count} parquet files on disk."
+        )
+
+    # -- manifest JSONL --
+    manifest_dir = run_dir / "manifests"
+    if not manifest_dir.exists():
+        _fail(f"Missing manifests directory: {manifest_dir}")
+
+    manifest_files = sorted(manifest_dir.glob("manifest_*.jsonl"))
+    if not manifest_files:
+        _fail(f"No manifest_*.jsonl files found in {manifest_dir}")
+
+    manifest_failures: list[str] = []
+    manifest_success_count = 0
+    manifest_skip_count = 0
+
+    for mf in manifest_files:
+        try:
+            for line in mf.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                status = rec.get("status", "")
+                if status == "success":
+                    manifest_success_count += 1
+                elif status == "skip":
+                    manifest_skip_count += 1
+                elif status == "failure":
+                    inp = rec.get("input_path", "?")
+                    exc = rec.get("exception_msg", "?")
+                    manifest_failures.append(f"{inp}: {exc}")
+        except (json.JSONDecodeError, OSError) as e:
+            _fail(f"Error reading manifest file {mf}: {e}")
+
+    if manifest_failures:
+        sample = manifest_failures[:10]
+        _fail(f"Manifest contains {len(manifest_failures)} failure entries (must be 0). Sample (up to 10): {sample}")
+
+    results["manifest_files_checked"] = len(manifest_files)
+    results["manifest_success_count"] = manifest_success_count
+    results["manifest_skip_count"] = manifest_skip_count
+
+    # -- batch summaries --
+    summary_files = sorted(manifest_dir.glob("summary_*.json"))
+    batch_failures = []
+    for sf in summary_files:
+        try:
+            bs = json.loads(sf.read_text(encoding="utf-8"))
+            if int(bs.get("n_failure", 0)) > 0:
+                batch_failures.append(f"{sf.name}: n_failure={bs.get('n_failure')}")
+        except (json.JSONDecodeError, OSError):
+            batch_failures.append(f"{sf.name}: unreadable")
+
+    if batch_failures:
+        _fail(f"Batch summary files report failures: {batch_failures[:10]}")
+
+    results["batch_summaries_checked"] = len(summary_files)
+
+    return results
+
+
 def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     p = argparse.ArgumentParser(description="Validate ComEd month-output parquet dataset contract.")
     p.add_argument(
@@ -566,6 +734,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     )
     p.add_argument("--seed", type=int, default=42, help="Deterministic seed for sampling selection/windows.")
     p.add_argument("--output-report", default=None, help="Write validation report JSON to this path.")
+    p.add_argument(
+        "--run-dir",
+        default=None,
+        help="Runner artifact directory (_runs/YYYYMM/<run_id>/) to validate plan.json, run_summary.json, manifests.",
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     out_root = Path(args.out_root).resolve()
@@ -577,9 +750,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     if args.compare_root is not None:
         _compare_roots(out_root, Path(args.compare_root).resolve(), args.max_files, args.seed)
 
-    # Validate schema + per-file partition integrity on selected files.
+    # Validate schema + per-file partition integrity + duplicates on selected files.
     total_files = sum(len(v) for v in mapping.values())
     checked_files = 0
+    total_rows = 0
+    per_file_rows: list[dict[str, object]] = []
 
     for part in partitions:
         files = mapping[part]
@@ -594,6 +769,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
         for f in selected:
             _validate_schema_on_file(f)
             _validate_partition_integrity_file(f, part)
+
+            # Duplicate detection + row count (always runs; cheap single-pass aggregate).
+            file_rows = _validate_no_duplicates_file(f)
+            total_rows += file_rows
+            per_file_rows.append({"file": f.name, "rows": file_rows})
 
             # Sortedness: per-file
             if args.check_mode == "full":
@@ -619,10 +799,19 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     if checked_files == 0:
         _fail("No files validated (unexpected). Check --max-files and discovered outputs.")
 
+    # Run artifact integrity (optional).
+    run_artifact_results: JsonDict | None = None
+    if args.run_dir is not None:
+        run_artifact_results = _validate_run_artifacts(
+            Path(args.run_dir).resolve(),
+            expected_parquet_count=total_files,
+        )
+
     # Build validation report
     checks_passed = [
         "schema_contract",
         "partition_integrity",
+        "no_duplicates",
         "datetime_invariants",
         f"sortedness_{args.check_mode}",
     ]
@@ -633,7 +822,10 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     if args.compare_root:
         checks_passed.append("determinism_compare")
 
-    report = {
+    if run_artifact_results is not None:
+        checks_passed.append("run_artifact_integrity")
+
+    report: JsonDict = {
         "status": "pass",
         "timestamp": dt_mod.datetime.now(dt_mod.timezone.utc).isoformat(),
         "out_root": str(out_root),
@@ -641,6 +833,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
         "partition_details": [{"year": p.year, "month": p.month, "files": len(mapping[p])} for p in partitions],
         "files_validated": checked_files,
         "total_files_discovered": total_files,
+        "total_rows_validated": total_rows,
+        "per_file_rows": per_file_rows,
         "check_mode": args.check_mode,
         "dst_month_check": args.dst_month_check,
         "checks_passed": checks_passed,
@@ -649,6 +843,9 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
 
     if args.compare_root:
         report["compare_root"] = str(Path(args.compare_root).resolve())
+
+    if run_artifact_results is not None:
+        report["run_artifacts"] = run_artifact_results
 
     # Write report if requested
     if args.output_report:
@@ -661,7 +858,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     # Minimal success signal (no prints during failure).
     print(
         f"OK: validated {checked_files} parquet files across {len(partitions)} partitions "
-        f"(discovered total parquet files={total_files})."
+        f"(discovered total parquet files={total_files}, total rows validated={total_rows})."
     )
 
     return 0
