@@ -386,9 +386,10 @@ def _composite_key_expr() -> pl.Expr:
 
 
 def _check_sorted_full(path: Path) -> None:
-    lf = pl.scan_parquet(str(path)).select([_composite_key_expr()]).select(pl.col("_k").is_sorted().alias("is_sorted"))
+    # Collect the composite key then check Series.is_sorted() (Expr.is_sorted was removed in Polars 1.38).
     try:
-        is_sorted = bool(lf.collect(streaming=True).row(0)[0])
+        k_series = pl.scan_parquet(str(path)).select([_composite_key_expr()]).collect(streaming=True)["_k"]
+        is_sorted = bool(k_series.is_sorted())
     except Exception as e:
         _fail(f"Failed full sortedness check for {path}: {e}")
     if not is_sorted:
