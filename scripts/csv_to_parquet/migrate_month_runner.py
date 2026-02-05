@@ -742,8 +742,13 @@ def run_batch(
             if uniq.height != 1:
                 _raise_batch_multi_year_month(uniq)
 
-            lf_sorted = lf_batch.sort(list(SORT_KEYS), maintain_order=True)
-            lf_sorted.sink_parquet(str(staging_out), compression="snappy", statistics=True)
+            # Collect before sort+write: sink_parquet uses the streaming engine
+            # which does not honor .sort() — it processes data in unordered chunks,
+            # silently producing unsorted output. Materializing first guarantees
+            # write_parquet emits rows in sorted order.
+            df_batch = lf_batch.collect(engine="streaming")
+            df_batch = df_batch.sort(list(SORT_KEYS), maintain_order=True)
+            df_batch.write_parquet(str(staging_out), compression="snappy", statistics=True, use_pyarrow=False)
             wrote_file = True
 
         if wrote_file:
