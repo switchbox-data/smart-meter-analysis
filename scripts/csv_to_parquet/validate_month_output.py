@@ -270,7 +270,7 @@ def _validate_partition_integrity_file(path: Path, part: Partition) -> None:
         pl.col("month").max().alias("month_max"),
     ])
     try:
-        row = lf.collect(streaming=True).row(0)
+        row = lf.collect(engine="streaming").row(0)
     except Exception as e:
         _fail(f"Failed to collect partition integrity stats for {path}: {e}")
 
@@ -367,9 +367,13 @@ def _streaming_sort_and_dup_check(
 
 
 def _slice_keys(path: Path, offset: int, length: int) -> pl.DataFrame:
+    # Do NOT use engine="streaming" here: streaming may reorder rows for
+    # sliced reads, which defeats the purpose of sortedness validation.
+    # Slices are small (head_k / window_k rows of 3 key cols) so default
+    # engine is both correct and fast enough.
     lf = pl.scan_parquet(str(path)).select([pl.col(c) for c in SORT_KEY_COLS]).slice(offset, length)
     try:
-        return lf.collect(streaming=True)
+        return lf.collect()
     except Exception as e:
         _fail(f"Failed to slice keys for {path} offset={offset} length={length}: {e}")
 
@@ -425,6 +429,7 @@ def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int,
 
     prev_last_key: str | None = None
     prev_tag: str | None = None
+    prev_end: int = 0  # offset + length of previous slice
 
     for off, length, tag in slices:
         df = _slice_keys(path, off, length)
@@ -453,7 +458,10 @@ def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int,
             )
 
         first_k, last_k = _first_last_key(df)
-        if prev_last_key is not None:
+        # Cross-slice boundary check: only valid when slices do NOT overlap.
+        # Random windows can overlap with head/tail or each other; comparing
+        # last-key-of-A to first-key-of-B is meaningless if B starts inside A.
+        if prev_last_key is not None and off >= prev_end:
             if first_k < prev_last_key:
                 _fail(
                     f"Sort violation across slice boundary in file {path}: "
@@ -470,6 +478,7 @@ def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int,
 
         prev_last_key = last_k
         prev_tag = tag
+        prev_end = off + length
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +498,7 @@ def _collect_datetime_stats_file(path: Path) -> _DtStats:
         pl.col("datetime").dt.month().max().alias("dt_month_max"),
     ])
     try:
-        row = lf.collect(streaming=True).row(0)
+        row = lf.collect(engine="streaming").row(0)
     except Exception as e:
         _fail(f"Failed to collect datetime stats for {path}: {e}")
 
@@ -574,7 +583,7 @@ def _collect_dst_stats_file(path: Path) -> _DstFileStats:
     )
 
     # Unique (d, h, m) — at most 31 * 48 = 1488 rows regardless of account count
-    slots_df = lf_base.select(["d", "h", "m"]).unique().collect(streaming=True)
+    slots_df = lf_base.select(["d", "h", "m"]).unique().collect(engine="streaming")
     day_slots: dict[dt_mod.date, set[tuple[int, int]]] = {}
     for row in slots_df.iter_rows():
         d, h, m = row
@@ -584,7 +593,7 @@ def _collect_dst_stats_file(path: Path) -> _DstFileStats:
     beyond_count = int(
         lf_base.filter((pl.col("h") > 23) | ((pl.col("h") == 23) & (pl.col("m") > 30)))
         .select(pl.len())
-        .collect(streaming=True)
+        .collect(engine="streaming")
         .row(0)[0]
     )
 
@@ -593,7 +602,7 @@ def _collect_dst_stats_file(path: Path) -> _DstFileStats:
         lf_base.filter((pl.col("h") == 23) & pl.col("m").is_in([0, 30]) & pl.col("energy_kwh").is_not_null())
         .select(["d", "h", "m"])
         .unique()
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
     day_nonnull: dict[dt_mod.date, set[tuple[int, int]]] = {}
     for row in late_df.iter_rows():
@@ -730,8 +739,8 @@ def _compare_roots(root_a: Path, root_b: Path, max_files: int | None, seed: int)
         pa = root_a / rel
         pb = root_b / rel
         try:
-            na = int(pl.scan_parquet(str(pa)).select(pl.len()).collect(streaming=True).row(0)[0])
-            nb = int(pl.scan_parquet(str(pb)).select(pl.len()).collect(streaming=True).row(0)[0])
+            na = int(pl.scan_parquet(str(pa)).select(pl.len()).collect(engine="streaming").row(0)[0])
+            nb = int(pl.scan_parquet(str(pb)).select(pl.len()).collect(engine="streaming").row(0)[0])
         except Exception as e:
             _fail(f"Determinism compare failed reading row counts for {rel}: {e}")
         if na != nb:
