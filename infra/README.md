@@ -1,72 +1,22 @@
-# smart-meter-analysis
+# EC2 Infrastructure for Smart Meter Analysis
 
-[![Release](https://img.shields.io/github/v/release/switchbox-data/smart-meter-analysis)](https://img.shields.io/github/v/release/switchbox-data/smart-meter-analysis)
-[![Build status](https://img.shields.io/github/actions/workflow/status/switchbox-data/smart-meter-analysis/main.yml?branch=main)](https://github.com/switchbox-data/smart-meter-analysis/actions/workflows/main.yml?query=branch%3Amain)
-[![codecov](https://codecov.io/gh/switchbox-data/smart-meter-analysis/branch/main/graph/badge.svg)](https://codecov.io/gh/switchbox-data/smart-meter-analysis)
-[![Commit activity](https://img.shields.io/github/commit-activity/m/switchbox-data/smart-meter-analysis)](https://img.shields.io/github/commit-activity/m/switchbox-data/smart-meter-analysis)
-[![License](https://img.shields.io/github/license/switchbox-data/smart-meter-analysis)](https://img.shields.io/github/license/switchbox-data/smart-meter-analysis)
+This directory contains Terraform configuration for provisioning a shared EC2 instance for the smart meter analysis project.
 
-This is the repo for the smart-meter-analysis project
+## Overview
 
-- **Github repository**: <https://github.com/switchbox-data/smart-meter-analysis/>
-- **Documentation** <https://switchbox-data.github.io/smart-meter-analysis/>
+The infrastructure includes:
 
-## Getting started with your project
+- EC2 instance (Ubuntu 22.04) with configurable instance type
+- Persistent EBS volume (mounted at `/ebs`) for user home directories and shared data
+- S3 bucket mount (`s3://data.sb/` mounted at `/data.sb/`) for large data files
+- IAM roles and security groups for secure access
+- Automatic user account creation based on AWS IAM users
 
-### 1. Create a New Repository
-
-First, create a repository on GitHub with the same name as this project, and then run the following commands:
-
-```bash
-git init -b main
-git add .
-git commit -m "init commit"
-git remote add origin git@github.com:switchbox-data/smart-meter-analysis.git
-git push -u origin main
-```
-
-### 2. Set Up Your Development Environment
-
-Then, install [just](https://github.com/casey/just) and use it to install our python packages and the pre-commit hooks with
-
-```bash
-just install
-```
-
-This will also generate your `uv.lock` file
-
-### 3. Run the pre-commit hooks
-
-Initially, the CI/CD pipeline might be failing due to formatting issues. To resolve those run:
-
-```bash
-uv run pre-commit run -a
-```
-
-### 4. Commit the changes
-
-Lastly, commit the changes made by the two steps above to your repository.
-
-```bash
-git add .
-git commit -m 'Fix formatting issues'
-git push origin main
-```
-
-You are now ready to start development on your project!
-The CI/CD pipeline will be triggered when you open a pull request, merge to main, or when you create a new release.
-
-To finalize the set-up for publishing to PyPI, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/publishing/#set-up-for-pypi).
-For activating the automatic documentation with MkDocs, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/mkdocs/#enabling-the-documentation-on-github).
-To enable the code coverage reports, see [here](https://fpgmaas.github.io/cookiecutter-uv/features/codecov/).
-
-## 🚀 Running on AWS: Using the Development VM
-
-If you want to run this code on AWS instead of locally, we provide a shared EC2 VM with all dependencies pre-configured. This is especially useful for data scientists who need more compute power or access to large datasets stored in S3.
-
-### Prerequisites
+## Prerequisites
 
 Before you begin, ensure you have the following tools installed on your local machine:
+
+### Required Tools
 
 1. **AWS CLI** - For authenticating with AWS
    - Installation: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
@@ -83,7 +33,16 @@ Before you begin, ensure you have the following tools installed on your local ma
    - Verify: `cursor --version`
    - **Note**: If you don't have this installed, you'll need to manually connect to the remote server in Cursor after running `just dev-login`
 
-4. **Required File**: `.secrets/aws-sso-config.sh` - AWS SSO configuration file (ask a team member for this file)
+4. **Terraform** (optional) - Automatically installed by `just dev-setup` if not present
+   - Manual installation: https://developer.hashicorp.com/terraform/downloads
+
+### Required Files
+
+- `.secrets/aws-sso-config.sh` - AWS SSO configuration file (ask a team member for this file)
+
+## Quick Start Guide
+
+This guide walks you through spinning up the VM, logging in, and tearing it down.
 
 ### Step 1: Spin Up the VM (One-Time Setup)
 
@@ -192,7 +151,6 @@ just dev-login
    ```
    - If Cursor opens automatically, you're all set!
    - If you see "Could not open Cursor remotely", you need to install the Cursor CLI (see Prerequisites)
-   - If Cursor doesn't open automatically, manually connect in Cursor to: `ssh-remote+smart-meter-analysis`
 
 8. **Interactive Shell**: At the end, you'll see:
    ```
@@ -243,27 +201,45 @@ Are you sure? Type 'yes' to confirm:
 ```
 Type `yes` to confirm, then the cleanup proceeds.
 
-### Understanding Storage on the VM
+## Understanding Storage: Root Volume, EBS Volume, and S3 Mount
 
-The VM has three types of storage:
+The VM has three types of storage, each serving different purposes:
 
-1. **Root Volume (`/`)** - 30 GB system disk (not persistent, destroyed when VM terminates)
-   - Use for: Operating system and system files only
-   - **Don't store your work here** - it will be lost if the VM is recreated
+### 1. Root Volume (`/`)
 
-2. **EBS Volume (`/ebs`)** - 500 GB persistent data disk
-   - Use for: Your home directory, project files, installed packages
-   - Your home directory (`~`) is actually `/ebs/home/your_username/`
-   - Structure:
-     - `/ebs/home/your_username/` - Your home directory (where `~/smart-meter-analysis/` lives)
-     - `/ebs/shared/` - Shared directory accessible to all users
+- **What it is**: The main system disk where Ubuntu and system files live
+- **Size**: 30 GB
+- **Location**: `/` (root of the filesystem)
+- **Persistence**: **Not persistent** - destroyed when the VM is terminated
+- **Use case**: Operating system, system packages, temporary files
+- **Don't store your work here** - it will be lost if the VM is recreated
 
-3. **S3 Mount (`/data.sb`)** - Unlimited S3 storage
-   - Use for: Large datasets, shared data files
-   - Files written here are automatically synced to S3
-   - Great for data that needs to persist across VM recreations
+### 2. EBS Volume (`/ebs`)
 
-**Quick Reference:**
+- **What it is**: A persistent data disk that survives VM recreation
+- **Size**: 500 GB (configurable)
+- **Location**: `/ebs/`
+- **Persistence**: **Persistent** - survives VM termination (unless you run `dev-teardown-all`)
+- **Use case**: Your home directory, project files, installed packages, local data
+- **Structure**:
+  - `/ebs/home/your_username/` - Your home directory (where `~/smart-meter-analysis/` lives)
+  - `/ebs/shared/` - Shared directory accessible to all users
+  - `/ebs/tmp/` - Temporary files directory
+
+**Important**: Your home directory (`~`) is actually `/ebs/home/your_username/`, so files you save in your home directory are automatically on the persistent EBS volume.
+
+### 3. S3 Mount (`/data.sb`)
+
+- **What it is**: A direct mount of the S3 bucket `s3://data.sb/`
+- **Size**: Unlimited (S3 storage)
+- **Location**: `/data.sb/`
+- **Persistence**: **Persistent** - data lives in S3, independent of the VM
+- **Use case**: Large datasets, shared data files, data that needs to persist across VM recreations
+- **Performance**: Slower than local disk (network access), but great for large files you don't need frequently
+
+**Note**: Files written to `/data.sb/` are automatically synced to S3. Changes may take a moment to appear.
+
+### Quick Reference
 
 | Storage Type | Path | Size | Persistent? | Best For |
 |-------------|------|------|-------------|----------|
@@ -271,7 +247,7 @@ The VM has three types of storage:
 | EBS Volume | `/ebs/` | 500 GB | ✅ Yes | Your work, home directory |
 | S3 Mount | `/data.sb/` | Unlimited | ✅ Yes | Large datasets, shared data |
 
-### Cost Management
+## Cost Management
 
 **⚠️ Important**: The VM does **not** automatically shut down. It will continue running and incur AWS costs until you explicitly tear it down.
 
@@ -279,8 +255,82 @@ The VM has three types of storage:
 - **Estimated Cost**: ~$0.50-1.00/hour (varies by region and pricing)
 - **Recommendation**: Always run `just dev-teardown` when you're done working
 
-For more details, see [`infra/README.md`](infra/README.md).
+The EBS volume incurs minimal storage costs (~$0.10/GB/month) even when the VM is stopped, but this is much cheaper than leaving the VM running.
 
----
+## Configuration
 
-Repository initiated with [fpgmaas/cookiecutter-uv](https://github.com/fpgmaas/cookiecutter-uv).
+Edit `variables.tf` to customize:
+
+- `instance_type` - EC2 instance type (default: `m7i.2xlarge`)
+- `ebs_volume_size` - EBS volume size in GB (default: 500)
+- `aws_region` - AWS region (default: `us-west-2`)
+- `s3_bucket_name` - S3 bucket to mount (default: `data.sb`)
+
+## Changing Instance Type
+
+To change the instance type:
+
+1. Update `instance_type` in `variables.tf` or pass via command line:
+   ```bash
+   terraform apply -var="instance_type=m7i.4xlarge"
+   ```
+
+2. Terraform will automatically:
+   - Stop the instance
+   - Change the instance type
+   - Start the new instance
+   - Reattach the EBS volume
+   - All user data in `/ebs/home/` persists automatically
+
+## EBS Volume Resizing
+
+To increase the EBS volume size:
+
+1. Update `ebs_volume_size` in `variables.tf`
+2. Run `terraform apply`
+3. The user-data script automatically detects the larger volume and runs `resize2fs`
+
+**Note:** EBS volumes cannot be decreased in size.
+
+## Authorization
+
+Users need the following AWS IAM permissions:
+
+- `ec2-instance-connect:SendSSHPublicKey`
+- `ec2:DescribeInstances`
+
+To grant access, add these permissions to the user's IAM role/user. Their Linux account will be created automatically on first login.
+
+## Files
+
+- `main.tf` - Main infrastructure (EC2, EBS, IAM, security groups)
+- `variables.tf` - Configuration variables
+- `outputs.tf` - Terraform outputs (instance ID, IPs, etc.)
+- `user-data.sh` - Bootstrap script that runs on instance startup
+- `.gitignore` - Ignores Terraform state files
+
+## Troubleshooting
+
+### Instance not accessible
+
+- Check security groups allow SSH from your IP/VPC
+- Verify AWS SSO login: `just aws`
+- Check instance status: `aws ec2 describe-instances --instance-ids <instance-id>`
+
+### S3 mount not working
+
+- Verify IAM instance profile has S3 permissions
+- Check S3 bucket name is correct in `variables.tf`
+- Check logs: `sudo journalctl -u user-data` or `/var/log/user-data.log`
+
+### User account issues
+
+- Verify AWS IAM username is valid
+- Check `/ebs/home/` directory permissions
+- User accounts are created automatically on first login
+
+### Cursor doesn't open automatically
+
+- Install the Cursor CLI: `curl https://cursor.com/install -fsS | bash`
+- Or manually connect in Cursor to: `ssh-remote+smart-meter-analysis`
+- Make sure the SSH port forwarding is still running (check the terminal where you ran `dev-login`)
