@@ -17,6 +17,41 @@ update:
     uv lock --upgrade
 
 # =============================================================================
+# 🔍 AWS
+# =============================================================================
+
+# Authenticate with AWS via SSO (for manual AWS CLI usage like S3 access)
+# Automatically configures SSO if not already configured
+aws:
+    .devcontainer/devpod/aws.sh
+
+# =============================================================================
+# 🚀 DEVELOPMENT ENVIRONMENT
+# =============================================================================
+
+# Ensure Terraform is installed (internal dependency). Depends on aws so credentials
+# are valid before any Terraform or infra script runs.
+_terraform: aws
+    bash infra/install-terraform.sh
+
+# Set up EC2 instance (run once by admin)
+# Idempotent: safe to run multiple times
+dev-setup: _terraform
+    bash infra/dev-setup.sh
+
+# Destroy EC2 instance but preserve data volume (to recreate, run dev-setup again)
+dev-teardown: _terraform
+    bash infra/dev-teardown.sh
+
+# Destroy everything including data volume (WARNING: destroys all data!)
+dev-teardown-all: _terraform
+    bash infra/dev-teardown-all.sh
+
+# User login (run by any authorized user)
+dev-login: aws
+    bash infra/dev-login.sh
+
+# =============================================================================
 # 🔄 DATA PIPELINE
 # =============================================================================
 
@@ -37,6 +72,26 @@ pipeline-debug YEAR_MONTH:
 
 download-transform YEAR_MONTH MAX_FILES="":
     uv run python -m smart_meter_analysis.aws_loader {{YEAR_MONTH}} {{MAX_FILES}}
+
+# CSV-to-Parquet migration (EC2 production). Usage: just migrate-month 202307
+migrate-month YEAR_MONTH:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    OUT_ROOT="/ebs/home/griffin_switch_box/runs/out_{{YEAR_MONTH}}_production"
+    INPUT_LIST="$HOME/s3_paths_{{YEAR_MONTH}}_full.txt"
+    if [ ! -f "$INPUT_LIST" ]; then
+        echo "ERROR: Input list not found: $INPUT_LIST" >&2
+        exit 1
+    fi
+    echo "migrate-month {{YEAR_MONTH}}: $(wc -l < "$INPUT_LIST") inputs -> $OUT_ROOT"
+    python scripts/csv_to_parquet/migrate_month_runner.py \
+        --input-list "$INPUT_LIST" \
+        --out-root "$OUT_ROOT" \
+        --year-month {{YEAR_MONTH}} \
+        --batch-size 100 \
+        --workers 6 \
+        --resume \
+        --exec-mode lazy_sink
 
 # =============================================================================
 # 🧪 SAMPLE DATA (S3 + Synthetic)
