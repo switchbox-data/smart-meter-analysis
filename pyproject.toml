@@ -142,6 +142,10 @@ disable_error_code = ["no-any-return"]
 module = "botocore.exceptions"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "pyarrow.*"
+ignore_missing_imports = true
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

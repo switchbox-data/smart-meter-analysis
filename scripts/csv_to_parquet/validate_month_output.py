@@ -8,16 +8,17 @@ import random
 import re
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import polars as pl
+import pyarrow.parquet as pq
 
 JsonDict = dict[str, Any]
 
 """
-Month-output Validator (QA + determinism + contract enforcement) for ComEd CSV→Parquet migration.
+Month-output Validator (QA + determinism + contract enforcement) for ComEd CSV->Parquet migration.
 
 What this validates (fail-loud; raises ValueError with actionable diagnostics):
 1) Discovery:
@@ -41,22 +42,24 @@ What this validates (fail-loud; raises ValueError with actionable diagnostics):
    - year/month columns exist, non-null, and min/max match partition directory year=... month=...
    - Detects mismatches and reports offending files.
 
-4) Datetime invariants (per partition):
+4) Datetime invariants (per partition, collected per-file and merged):
    - No null datetime.
    - min(datetime) has (hour,minute)==(0,0)
    - max(datetime) has (hour,minute)==(23,30)
    - All datetime values fall within (partition year, partition month) (no spillover).
 
-5) DST Option B invariants (optional: --dst-month-check):
+5) DST Option B invariants (optional: --dst-month-check, collected per-file and merged):
    - Exactly 48 distinct time slots per day (no 49/50 slot days).
    - Ensures no timestamps beyond 23:30.
    - Spot-checks that (23:00 and 23:30) exist on at least one day with non-null energy_kwh (coarse sanity).
 
-6) Sortedness (non-tautological):
-   - Validates lexicographic non-decreasing order by (zip_code, account_identifier, datetime).
+6) Sortedness + Uniqueness (non-tautological):
+   - Validates strict lexicographic ordering by (zip_code, account_identifier, datetime).
    - Modes:
-       --check-mode full   : scans entire selected files (streaming=True) and checks is_sorted on a composite key.
-       --check-mode sample : checks first/last K rows and deterministic random windows per file (also checks boundaries).
+       --check-mode full   : PyArrow streaming pass across files; O(batch_size) memory; checks strictly
+                              increasing composite key (sortedness + no duplicates in one pass).
+       --check-mode sample : checks first/last K rows and deterministic random windows per file;
+                              also checks boundaries and strictly-increasing keys within windows.
 
 7) Determinism compare (optional: --compare-root):
    - Compares directory trees (relative paths) and per-file sizes between two outputs.
@@ -89,6 +92,11 @@ REQUIRED_SCHEMA: dict[str, pl.DataType] = {
 SORT_KEY_COLS: tuple[str, str, str] = ("zip_code", "account_identifier", "datetime")
 
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class Partition:
     year: int
@@ -96,7 +104,34 @@ class Partition:
     path: Path
 
 
-def _fail(msg: str) -> None:
+@dataclass
+class _DtStats:
+    """Aggregated datetime statistics for a single file or merged partition."""
+
+    dt_nulls: int = 0
+    dt_min: dt_mod.datetime | None = None
+    dt_max: dt_mod.datetime | None = None
+    year_min: int | None = None
+    year_max: int | None = None
+    month_min: int | None = None
+    month_max: int | None = None
+
+
+@dataclass
+class _DstFileStats:
+    """Per-file DST statistics for merge across a partition."""
+
+    day_slots: dict[dt_mod.date, set[tuple[int, int]]] = field(default_factory=dict)
+    day_nonnull_late_slots: dict[dt_mod.date, set[tuple[int, int]]] = field(default_factory=dict)
+    has_beyond_2330: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _fail(msg: str) -> NoReturn:
     raise ValueError(msg)
 
 
@@ -123,6 +158,28 @@ def _dtype_eq(observed: pl.DataType, expected: pl.DataType) -> bool:
     if expected == pl.Datetime:
         return isinstance(observed, pl.Datetime) or observed == pl.Datetime
     return observed == expected
+
+
+def _composite_key_expr() -> pl.Expr:
+    # Build a lexicographically comparable composite key without sorting.
+    return pl.concat_str([
+        pl.col("zip_code").cast(pl.Utf8),
+        pl.lit("\u001f"),  # unit separator
+        pl.col("account_identifier").cast(pl.Utf8),
+        pl.lit("\u001f"),
+        pl.col("datetime").cast(pl.Utf8),
+    ]).alias("_k")
+
+
+def _get_row_count_metadata(path: Path) -> int:
+    """Get row count from parquet file metadata (O(1), no data scan)."""
+    pf = pq.ParquetFile(str(path))
+    return pf.metadata.num_rows
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Discovery
+# ---------------------------------------------------------------------------
 
 
 def _discover_partitions(out_root: Path) -> list[Partition]:  # noqa: C901
@@ -178,6 +235,11 @@ def _discover_parquet_files(partitions: Sequence[Partition]) -> dict[Partition, 
     return mapping
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Metadata checks (schema + partition integrity)
+# ---------------------------------------------------------------------------
+
+
 def _validate_schema_on_file(path: Path) -> None:
     schema = _read_parquet_schema(path)
 
@@ -187,8 +249,6 @@ def _validate_schema_on_file(path: Path) -> None:
             f"Schema missing required columns in file {path}:\n  missing={missing}\n  observed_cols={sorted(schema.keys())}"
         )
 
-    # Exactness: allow extra columns, but report them (do not fail).
-    # (If you want strict no-extras later, make that a flag.)
     mismatches: list[str] = []
     for col, expected in REQUIRED_SCHEMA.items():
         observed = schema[col]
@@ -224,194 +284,86 @@ def _validate_partition_integrity_file(path: Path, part: Partition) -> None:
         )
 
 
-def _validate_datetime_invariants_partition(part: Partition, files: Sequence[Path]) -> None:
-    # Partition-level scan across files (still lazy).
-    lf = pl.scan_parquet([str(p) for p in files]).select([
-        pl.col("datetime").null_count().alias("dt_nulls"),
-        pl.col("datetime").min().alias("dt_min"),
-        pl.col("datetime").max().alias("dt_max"),
-        pl.col("datetime").dt.year().min().alias("dt_year_min"),
-        pl.col("datetime").dt.year().max().alias("dt_year_max"),
-        pl.col("datetime").dt.month().min().alias("dt_month_min"),
-        pl.col("datetime").dt.month().max().alias("dt_month_max"),
-    ])
-    try:
-        row = lf.collect(streaming=True).row(0)
-    except Exception as e:
-        _fail(f"Failed to collect datetime invariants for partition {part.path}: {e}")
-
-    dt_nulls, dt_min, dt_max, y_min, y_max, m_min, m_max = row
-    if dt_nulls != 0:
-        _fail(f"Null datetime found in partition {part.path}: dt_nulls={dt_nulls}")
-
-    if dt_min is None or dt_max is None:
-        _fail(f"Datetime min/max unexpectedly None in partition {part.path}")
-
-    # Ensure within partition month
-    if y_min != part.year or y_max != part.year or m_min != part.month or m_max != part.month:
-        _fail(
-            f"Datetime spillover in partition {part.path} (dir year={part.year}, month={part.month}) "
-            f"but datetime year range=({y_min},{y_max}) month range=({m_min},{m_max})"
-        )
-
-    # Time-of-day checks
-    if (dt_min.hour, dt_min.minute) != (0, 0):
-        _fail(f"Partition {part.path} has dt_min={dt_min} but expected time-of-day 00:00")
-    if (dt_max.hour, dt_max.minute) != (23, 30):
-        _fail(f"Partition {part.path} has dt_max={dt_max} but expected time-of-day 23:30")
+# ---------------------------------------------------------------------------
+# Phase 3a: Streaming sort + duplicate check (full mode)
+# ---------------------------------------------------------------------------
 
 
-def _validate_dst_option_b_partition(part: Partition, files: Sequence[Path]) -> None:
-    # Exactly 48 unique time slots per day; no times beyond 23:30.
-    lf = (
-        pl.scan_parquet([str(p) for p in files])
-        .select([
-            pl.col("datetime"),
-            pl.col("energy_kwh"),
-        ])
-        .with_columns([
-            pl.col("datetime").dt.date().alias("d"),
-            pl.col("datetime").dt.hour().alias("h"),
-            pl.col("datetime").dt.minute().alias("m"),
-        ])
-    )
+def _streaming_sort_and_dup_check(
+    files: Sequence[Path],
+    batch_size: int = 65_536,
+) -> tuple[int, list[dict[str, object]]]:
+    """Combined streaming sortedness + uniqueness check across ordered files.
 
-    # Count distinct (h,m) per day. Should be 48 everywhere.
-    counts = lf.group_by("d").agg([
-        pl.struct(["h", "m"]).n_unique().alias("slots"),
-        pl.col("datetime").max().alias("dt_max_day"),
-        pl.col("datetime").min().alias("dt_min_day"),
-        pl.col("energy_kwh").null_count().alias("ekwh_nulls_day"),
-        pl.len().alias("rows_day"),
-    ])
+    Leverages the global sort order: data sorted by (zip_code, account_identifier, datetime)
+    means duplicates are always adjacent.  Checks each composite key is strictly greater than
+    the previous (sort order AND uniqueness in a single pass).
 
-    try:
-        df = counts.collect(streaming=True)
-    except Exception as e:
-        _fail(f"Failed to collect DST Option B invariants for partition {part.path}: {e}")
+    Uses PyArrow iter_batches for O(batch_size) memory per pass.
 
-    bad = df.filter(pl.col("slots") != 48)
-    if bad.height > 0:
-        sample = bad.select(["d", "slots", "rows_day"]).head(10).to_dicts()
-        _fail(f"DST Option B violation: days with slots!=48 in partition {part.path}. Examples (up to 10): {sample}")
-
-    # No timestamps beyond 23:30
-    too_late = lf.filter((pl.col("h") > 23) | ((pl.col("h") == 23) & (pl.col("m") > 30))).select(
-        pl.col("datetime").min().alias("first_bad")
-    )
-    try:
-        first_bad = too_late.collect(streaming=True).row(0)[0]
-    except Exception as e:
-        _fail(f"Failed to check 'no timestamps beyond 23:30' in partition {part.path}: {e}")
-
-    if first_bad is not None:
-        _fail(
-            f"DST Option B violation: found datetime beyond 23:30 in partition {part.path}. First example: {first_bad}"
-        )
-
-    # Coarse folded-energy sanity: ensure at least one day has non-null energy at 23:00 and 23:30.
-    # (We avoid deep calendar inference; this is a light guardrail.)
-    spot = (
-        lf.filter(((pl.col("h") == 23) & (pl.col("m").is_in([0, 30]))) & pl.col("energy_kwh").is_not_null())
-        .group_by("d")
-        .agg(pl.struct(["h", "m"]).n_unique().alias("unique_slots_nonnull"))
-        .filter(pl.col("unique_slots_nonnull") == 2)
-        .select(pl.len().alias("days_with_both_slots_nonnull"))
-    )
-    try:
-        days_ok = int(spot.collect(streaming=True).row(0)[0])
-    except Exception as e:
-        _fail(f"Failed DST spot-check for partition {part.path}: {e}")
-
-    if days_ok == 0:
-        _fail(
-            f"DST Option B spot-check failed in partition {part.path}: "
-            f"did not find any day with non-null energy_kwh at both 23:00 and 23:30."
-        )
-
-
-def _validate_no_duplicates_file(path: Path) -> int:
-    """Check for duplicate (zip_code, account_identifier, datetime) within a single parquet file.
-
-    Returns the row count for the file (used by row-count sanity reporting).
-    Raises ValueError if duplicates are found.
+    Returns (total_rows, per_file_rows).
     """
-    lf = pl.scan_parquet(str(path))
-    stats = lf.select([
-        pl.len().alias("total_rows"),
-        pl.struct(["zip_code", "account_identifier", "datetime"]).n_unique().alias("unique_keys"),
-    ])
-    try:
-        row = stats.collect(streaming=True).row(0)
-    except Exception as e:
-        _fail(f"Failed to collect duplicate-check stats for {path}: {e}")
+    prev_key: str | None = None
+    total_rows = 0
+    per_file_rows: list[dict[str, object]] = []
 
-    total_rows, unique_keys = row
-    if total_rows == 0:
-        _fail(f"Empty parquet file (0 rows): {path}")
+    for fpath in files:
+        pf = pq.ParquetFile(str(fpath))
+        file_rows = 0
 
-    if unique_keys < total_rows:
-        n_dups = total_rows - unique_keys
-        # Grab a small sample of duplicate keys for diagnostics.
-        dup_sample = (
-            lf.group_by(["zip_code", "account_identifier", "datetime"])
-            .agg(pl.len().alias("cnt"))
-            .filter(pl.col("cnt") > 1)
-            .sort("cnt", descending=True)
-            .head(5)
-        )
-        try:
-            sample_dicts = dup_sample.collect(streaming=True).to_dicts()
-        except Exception:
-            sample_dicts = []
-        _fail(
-            f"Duplicate (zip_code, account_identifier, datetime) rows in {path}: "
-            f"total_rows={total_rows}, unique_keys={unique_keys}, duplicates={n_dups}. "
-            f"Top duplicates (up to 5): {sample_dicts}"
-        )
+        for batch in pf.iter_batches(batch_size=batch_size, columns=list(SORT_KEY_COLS)):
+            n = batch.num_rows
+            if n == 0:
+                continue
 
-    return int(total_rows)
+            # Convert PyArrow batch -> Polars DataFrame for composite key
+            df = pl.from_arrow(batch)
+            keys = df.select(_composite_key_expr())["_k"]
+
+            # -- Cross-batch/file boundary check --
+            first_key = str(keys[0])
+            if prev_key is not None:
+                if first_key < prev_key:
+                    _fail(
+                        f"Sort violation at batch boundary (row ~{total_rows + file_rows}) "
+                        f"in {fpath}: prev_key={prev_key!r} > first_key={first_key!r}"
+                    )
+                elif first_key == prev_key:
+                    _fail(
+                        f"Duplicate key at batch boundary (row ~{total_rows + file_rows}) in {fpath}: key={first_key!r}"
+                    )
+
+            # -- Within-batch: strictly increasing check --
+            if n > 1:
+                violations = (
+                    df.select([_composite_key_expr()])
+                    .with_row_index("_idx")
+                    .with_columns(pl.col("_k").shift(1).alias("_kp"))
+                    .filter(pl.col("_kp").is_not_null() & (pl.col("_k") <= pl.col("_kp")))
+                    .head(1)
+                )
+                if violations.height > 0:
+                    r = violations.row(0)
+                    idx_in_batch, k, kp = r
+                    abs_row = total_rows + file_rows + idx_in_batch
+                    kind = "Duplicate key" if k == kp else "Sort violation"
+                    _fail(f"{kind} at row ~{abs_row} in {fpath}: prev_key={kp!r}, key={k!r}")
+
+            prev_key = str(keys[-1])
+            file_rows += n
+
+        if file_rows == 0:
+            _fail(f"Empty parquet file (0 rows): {fpath}")
+
+        per_file_rows.append({"file": fpath.name, "rows": file_rows})
+        total_rows += file_rows
+
+    return total_rows, per_file_rows
 
 
-def _composite_key_expr() -> pl.Expr:
-    # Build a lexicographically comparable composite key without sorting.
-    # datetime is included via cast to UTF-8 (stable ordering for ISO-like timestamp representation in Polars).
-    return pl.concat_str([
-        pl.col("zip_code").cast(pl.Utf8),
-        pl.lit("\u001f"),  # unit separator
-        pl.col("account_identifier").cast(pl.Utf8),
-        pl.lit("\u001f"),
-        pl.col("datetime").cast(pl.Utf8),
-    ]).alias("_k")
-
-
-def _check_sorted_full(path: Path) -> None:
-    # Collect the composite key then check Series.is_sorted() (Expr.is_sorted was removed in Polars 1.38).
-    try:
-        k_series = pl.scan_parquet(str(path)).select([_composite_key_expr()]).collect(streaming=True)["_k"]
-        is_sorted = bool(k_series.is_sorted())
-    except Exception as e:
-        _fail(f"Failed full sortedness check for {path}: {e}")
-    if not is_sorted:
-        # Find first break index with a second pass (still streaming-friendly).
-        lf2 = (
-            pl.scan_parquet(str(path))
-            .select([_composite_key_expr()])
-            .with_row_index("idx")
-            .with_columns(pl.col("_k").shift(1).alias("_k_prev"))
-            .filter(pl.col("_k_prev").is_not_null() & (pl.col("_k") < pl.col("_k_prev")))
-            .select(["idx", "_k_prev", "_k"])
-            .head(1)
-        )
-        try:
-            df = lf2.collect(streaming=True)
-        except Exception as e:
-            _fail(f"Sortedness failed for {path}, and failed to locate break index: {e}")
-        if df.height == 0:
-            _fail(f"Sortedness failed for {path} (is_sorted=False) but could not locate first break (unexpected).")
-        r = df.row(0)
-        idx, prev_k, k = r
-        _fail(f"Sortedness violation in {path} at row idx={idx}: prev_key={prev_k} > key={k}")
+# ---------------------------------------------------------------------------
+# Phase 3b: Sample-mode sort + duplicate check
+# ---------------------------------------------------------------------------
 
 
 def _slice_keys(path: Path, offset: int, length: int) -> pl.DataFrame:
@@ -422,20 +374,17 @@ def _slice_keys(path: Path, offset: int, length: int) -> pl.DataFrame:
         _fail(f"Failed to slice keys for {path} offset={offset} length={length}: {e}")
 
 
-def _keys_is_sorted_df(df: pl.DataFrame) -> bool:
+def _keys_strictly_increasing_df(df: pl.DataFrame) -> bool:
+    """Check that composite keys in df are strictly increasing (sorted + unique)."""
     if df.height <= 1:
         return True
-    # Composite key as series (in-memory for this small df)
-    k = df.select(
-        pl.concat_str([
-            pl.col("zip_code").cast(pl.Utf8),
-            pl.lit("\u001f"),
-            pl.col("account_identifier").cast(pl.Utf8),
-            pl.lit("\u001f"),
-            pl.col("datetime").cast(pl.Utf8),
-        ]).alias("_k")
-    )["_k"]
-    return bool(k.is_sorted())
+    violations = (
+        df.select([_composite_key_expr()])
+        .with_row_index("_idx")
+        .with_columns(pl.col("_k").shift(1).alias("_kp"))
+        .filter(pl.col("_kp").is_not_null() & (pl.col("_k") <= pl.col("_kp")))
+    )
+    return violations.height == 0
 
 
 def _first_last_key(df: pl.DataFrame) -> tuple[str, str]:
@@ -452,12 +401,8 @@ def _first_last_key(df: pl.DataFrame) -> tuple[str, str]:
 
 
 def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int, head_k: int) -> None:
-    # Get row count cheaply
-    try:
-        n = int(pl.scan_parquet(str(path)).select(pl.len().alias("n")).collect(streaming=True).row(0)[0])
-    except Exception as e:
-        _fail(f"Failed to get row count for {path}: {e}")
-
+    # Get row count cheaply from parquet metadata
+    n = _get_row_count_metadata(path)
     if n <= 1:
         return
 
@@ -484,23 +429,222 @@ def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int,
     for off, length, tag in slices:
         df = _slice_keys(path, off, length)
 
-        if not _keys_is_sorted_df(df):
+        if not _keys_strictly_increasing_df(df):
+            # Locate the violation for diagnostics
+            viol = (
+                df.select([_composite_key_expr()])
+                .with_row_index("_idx")
+                .with_columns(pl.col("_k").shift(1).alias("_kp"))
+                .filter(pl.col("_kp").is_not_null() & (pl.col("_k") <= pl.col("_kp")))
+                .head(1)
+            )
+            if viol.height > 0:
+                r = viol.row(0)
+                idx, k, kp = r
+                kind = "Duplicate key" if k == kp else "Sort violation"
+                _fail(
+                    f"{kind} in slice tag={tag} offset={off}+{idx} in file {path}: "
+                    f"prev_key={kp!r}, key={k!r}. "
+                    f"Re-run with --check-mode full for exact break index."
+                )
             _fail(
-                f"Sortedness violation within slice tag={tag} offset={off} length={length} in file {path}. "
+                f"Strictly-increasing violation in slice tag={tag} offset={off} in file {path}. "
                 f"Re-run with --check-mode full for exact break index."
             )
 
         first_k, last_k = _first_last_key(df)
-        if prev_last_key is not None and first_k < prev_last_key:
-            _fail(
-                f"Sortedness violation across slice boundary in file {path}: "
-                f"prev_slice={prev_tag} last_key={prev_last_key} > "
-                f"slice={tag} first_key={first_k}. "
-                f"Re-run with --check-mode full for exact break index."
-            )
+        if prev_last_key is not None:
+            if first_k < prev_last_key:
+                _fail(
+                    f"Sort violation across slice boundary in file {path}: "
+                    f"prev_slice={prev_tag} last_key={prev_last_key!r} > "
+                    f"slice={tag} first_key={first_k!r}. "
+                    f"Re-run with --check-mode full for exact break index."
+                )
+            elif first_k == prev_last_key:
+                _fail(
+                    f"Duplicate key across slice boundary in file {path}: "
+                    f"prev_slice={prev_tag} key={first_k!r}. "
+                    f"Re-run with --check-mode full for exact break index."
+                )
 
         prev_last_key = last_k
         prev_tag = tag
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Datetime invariants (per-file collect + merge)
+# ---------------------------------------------------------------------------
+
+
+def _collect_datetime_stats_file(path: Path) -> _DtStats:
+    """Collect datetime aggregate stats from a single file (cheap aggregates)."""
+    lf = pl.scan_parquet(str(path)).select([
+        pl.col("datetime").null_count().alias("dt_nulls"),
+        pl.col("datetime").min().alias("dt_min"),
+        pl.col("datetime").max().alias("dt_max"),
+        pl.col("datetime").dt.year().min().alias("dt_year_min"),
+        pl.col("datetime").dt.year().max().alias("dt_year_max"),
+        pl.col("datetime").dt.month().min().alias("dt_month_min"),
+        pl.col("datetime").dt.month().max().alias("dt_month_max"),
+    ])
+    try:
+        row = lf.collect(streaming=True).row(0)
+    except Exception as e:
+        _fail(f"Failed to collect datetime stats for {path}: {e}")
+
+    return _DtStats(
+        dt_nulls=row[0],
+        dt_min=row[1],
+        dt_max=row[2],
+        year_min=row[3],
+        year_max=row[4],
+        month_min=row[5],
+        month_max=row[6],
+    )
+
+
+def _merge_dt_stats(stats_list: Sequence[_DtStats]) -> _DtStats:
+    """Merge per-file datetime stats into partition-level stats."""
+    merged = _DtStats()
+    for s in stats_list:
+        merged.dt_nulls += s.dt_nulls
+        if s.dt_min is not None:
+            merged.dt_min = min(merged.dt_min, s.dt_min) if merged.dt_min is not None else s.dt_min
+        if s.dt_max is not None:
+            merged.dt_max = max(merged.dt_max, s.dt_max) if merged.dt_max is not None else s.dt_max
+        if s.year_min is not None:
+            merged.year_min = min(merged.year_min, s.year_min) if merged.year_min is not None else s.year_min
+        if s.year_max is not None:
+            merged.year_max = max(merged.year_max, s.year_max) if merged.year_max is not None else s.year_max
+        if s.month_min is not None:
+            merged.month_min = min(merged.month_min, s.month_min) if merged.month_min is not None else s.month_min
+        if s.month_max is not None:
+            merged.month_max = max(merged.month_max, s.month_max) if merged.month_max is not None else s.month_max
+    return merged
+
+
+def _validate_datetime_stats_for_partition(merged: _DtStats, part: Partition) -> None:
+    """Validate merged datetime stats against partition expectations."""
+    if merged.dt_nulls != 0:
+        _fail(f"Null datetime found in partition {part.path}: dt_nulls={merged.dt_nulls}")
+
+    if merged.dt_min is None or merged.dt_max is None:
+        _fail(f"Datetime min/max unexpectedly None in partition {part.path}")
+
+    # Ensure within partition month
+    if (
+        merged.year_min != part.year
+        or merged.year_max != part.year
+        or merged.month_min != part.month
+        or merged.month_max != part.month
+    ):
+        _fail(
+            f"Datetime spillover in partition {part.path} (dir year={part.year}, month={part.month}) "
+            f"but datetime year range=({merged.year_min},{merged.year_max}) "
+            f"month range=({merged.month_min},{merged.month_max})"
+        )
+
+    # Time-of-day checks
+    if (merged.dt_min.hour, merged.dt_min.minute) != (0, 0):
+        _fail(f"Partition {part.path} has dt_min={merged.dt_min} but expected time-of-day 00:00")
+    if (merged.dt_max.hour, merged.dt_max.minute) != (23, 30):
+        _fail(f"Partition {part.path} has dt_max={merged.dt_max} but expected time-of-day 23:30")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: DST Option B (per-file collect + merge)
+# ---------------------------------------------------------------------------
+
+
+def _collect_dst_stats_file(path: Path) -> _DstFileStats:
+    """Collect DST-relevant stats from a single file.
+
+    Returns per-day unique (h,m) slot sets and spot-check data.
+    Memory: O(days_in_month * 48) = ~1500 entries max.
+    """
+    lf_base = (
+        pl.scan_parquet(str(path))
+        .select(["datetime", "energy_kwh"])
+        .with_columns([
+            pl.col("datetime").dt.date().alias("d"),
+            pl.col("datetime").dt.hour().alias("h"),
+            pl.col("datetime").dt.minute().alias("m"),
+        ])
+    )
+
+    # Unique (d, h, m) — at most 31 * 48 = 1488 rows regardless of account count
+    slots_df = lf_base.select(["d", "h", "m"]).unique().collect(streaming=True)
+    day_slots: dict[dt_mod.date, set[tuple[int, int]]] = {}
+    for row in slots_df.iter_rows():
+        d, h, m = row
+        day_slots.setdefault(d, set()).add((h, m))
+
+    # Beyond 23:30 check
+    beyond_count = int(
+        lf_base.filter((pl.col("h") > 23) | ((pl.col("h") == 23) & (pl.col("m") > 30)))
+        .select(pl.len())
+        .collect(streaming=True)
+        .row(0)[0]
+    )
+
+    # Non-null energy at 23:00 and 23:30 (for spot-check merge)
+    late_df = (
+        lf_base.filter((pl.col("h") == 23) & pl.col("m").is_in([0, 30]) & pl.col("energy_kwh").is_not_null())
+        .select(["d", "h", "m"])
+        .unique()
+        .collect(streaming=True)
+    )
+    day_nonnull: dict[dt_mod.date, set[tuple[int, int]]] = {}
+    for row in late_df.iter_rows():
+        d, h, m = row
+        day_nonnull.setdefault(d, set()).add((h, m))
+
+    return _DstFileStats(
+        day_slots=day_slots,
+        day_nonnull_late_slots=day_nonnull,
+        has_beyond_2330=beyond_count > 0,
+    )
+
+
+def _validate_dst_for_partition(part: Partition, files: Sequence[Path]) -> None:
+    """Validate DST Option B by collecting per-file stats and merging."""
+    merged_slots: dict[dt_mod.date, set[tuple[int, int]]] = {}
+    merged_nonnull: dict[dt_mod.date, set[tuple[int, int]]] = {}
+    any_beyond = False
+
+    for f in files:
+        stats = _collect_dst_stats_file(f)
+        for d, s in stats.day_slots.items():
+            merged_slots.setdefault(d, set()).update(s)
+        for d, s in stats.day_nonnull_late_slots.items():
+            merged_nonnull.setdefault(d, set()).update(s)
+        if stats.has_beyond_2330:
+            any_beyond = True
+
+    # Check 1: exactly 48 unique time slots per day
+    bad_days = [(d, len(s)) for d, s in merged_slots.items() if len(s) != 48]
+    if bad_days:
+        bad_days.sort()
+        sample = [{"date": str(d), "slots": n} for d, n in bad_days[:10]]
+        _fail(f"DST Option B violation: days with slots!=48 in partition {part.path}. Examples (up to 10): {sample}")
+
+    # Check 2: no timestamps beyond 23:30
+    if any_beyond:
+        _fail(f"DST Option B violation: found datetime beyond 23:30 in partition {part.path}.")
+
+    # Check 3: at least one day has non-null energy_kwh at both 23:00 and 23:30
+    days_with_both = sum(1 for s in merged_nonnull.values() if (23, 0) in s and (23, 30) in s)
+    if days_with_both == 0:
+        _fail(
+            f"DST Option B spot-check failed in partition {part.path}: "
+            f"did not find any day with non-null energy_kwh at both 23:00 and 23:30."
+        )
+
+
+# ---------------------------------------------------------------------------
+# File selection
+# ---------------------------------------------------------------------------
 
 
 def _select_files_for_mode(files: Sequence[Path], mode: str, max_files: int | None, seed: int) -> list[Path]:
@@ -516,6 +660,11 @@ def _select_files_for_mode(files: Sequence[Path], mode: str, max_files: int | No
     rng.shuffle(idxs)
     chosen = sorted(idxs[:max_files])
     return [files[i] for i in chosen]
+
+
+# ---------------------------------------------------------------------------
+# Determinism compare
+# ---------------------------------------------------------------------------
 
 
 def _compare_roots(root_a: Path, root_b: Path, max_files: int | None, seed: int) -> None:  # noqa: C901
@@ -592,6 +741,11 @@ def _compare_roots(root_a: Path, root_b: Path, max_files: int | None, seed: int)
 
     if row_mismatches:
         _fail("Determinism compare failed: row counts differ.\n  " + "\n  ".join(row_mismatches))
+
+
+# ---------------------------------------------------------------------------
+# Run artifact validation
+# ---------------------------------------------------------------------------
 
 
 def _validate_run_artifacts(run_dir: Path, expected_parquet_count: int | None = None) -> JsonDict:  # noqa: C901
@@ -716,6 +870,11 @@ def _validate_run_artifacts(run_dir: Path, expected_parquet_count: int | None = 
     return results
 
 
+# ---------------------------------------------------------------------------
+# Main (phase-based architecture)
+# ---------------------------------------------------------------------------
+
+
 def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
     p = argparse.ArgumentParser(description="Validate ComEd month-output parquet dataset contract.")
     p.add_argument(
@@ -744,43 +903,51 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
 
     out_root = Path(args.out_root).resolve()
 
+    # ── Phase 1: Discovery ──────────────────────────────────────────────
     partitions = _discover_partitions(out_root)
     mapping = _discover_parquet_files(partitions)
 
-    # Compare mode first (structural invariants); fail fast if mismatched.
+    # ── Phase 1b: Compare mode (structural, fail fast) ──────────────────
     if args.compare_root is not None:
         _compare_roots(out_root, Path(args.compare_root).resolve(), args.max_files, args.seed)
 
-    # Validate schema + per-file partition integrity + duplicates on selected files.
+    # ── Phase 2: Metadata checks (schema + partition integrity) ─────────
     total_files = sum(len(v) for v in mapping.values())
     checked_files = 0
+
+    for part in partitions:
+        files = mapping[part]
+        if not files:
+            _fail(
+                f"Discovered partition {part.path} (year={part.year}, month={part.month}) "
+                f"but found zero parquet files under it."
+            )
+
+        selected = _select_files_for_mode(files, args.check_mode, args.max_files, args.seed)
+        for f in selected:
+            _validate_schema_on_file(f)
+            _validate_partition_integrity_file(f, part)
+            checked_files += 1
+
+    if checked_files == 0:
+        _fail("No files validated (unexpected). Check --max-files and discovered outputs.")
+
+    # ── Phase 3: Sortedness + duplicates + row counts ───────────────────
     total_rows = 0
     per_file_rows: list[dict[str, object]] = []
 
     for part in partitions:
         files = mapping[part]
-        if not files:
-            # Partition exists but empty: fail-loud.
-            _fail(
-                f"Discovered partition {part.path} (year={part.year}, month={part.month}) but found zero parquet files under it."
-            )
-
         selected = _select_files_for_mode(files, args.check_mode, args.max_files, args.seed)
 
-        for f in selected:
-            _validate_schema_on_file(f)
-            _validate_partition_integrity_file(f, part)
-
-            # Duplicate detection + row count (always runs; cheap single-pass aggregate).
-            file_rows = _validate_no_duplicates_file(f)
-            total_rows += file_rows
-            per_file_rows.append({"file": f.name, "rows": file_rows})
-
-            # Sortedness: per-file
-            if args.check_mode == "full":
-                _check_sorted_full(f)
-            else:
-                # Windows: modest defaults; tune if needed
+        if args.check_mode == "full":
+            # Combined streaming sort+dup check — O(batch_size) memory
+            partition_rows, partition_per_file = _streaming_sort_and_dup_check(selected)
+            total_rows += partition_rows
+            per_file_rows.extend(partition_per_file)
+        else:
+            # Sample mode: enhanced strict-increasing check per file
+            for f in selected:
                 _check_sorted_sample(
                     f,
                     seed=args.seed,
@@ -788,19 +955,23 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
                     window_k=5_000,
                     head_k=5_000,
                 )
+                frows = _get_row_count_metadata(f)
+                total_rows += frows
+                per_file_rows.append({"file": f.name, "rows": frows})
 
-            checked_files += 1
+    # ── Phase 4: Datetime invariants (all files, per-file + merge) ──────
+    for part in partitions:
+        files = mapping[part]
+        dt_stats_list = [_collect_datetime_stats_file(f) for f in files]
+        merged = _merge_dt_stats(dt_stats_list)
+        _validate_datetime_stats_for_partition(merged, part)
 
-        # Partition-level datetime invariants: always across *all* files in partition (cheap aggregates).
-        _validate_datetime_invariants_partition(part, files)
+    # ── Phase 5: DST Option B (all files, per-file + merge) ────────────
+    if args.dst_month_check:
+        for part in partitions:
+            _validate_dst_for_partition(part, mapping[part])
 
-        if args.dst_month_check:
-            _validate_dst_option_b_partition(part, files)
-
-    if checked_files == 0:
-        _fail("No files validated (unexpected). Check --max-files and discovered outputs.")
-
-    # Run artifact integrity (optional).
+    # ── Phase 6: Run artifact integrity (optional) ─────────────────────
     run_artifact_results: JsonDict | None = None
     if args.run_dir is not None:
         run_artifact_results = _validate_run_artifacts(
@@ -808,7 +979,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
             expected_parquet_count=total_files,
         )
 
-    # Build validation report
+    # ── Phase 7: Build validation report ────────────────────────────────
     checks_passed = [
         "schema_contract",
         "partition_integrity",
