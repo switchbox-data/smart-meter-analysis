@@ -132,6 +132,12 @@ class _DstFileStats:
 
 
 def _fail(msg: str) -> NoReturn:
+    """Abort validation with a diagnostic message.
+
+    Typed as NoReturn so that mypy narrows Optional types after guard clauses
+    that call _fail() — e.g., after ``if x is None: _fail(...)``, mypy knows
+    x is not None on the subsequent line.
+    """
     raise ValueError(msg)
 
 
@@ -140,8 +146,12 @@ def _is_parquet(p: Path) -> bool:
 
 
 def _read_parquet_schema(path: Path) -> dict[str, pl.DataType]:
-    # Prefer metadata-only schema extraction if available.
-    # Polars versions may differ; we keep a robust fallback.
+    """Extract column names and dtypes without reading row data.
+
+    Uses a two-level fallback chain because Polars' ``read_parquet_schema``
+    API has varied across versions; ``scan_parquet(...).schema`` is the
+    reliable alternative.  Both are metadata-only operations (O(1) data I/O).
+    """
     try:
         schema = pl.read_parquet_schema(str(path))
         return dict(schema)
@@ -154,14 +164,27 @@ def _read_parquet_schema(path: Path) -> dict[str, pl.DataType]:
 
 
 def _dtype_eq(observed: pl.DataType, expected: pl.DataType) -> bool:
-    # Datetime may carry time_unit/time_zone; contract is "Datetime" at type level.
+    """Compare observed dtype against the schema contract.
+
+    Special-cases Datetime because the contract requires "is a Datetime" without
+    constraining time_unit (us/ns/ms) or time_zone.  Polars' Datetime is
+    parameterized, so a naive ``==`` check would reject valid ``Datetime('us')``
+    when the contract specifies the unparameterized ``pl.Datetime``.
+    """
     if expected == pl.Datetime:
         return isinstance(observed, pl.Datetime) or observed == pl.Datetime
     return observed == expected
 
 
 def _composite_key_expr() -> pl.Expr:
-    # Build a lexicographically comparable composite key without sorting.
+    """Build a single-string composite key for sortedness and uniqueness checks.
+
+    Uses U+001F (Unit Separator) as delimiter because it is a non-printable
+    control character that cannot appear in zip codes, account identifiers, or
+    datetime strings.  This guarantees the composite key comparison is equivalent
+    to a lexicographic tuple comparison of the three sort-key columns, without
+    the overhead of maintaining and comparing three separate columns.
+    """
     return pl.concat_str([
         pl.col("zip_code").cast(pl.Utf8),
         pl.lit("\u001f"),  # unit separator
@@ -241,6 +264,12 @@ def _discover_parquet_files(partitions: Sequence[Partition]) -> dict[Partition, 
 
 
 def _validate_schema_on_file(path: Path) -> None:
+    """Validate that a single Parquet file conforms to the canonical schema.
+
+    Runs metadata-only (no row data read).  Checks both column presence and
+    dtype compatibility.  Fails on the first file that violates the contract,
+    providing the exact filename and mismatch details for rapid diagnosis.
+    """
     schema = _read_parquet_schema(path)
 
     missing = [c for c in REQUIRED_SCHEMA if c not in schema]
@@ -260,6 +289,12 @@ def _validate_schema_on_file(path: Path) -> None:
 
 
 def _validate_partition_integrity_file(path: Path, part: Partition) -> None:
+    """Verify that year/month column values match the Hive directory they reside in.
+
+    A row with year=2023 in a ``year=2024`` directory would silently corrupt
+    queries that rely on Hive partition pruning.  This check reads only six
+    scalar aggregates (min/max/null_count for year and month) — negligible I/O.
+    """
     # Read tiny aggregates only.
     lf = pl.scan_parquet(str(path)).select([
         pl.col("year").null_count().alias("year_nulls"),
@@ -379,7 +414,13 @@ def _slice_keys(path: Path, offset: int, length: int) -> pl.DataFrame:
 
 
 def _keys_strictly_increasing_df(df: pl.DataFrame) -> bool:
-    """Check that composite keys in df are strictly increasing (sorted + unique)."""
+    """Check that composite keys in df are strictly increasing (sorted + unique).
+
+    "Strictly increasing" (k[i] < k[i+1] for all i) validates both sortedness
+    AND uniqueness in a single pass: if any adjacent pair has k[i] == k[i+1],
+    the check fails.  This is more efficient than separate sort + deduplicate
+    checks and is sound because the data is globally sorted by SORT_KEY_COLS.
+    """
     if df.height <= 1:
         return True
     violations = (
@@ -405,6 +446,19 @@ def _first_last_key(df: pl.DataFrame) -> tuple[str, str]:
 
 
 def _check_sorted_sample(path: Path, seed: int, max_windows: int, window_k: int, head_k: int) -> None:
+    """Probabilistic sortedness check: validate sort order in sampled windows.
+
+    Checks head, tail, and several deterministic random windows within a file.
+    Each window validates strictly-increasing composite keys internally, and
+    cross-window boundary checks confirm ordering between adjacent non-overlapping
+    windows.
+
+    The overlap guard (``off >= prev_end``) is essential: random windows may
+    overlap with the head/tail slices or with each other.  Comparing the last
+    key of slice A to the first key of slice B is only valid when B starts at
+    or after the end of A; otherwise the "boundary" is inside A and the
+    comparison is semantically meaningless (and produces false positives).
+    """
     # Get row count cheaply from parquet metadata
     n = _get_row_count_metadata(path)
     if n <= 1:
@@ -657,11 +711,17 @@ def _validate_dst_for_partition(part: Partition, files: Sequence[Path]) -> None:
 
 
 def _select_files_for_mode(files: Sequence[Path], mode: str, max_files: int | None, seed: int) -> list[Path]:
+    """Select a subset of files for validation when --max-files is set.
+
+    Full mode uses deterministic first-N selection (reproducible, bias toward
+    early batches).  Sample mode uses seeded random selection to provide
+    coverage across the full output without examining every file.  The seed
+    ensures that repeated runs with the same arguments validate the same files.
+    """
     if max_files is None or max_files <= 0 or max_files >= len(files):
         return list(files)
 
     if mode == "full":
-        # Deterministic selection: first max_files by path order.
         return list(files)[:max_files]
 
     rng = random.Random(seed)  # noqa: S311
@@ -677,6 +737,18 @@ def _select_files_for_mode(files: Sequence[Path], mode: str, max_files: int | No
 
 
 def _compare_roots(root_a: Path, root_b: Path, max_files: int | None, seed: int) -> None:  # noqa: C901
+    """Compare two output directories for determinism (same code + inputs → same output).
+
+    Three-tier comparison strategy, each progressively more expensive:
+    1. Directory tree structure (file paths must match exactly)
+    2. File sizes (cheap; catches most non-determinism from different row counts
+       or compression differences)
+    3. Row counts for a sample of Parquet files (controlled by --max-files)
+
+    This does NOT do byte-for-byte comparison because Parquet writer versions
+    and compression settings may produce bitwise-different files with identical
+    logical content.  Size + row count is sufficient for migration QA purposes.
+    """
     if not root_b.exists() or not root_b.is_dir():
         _fail(f"--compare-root is not a directory: {root_b}")
 
@@ -885,6 +957,23 @@ def _validate_run_artifacts(run_dir: Path, expected_parquet_count: int | None = 
 
 
 def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
+    """Orchestrate validation in sequential phases.
+
+    Phase architecture rationale: phases are ordered from cheapest to most
+    expensive.  If a cheap check (schema, partition integrity) fails, expensive
+    checks (streaming sort, DST) are never reached.  This fail-fast approach
+    minimizes wall-clock time when data is corrupt.
+
+    Phases:
+      1. Discovery — find partitions and Parquet files
+      1b. Compare — structural determinism check (optional, fail-fast)
+      2. Metadata — schema contract + partition integrity (metadata-only I/O)
+      3. Sortedness + duplicates — streaming or sample-based (configurable)
+      4. Datetime invariants — per-file collect + merge (all files)
+      5. DST Option B — per-file collect + merge (optional)
+      6. Run artifacts — plan.json, manifests, summaries (optional)
+      7. Report — build and write validation summary
+    """
     p = argparse.ArgumentParser(description="Validate ComEd month-output parquet dataset contract.")
     p.add_argument(
         "--out-root", required=True, help="Converted dataset output root containing year=YYYY/month=MM partitions."

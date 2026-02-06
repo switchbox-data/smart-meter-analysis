@@ -1,4 +1,46 @@
 #!/usr/bin/env python3
+"""Deterministic, resumable CSV-to-Parquet month migration runner.
+
+Architecture
+------------
+Orchestrates conversion of ~30k wide-format ComEd smart-meter CSVs per month
+into Hive-partitioned Parquet (year=YYYY/month=MM).
+
+Key design decisions:
+
+1. **Batch-level atomicity** — Files are grouped into fixed-size batches.  Each
+   batch produces exactly one Parquet file, written to a staging directory and
+   atomically published via ``os.replace()``.  Readers never see partial output.
+
+2. **Resume / checkpointing** — Per-file success is recorded in JSONL manifests.
+   Re-running with ``--resume`` skips already-succeeded inputs, enabling safe
+   restarts after crashes or OOMs without re-processing the entire month.
+
+3. **Deterministic output** — Inputs are sorted lexicographically before batching
+   so batch composition is reproducible.  Within each batch, rows are globally
+   sorted by ``(zip_code, account_identifier, datetime)`` before writing.
+
+4. **Lazy-then-collect execution** — The ``lazy_sink`` mode builds LazyFrames
+   per file, concatenates them, then *materializes* via ``.collect()`` before
+   sorting and writing.  This is required because Polars' streaming
+   ``sink_parquet`` does not honor ``.sort()`` — it processes data in unordered
+   chunks.  Explicit collect → sort → write guarantees sorted output at the cost
+   of batch-level memory.
+
+5. **Thread-pool parallelism** — Batches execute concurrently via
+   ``ThreadPoolExecutor``.  Threads (not processes) are chosen because the
+   per-batch workload is I/O-bound (CSV read → transform → Parquet write) and
+   Polars releases the GIL during its native Rust operations.
+
+6. **Full audit trail** — Every file- and batch-level event is logged to
+   structured JSONL.  ``plan.json``, ``run_summary.json``, and per-batch manifest
+   files provide complete post-hoc reproducibility evidence.
+
+Usage (via Justfile)::
+
+    just migrate-month 202307
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -29,10 +71,16 @@ from smart_meter_analysis.wide_to_long import transform_wide_to_long, transform_
 JsonDict = dict[str, Any]
 Status = Literal["start", "success", "failure", "skip", "warning", "info"]
 
-# Deterministic canonical sort order (boss-approved, updated):
-# zip_code, account_identifier, datetime
+# Canonical sort order for all batch output.  This three-column key is the
+# contract shared with validate_month_output.py — both must agree exactly.
+# Ordering rationale: zip_code groups geographically co-located accounts,
+# account_identifier within zip provides stable per-meter ordering, and
+# datetime gives the natural time series within each meter.
 SORT_KEYS: tuple[str, str, str] = ("zip_code", "account_identifier", "datetime")
 
+# Minimum columns required in the upstream wide CSV to proceed with transform.
+# If any are absent, the CSV is structurally invalid — fail-loud rather than
+# attempting partial output that would silently corrupt downstream analysis.
 REQUIRED_WIDE_COLS: tuple[str, ...] = (
     "ZIP_CODE",
     "DELIVERY_SERVICE_CLASS",
@@ -45,6 +93,9 @@ REQUIRED_WIDE_COLS: tuple[str, ...] = (
     "NSPL_VALUE",
 )
 
+# Canonical output schema (exact column order).  All Parquet files produced by
+# this runner must have exactly these columns in this order.  The validator
+# (validate_month_output.py) cross-checks against this contract.
 FINAL_LONG_COLS: tuple[str, ...] = (
     "zip_code",
     "delivery_service_class",
@@ -73,29 +124,35 @@ DEFAULT_SKIP_EXISTING_BATCH_OUTPUTS = True
 
 @dataclass(frozen=True)
 class RunnerConfig:
+    """Immutable run configuration resolved from CLI arguments at startup.
+
+    Frozen to prevent accidental mutation during concurrent batch execution.
+    All filesystem paths are resolved to absolute at construction time so that
+    batch workers can operate independently of working-directory changes.
+    """
+
     year_month: str  # YYYYMM
     input_list: Path
-    out_root: Path  # dataset root
-    run_id: str
+    out_root: Path  # dataset root (Hive partitions live here)
+    run_id: str  # unique per invocation; used for artifact directory naming
 
     workers: int
     batch_size: int
-    resume: bool
+    resume: bool  # when True, skip inputs already logged as success in manifests
     dry_run: bool
     fail_fast: bool
-    max_errors: int
-    max_files: int | None
+    max_errors: int  # per-batch error budget before aborting
+    max_files: int | None  # optional cap on total inputs (for testing)
 
-    shard_id: int | None
+    shard_id: int | None  # enables filename-safe parallel sharding
 
-    # Phase A/B ergonomics
-    skip_existing_batch_outputs: bool
-    overwrite: bool
+    skip_existing_batch_outputs: bool  # batch-level idempotence guard
+    overwrite: bool  # opt-in to overwrite existing batch outputs
 
-    run_dir: Path
-    log_jsonl: Path
-    manifest_dir: Path
-    staging_dir: Path
+    run_dir: Path  # _runs/<YYYYMM>/<run_id>/ — all artifacts live here
+    log_jsonl: Path  # structured event log (append-only)
+    manifest_dir: Path  # per-batch JSONL manifests for resume
+    staging_dir: Path  # temp write location for atomic publish
 
     print_failures: int
 
@@ -107,6 +164,12 @@ class RunnerConfig:
 
 @dataclass(frozen=True)
 class BatchPlan:
+    """A unit of work: a group of input CSVs that will produce one Parquet file.
+
+    batch_id is zero-padded (batch_0000, batch_0001, ...) for deterministic
+    filesystem ordering and human readability in logs.
+    """
+
     batch_id: str
     inputs: list[str]
 
@@ -117,6 +180,14 @@ class BatchPlan:
 
 
 class JsonlLogger:
+    """Thread-safe, append-only structured event logger.
+
+    Uses a threading.Lock to serialize writes from concurrent batch workers.
+    JSONL (one JSON object per line) is chosen over CSV or multi-line JSON
+    because it is append-safe, grep-friendly, and trivially parseable for
+    post-hoc analysis (e.g., extracting failure events from a 100k-line log).
+    """
+
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()
@@ -141,6 +212,13 @@ def stable_hash(s: str) -> str:
 
 
 def try_git_info() -> JsonDict:
+    """Capture git SHA and dirty state for the audit trail.
+
+    Best-effort: returns None fields if git is unavailable (e.g., in Docker
+    images without git).  This is logged in plan.json to tie output artifacts
+    back to the exact code version that produced them.
+    """
+
     def _run(args: list[str]) -> str | None:
         try:
             cp = subprocess.run(args, check=False, capture_output=True, text=True)  # noqa: S603
@@ -170,6 +248,11 @@ def build_env_info() -> JsonDict:
 
 
 def _read_rss_bytes() -> int | None:
+    """Read resident set size from /proc/self/status (Linux only).
+
+    Used with --debug-mem to track per-batch memory growth and detect leaks
+    during long-running migrations.  Returns None on non-Linux platforms.
+    """
     try:
         with open("/proc/self/status", encoding="utf-8") as f:
             for line in f:
@@ -215,6 +298,12 @@ def _snapshot_dir(path: Path, limit: int = 2000) -> dict[str, int]:
 
 
 def normalize_input_path(p: str) -> str:
+    """Canonicalize an input path for deterministic deduplication.
+
+    S3 URIs are kept as-is (already canonical); local paths are resolved to
+    absolute so that the same file referenced via different relative paths
+    (e.g., ./foo.csv vs ../dir/foo.csv) produces the same manifest key.
+    """
     p = p.strip()
     if not p:
         return p
@@ -224,6 +313,13 @@ def normalize_input_path(p: str) -> str:
 
 
 def load_inputs(input_list: Path) -> list[str]:
+    """Load and sort the input file list.
+
+    Sorting is critical for determinism: it ensures that the same set of inputs
+    always produces the same batch assignments, regardless of the order in which
+    ``aws s3 ls`` or ``find`` emits them.  This makes runs reproducible across
+    retries and enables meaningful determinism comparisons between outputs.
+    """
     if not input_list.exists():
         raise SystemExit(f"--input-list not found: {input_list}")
     raw = input_list.read_text(encoding="utf-8").splitlines()
@@ -235,6 +331,13 @@ def load_inputs(input_list: Path) -> list[str]:
 
 
 def make_batches(inputs_sorted: list[str], batch_size: int) -> list[BatchPlan]:
+    """Partition the sorted input list into fixed-size, sequentially-numbered batches.
+
+    Sequential numbering (batch_0000, batch_0001, ...) is required for:
+    - deterministic output filenames that sort naturally on disk
+    - resume correctness (batch_id is the checkpoint key)
+    - human readability in logs and manifest files
+    """
     if batch_size <= 0:
         raise SystemExit("--batch-size must be > 0")
     out: list[BatchPlan] = []
@@ -268,6 +371,14 @@ def to_jsonable(x: Any) -> Any:
 
 
 def iter_manifest_success_inputs(manifest_dir: Path) -> set[str]:
+    """Build the set of input paths that previously succeeded (for --resume).
+
+    Scans all manifest JSONL files and collects input_path values with
+    status=success.  This set is used as a skip-list so that resumed runs
+    don't re-transform files that already completed.  The manifest is the
+    source of truth — not the presence of output files — because a crash
+    could leave partial staging files without a success record.
+    """
     if not manifest_dir.exists():
         return set()
 
@@ -293,6 +404,17 @@ def iter_manifest_success_inputs(manifest_dir: Path) -> set[str]:
 
 
 def build_wide_schema() -> dict[str, pl.DataType]:
+    """Construct an explicit Polars schema for the upstream wide CSV.
+
+    An explicit schema is used instead of inference because:
+    - Inference is nondeterministic across files (a column that happens to have
+      all-integer values in one file may be inferred as Int64, while another
+      file with the same column may be inferred as Float64).
+    - ZIP_CODE and ACCOUNT_IDENTIFIER must be read as Utf8 to preserve leading
+      zeros (e.g., ZIP 01234).
+    - INTERVAL_READING_DATE is read as Utf8 and parsed downstream with an
+      explicit date format to avoid DD/MM vs MM/DD ambiguity.
+    """
     schema: dict[str, pl.DataType] = {
         "ZIP_CODE": pl.Utf8,
         "DELIVERY_SERVICE_CLASS": pl.Utf8,
@@ -314,6 +436,12 @@ def build_wide_schema() -> dict[str, pl.DataType]:
 
 
 def validate_wide_contract(df: pl.DataFrame) -> None:
+    """Fail-loud pre-transform contract check on an eager DataFrame.
+
+    Checks required columns exist and INTERVAL_LENGTH is uniformly 1800s (30 min).
+    This is the authoritative guard against upstream schema drift — catching it
+    here prevents corrupt long output from being written to the batch Parquet file.
+    """
     missing = [c for c in REQUIRED_WIDE_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required wide columns: {missing}")
@@ -344,6 +472,12 @@ def validate_wide_contract(df: pl.DataFrame) -> None:
 
 
 def validate_wide_contract_lf(lf: pl.LazyFrame) -> None:
+    """Lazy-mode equivalent of validate_wide_contract.
+
+    Both eager and lazy variants exist because the runner supports two execution
+    modes.  The lazy variant avoids full materialization — it collects only the
+    bad-row count and a small diagnostic sample.
+    """
     cols = lf.collect_schema().names()
     missing = [c for c in REQUIRED_WIDE_COLS if c not in cols]
     if missing:
@@ -369,6 +503,15 @@ def validate_wide_contract_lf(lf: pl.LazyFrame) -> None:
 
 
 def shape_long_after_transform(df: pl.DataFrame) -> pl.DataFrame:
+    """Enforce canonical column names, dtypes, and order on the transform output.
+
+    This is a defensive layer between wide_to_long.py (which owns the transform
+    logic) and the Parquet writer (which requires an exact schema).  It handles:
+    - Legacy column naming (interval_energy → energy_kwh)
+    - Dtype coercion to the canonical 10-column schema
+    - Adding year/month partition columns derived from datetime
+    - Projecting to FINAL_LONG_COLS in exact order
+    """
     out = df
     if "energy_kwh" not in out.columns and "interval_energy" in out.columns:
         out = out.rename({"interval_energy": "energy_kwh"})
@@ -408,6 +551,7 @@ def shape_long_after_transform(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def shape_long_after_transform_lf(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Lazy-mode equivalent of shape_long_after_transform."""
     cols = lf.collect_schema().names()
     if "energy_kwh" not in cols and "interval_energy" in cols:
         lf = lf.rename({"interval_energy": "energy_kwh"})
@@ -445,6 +589,12 @@ def shape_long_after_transform_lf(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def validate_year_month(df: pl.DataFrame, year_month: str) -> None:
+    """Guard against partition spillover: every row must belong to the target month.
+
+    A CSV file dated in July that contains even one row with a datetime in August
+    would corrupt the Hive partition.  Catching this at transform time (rather
+    than post-hoc validation) prevents bad data from being written to disk.
+    """
     y = int(year_month[:4])
     m = int(year_month[4:6])
     bad = df.filter((pl.col("year") != y) | (pl.col("month") != m)).height
@@ -453,6 +603,7 @@ def validate_year_month(df: pl.DataFrame, year_month: str) -> None:
 
 
 def validate_year_month_lf(lf: pl.LazyFrame, year_month: str) -> None:
+    """Lazy-mode equivalent of validate_year_month."""
     y = int(year_month[:4])
     m = int(year_month[4:6])
     bad = (
@@ -465,9 +616,16 @@ def validate_year_month_lf(lf: pl.LazyFrame, year_month: str) -> None:
         raise ValueError(f"--year-month {year_month} validation failed: bad_rows={int(bad)}")
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Paths / deterministic output naming
-# -----------------------------
+#
+# Output path structure: <out_root>/year=YYYY/month=MM/<batch_id>.parquet
+# Staging path structure: <staging_dir>/<batch_id>/year=YYYY/month=MM/<batch_id>.parquet
+#
+# The staging directory mirrors the final path hierarchy so that atomic_publish
+# can use a single os.replace() call.  When sharding is enabled, filenames
+# include the shard_id prefix to avoid collisions between parallel shards.
+# ---------------------------------------------------------------------------
 
 
 def year_month_dirs(year_month: str) -> tuple[str, str]:
@@ -493,6 +651,13 @@ def staging_batch_out_path(cfg: RunnerConfig, batch_id: str) -> Path:
 
 
 def atomic_publish(staging_path: Path, final_path: Path, overwrite: bool) -> None:
+    """Move a completed batch file from staging to its final location.
+
+    Uses os.replace() for atomicity on POSIX filesystems: the destination either
+    has the old file or the new file, never a partially-written one.  This is
+    essential because downstream readers (validators, queries) may access the
+    output directory concurrently during long-running migrations.
+    """
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if overwrite:
         os.replace(str(staging_path), str(final_path))
@@ -526,6 +691,18 @@ def run_batch(
     skip_set: set[str],
     stop_flag: threading.Event,
 ) -> JsonDict:
+    """Execute one batch: read CSVs, transform, sort, write Parquet.
+
+    This is the core unit of work.  Each batch:
+    1. Checks whether the final output already exists (batch-level idempotence).
+    2. Iterates over input files, transforming each wide CSV to long format.
+    3. Concatenates all long DataFrames within the batch.
+    4. Sorts by SORT_KEYS and writes a single Parquet file to staging.
+    5. Atomically publishes the staging file to the final output location.
+    6. Records per-file status in the batch manifest for resume support.
+
+    Returns a batch summary dict logged to both the JSONL log and a JSON file.
+    """
     t_batch0 = time.time()
     manifest_path, summary_path = batch_manifest_paths(cfg, batch.batch_id)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -918,6 +1095,11 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
 
 
 def sample_failures_from_log(log_path: Path, n: int) -> list[dict[str, Any]]:
+    """Extract a bounded sample of failure events from the run log for stderr output.
+
+    Provides immediate diagnostic visibility at the end of a run without
+    requiring the operator to manually parse the full JSONL log.
+    """
     if n <= 0 or (not log_path.exists()):
         return []
     out: list[dict[str, Any]] = []
@@ -943,8 +1125,17 @@ def sample_failures_from_log(log_path: Path, n: int) -> list[dict[str, Any]]:
 
 
 def main(argv: Sequence[str]) -> int:
+    """Entry point: plan → (optionally resume) → execute batches → summarize.
+
+    Signal handling: SIGINT/SIGTERM set a cooperative stop flag rather than
+    killing workers abruptly.  In-flight batches complete their current file
+    and exit cleanly, ensuring manifests reflect actual work done.  This is
+    critical for resume correctness — an unrecorded partial write would cause
+    duplicate processing on retry.
+    """
     cfg = parse_args(argv)
 
+    # Cooperative shutdown: workers check stop_flag between files.
     stop_flag = threading.Event()
 
     def _handle_signal(_signum: int, _frame: Any) -> None:
@@ -1052,6 +1243,12 @@ def main(argv: Sequence[str]) -> int:
     t0 = time.time()
     summaries: list[JsonDict] = []
 
+    # ThreadPoolExecutor is preferred over ProcessPoolExecutor because:
+    # - Polars releases the GIL during native Rust operations (CSV parse, sort,
+    #   Parquet write), so threads achieve true parallelism for the heavy work.
+    # - Threads share memory, avoiding the serialization overhead of passing
+    #   DataFrames between processes.
+    # - Simpler error propagation and signal handling.
     with cf.ThreadPoolExecutor(max_workers=cfg.workers) as ex:
         futs: dict[cf.Future[JsonDict], BatchPlan] = {}
         for b in batches:
