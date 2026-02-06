@@ -172,3 +172,10 @@ results/
 profiles/
 docs/*.html
 docs/index_files/
+
+# Local run artifacts (shard lists, input lists, temp dirs)
+*.txt
+.tmp/
+archive_quarantine/
+tmp_polars_run_*/
+subagent_packages/

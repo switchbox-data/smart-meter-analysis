@@ -73,6 +73,46 @@ pipeline-debug YEAR_MONTH:
 download-transform YEAR_MONTH MAX_FILES="":
     uv run python -m smart_meter_analysis.aws_loader {{YEAR_MONTH}} {{MAX_FILES}}
 
+# CSV-to-Parquet migration (EC2 only). Generates S3 input list then runs migration.
+# EC2 guard: /ebs is the EBS data volume mounted only on the project's EC2 instance.
+#   Running locally would fail on S3 reads and produce output in the wrong location.
+# Input list: `aws s3 ls` discovers all CSVs for the month, piped through awk to
+#   reconstruct full S3 URIs, then sorted for deterministic batch assignment.
+# Parameters:
+#   --batch-size 100: balances memory (~100 CSVs * ~48 rows * 48 intervals each ≈
+#     230k rows/batch) against Parquet file count (300 files for 30k inputs).
+#   --workers 6: tuned for the r5.2xlarge (8 vCPU) — leaves headroom for OS and I/O.
+#   --resume: enables safe restart after crash/OOM without re-processing.
+#   --exec-mode lazy_sink: builds LazyFrames to minimize peak memory per file.
+# Usage: just migrate-month 202307
+migrate-month YEAR_MONTH:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d /ebs ]; then
+        echo "ERROR: /ebs not found. This command must be run on EC2." >&2
+        exit 1
+    fi
+    INPUT_LIST="$HOME/s3_paths_{{YEAR_MONTH}}_full.txt"
+    OUT_ROOT="/ebs/home/griffin_switch_box/runs/out_{{YEAR_MONTH}}_production"
+    echo "Generating S3 input list for {{YEAR_MONTH}}..."
+    aws s3 ls "s3://smart-meter-data-sb/sharepoint-files/Zip4/{{YEAR_MONTH}}/" --recursive \
+        | awk '{print "s3://smart-meter-data-sb/"$4}' \
+        | sort > "$INPUT_LIST"
+    N=$(wc -l < "$INPUT_LIST")
+    if [ "$N" -eq 0 ]; then
+        echo "ERROR: No S3 objects found for {{YEAR_MONTH}}. Check bucket path." >&2
+        exit 1
+    fi
+    echo "migrate-month {{YEAR_MONTH}}: $N inputs -> $OUT_ROOT"
+    python scripts/csv_to_parquet/migrate_month_runner.py \
+        --input-list "$INPUT_LIST" \
+        --out-root "$OUT_ROOT" \
+        --year-month {{YEAR_MONTH}} \
+        --batch-size 100 \
+        --workers 6 \
+        --resume \
+        --exec-mode lazy_sink
+
 # =============================================================================
 # 🧪 SAMPLE DATA (S3 + Synthetic)
 # =============================================================================
