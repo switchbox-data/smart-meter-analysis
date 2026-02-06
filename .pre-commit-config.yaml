@@ -13,6 +13,7 @@ repos:
         args: [--autofix, --no-sort-keys]
       - id: end-of-file-fixer
       - id: trailing-whitespace
+      - id: detect-private-key
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: "v0.11.5"
@@ -20,3 +21,11 @@ repos:
       - id: ruff
         args: [--exit-non-zero-on-fix]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: forbid-secrets
+        name: Block secrets and credential files
+        entry: "bash -c 'echo BLOCKED: secrets/credential file staged for commit >&2; exit 1'"
+        language: system
+        files: '(\.env$|\.env\.|\.secrets|\.secret|credentials\.json|\.pem$|\.key$|\.p12$|\.pfx$|\.jks$)'
