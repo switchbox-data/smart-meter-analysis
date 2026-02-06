@@ -73,17 +73,27 @@ pipeline-debug YEAR_MONTH:
 download-transform YEAR_MONTH MAX_FILES="":
     uv run python -m smart_meter_analysis.aws_loader {{YEAR_MONTH}} {{MAX_FILES}}
 
-# CSV-to-Parquet migration (EC2 production). Usage: just migrate-month 202307
+# CSV-to-Parquet migration (EC2 only). Generates S3 input list then runs migration.
+# Usage: just migrate-month 202307
 migrate-month YEAR_MONTH:
     #!/usr/bin/env bash
     set -euo pipefail
-    OUT_ROOT="/ebs/home/griffin_switch_box/runs/out_{{YEAR_MONTH}}_production"
-    INPUT_LIST="$HOME/s3_paths_{{YEAR_MONTH}}_full.txt"
-    if [ ! -f "$INPUT_LIST" ]; then
-        echo "ERROR: Input list not found: $INPUT_LIST" >&2
+    if [ ! -d /ebs ]; then
+        echo "ERROR: /ebs not found. This command must be run on EC2." >&2
         exit 1
     fi
-    echo "migrate-month {{YEAR_MONTH}}: $(wc -l < "$INPUT_LIST") inputs -> $OUT_ROOT"
+    INPUT_LIST="$HOME/s3_paths_{{YEAR_MONTH}}_full.txt"
+    OUT_ROOT="/ebs/home/griffin_switch_box/runs/out_{{YEAR_MONTH}}_production"
+    echo "Generating S3 input list for {{YEAR_MONTH}}..."
+    aws s3 ls "s3://smart-meter-data-sb/sharepoint-files/Zip4/{{YEAR_MONTH}}/" --recursive \
+        | awk '{print "s3://smart-meter-data-sb/"$4}' \
+        | sort > "$INPUT_LIST"
+    N=$(wc -l < "$INPUT_LIST")
+    if [ "$N" -eq 0 ]; then
+        echo "ERROR: No S3 objects found for {{YEAR_MONTH}}. Check bucket path." >&2
+        exit 1
+    fi
+    echo "migrate-month {{YEAR_MONTH}}: $N inputs -> $OUT_ROOT"
     python scripts/csv_to_parquet/migrate_month_runner.py \
         --input-list "$INPUT_LIST" \
         --out-root "$OUT_ROOT" \
