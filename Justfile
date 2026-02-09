@@ -139,7 +139,7 @@ migrate-month YEAR_MONTH:
 
     echo "Wrote $(wc -l < "$INPUT_LIST") CSVs to $INPUT_LIST"
 
-    python3 scripts/csv_to_parquet/migrate_month_runner.py \
+    uv run python scripts/csv_to_parquet/migrate_month_runner.py \
       --input-list "$INPUT_LIST" \
       --out-root "$OUT_ROOT" \
       --year-month "{{YEAR_MONTH}}" \
