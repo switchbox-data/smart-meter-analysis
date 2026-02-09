@@ -9,7 +9,6 @@ default:
 # =============================================================================
 
 install:
-    echo "🚀 Creating virtual environment using uv"
     uv sync
     uv run pre-commit install
 
@@ -20,8 +19,6 @@ update:
 # 🔍 AWS
 # =============================================================================
 
-# Authenticate with AWS via SSO (for manual AWS CLI usage like S3 access)
-# Automatically configures SSO if not already configured
 aws:
     .devcontainer/devpod/aws.sh
 
@@ -29,40 +26,27 @@ aws:
 # 🚀 DEVELOPMENT ENVIRONMENT
 # =============================================================================
 
-# Ensure Terraform is installed (internal dependency). Depends on aws so credentials
-# are valid before any Terraform or infra script runs.
 _terraform: aws
     bash infra/install-terraform.sh
 
-# Set up EC2 instance (run once by admin)
-# Idempotent: safe to run multiple times
 dev-setup: _terraform
     bash infra/dev-setup.sh
 
-# Destroy EC2 instance but preserve data volume (to recreate, run dev-setup again)
 dev-teardown: _terraform
     bash infra/dev-teardown.sh
 
-# Destroy everything including data volume (WARNING: destroys all data!)
 dev-teardown-all: _terraform
     bash infra/dev-teardown-all.sh
 
-# User login (run by any authorized user)
 dev-login: aws
     bash infra/dev-login.sh
 
 # =============================================================================
-# 🔄 DATA PIPELINE
+# 🔄 DATA PIPELINE (ANALYTICS)
 # =============================================================================
-
-test-pipeline-local:
-    uv run python scripts/run_comed_pipeline.py --source local
 
 pipeline YEAR_MONTH:
     uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --source s3
-
-test-pipeline YEAR_MONTH MAX_FILES="10":
-    uv run mprof run scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --max-files {{MAX_FILES}} --source s3
 
 pipeline-skip-download YEAR_MONTH:
     uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --skip-download --source s3
@@ -70,305 +54,219 @@ pipeline-skip-download YEAR_MONTH:
 pipeline-debug YEAR_MONTH:
     uv run python scripts/run_comed_pipeline.py --year-month {{YEAR_MONTH}} --debug --source s3
 
-download-transform YEAR_MONTH MAX_FILES="":
-    uv run python -m smart_meter_analysis.aws_loader {{YEAR_MONTH}} {{MAX_FILES}}
+# =============================================================================
+# 🔄 CSV → PARQUET MIGRATION (PORTABLE + OPEN SOURCE SAFE)
+# =============================================================================
+# Operator configuration:
+#   .env.comed (gitignored) may define:
+#     COMED_S3_PREFIX
+#     COMED_MIGRATE_OUT_BASE
+#     COMED_MIGRATE_BATCH_SIZE
+#     COMED_MIGRATE_WORKERS
+#     CONTINUE_ON_ERROR
+#     COMED_ORCHESTRATOR_LOG_DIR
 
-# CSV-to-Parquet migration (EC2 only). Generates S3 input list then runs migration.
-# EC2 guard: /ebs is the EBS data volume mounted only on the project's EC2 instance.
-#   Running locally would fail on S3 reads and produce output in the wrong location.
-# Input list: `aws s3 ls` discovers all CSVs for the month, piped through awk to
-#   reconstruct full S3 URIs, then sorted for deterministic batch assignment.
-# Parameters:
-#   --batch-size 100: balances memory (~100 CSVs * ~48 rows * 48 intervals each ≈
-#     230k rows/batch) against Parquet file count (300 files for 30k inputs).
-#   --workers 6: tuned for the r5.2xlarge (8 vCPU) — leaves headroom for OS and I/O.
-#   --resume: enables safe restart after crash/OOM without re-processing.
-#   --exec-mode lazy_sink: builds LazyFrames to minimize peak memory per file.
-# Usage: just migrate-month 202307
+S3_PREFIX            := env_var_or_default("COMED_S3_PREFIX", "")
+MIGRATE_OUT_BASE     := env_var_or_default("COMED_MIGRATE_OUT_BASE", "")
+MIGRATE_BATCH_SIZE   := env_var_or_default("COMED_MIGRATE_BATCH_SIZE", "100")
+MIGRATE_WORKERS      := env_var_or_default("COMED_MIGRATE_WORKERS", "6")
+CONTINUE_ON_ERROR    := env_var_or_default("CONTINUE_ON_ERROR", "")
+ORCHESTRATOR_LOG_DIR := env_var_or_default("COMED_ORCHESTRATOR_LOG_DIR", "")
+OUT_ROOT_TEMPLATE    := env_var_or_default("COMED_OUT_ROOT_TEMPLATE", "")
+
+# -----------------------------------------------------------------------------
+# List available YYYYMM months from S3
+# -----------------------------------------------------------------------------
+
+months-from-s3 OUT_FILE PREFIX=S3_PREFIX:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f ".env.comed" ]; then source ".env.comed"; fi
+
+    prefix="{{PREFIX}}"
+    if [ -z "$prefix" ]; then prefix="${COMED_S3_PREFIX:-}"; fi
+    if [ -z "$prefix" ]; then
+        echo "ERROR: S3 prefix not set. Use COMED_S3_PREFIX or PREFIX=..." >&2
+        exit 1
+    fi
+    prefix="${prefix%/}/"
+
+    AWS_PAGER="" aws s3 ls "$prefix" \
+      | awk '/PRE/ {gsub(/\//,"",$2); if ($2 ~ /^[0-9]{6}$/) print $2}' \
+      | sort -u > "{{OUT_FILE}}"
+
+    echo "Wrote $(wc -l < "{{OUT_FILE}}") months to {{OUT_FILE}}"
+
+# -----------------------------------------------------------------------------
+# Single-month migration (EC2 only)
+# -----------------------------------------------------------------------------
+
 migrate-month YEAR_MONTH:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ -f ".env.comed" ]; then source ".env.comed"; fi
+
     if [ ! -d /ebs ]; then
-        echo "ERROR: /ebs not found. This command must be run on EC2." >&2
+        echo "ERROR: /ebs not found. Must run on EC2 with EBS mounted." >&2
         exit 1
     fi
+
+    prefix="{{S3_PREFIX}}"
+    if [ -z "$prefix" ]; then prefix="${COMED_S3_PREFIX:-}"; fi
+    if [ -z "$prefix" ]; then
+        echo "ERROR: S3 prefix not set. Use COMED_S3_PREFIX or S3_PREFIX=..." >&2
+        exit 1
+    fi
+    prefix="${prefix%/}/"
+
+    bucket=$(echo "$prefix" | sed 's|^s3://||' | cut -d/ -f1)
+
+    out_base="{{MIGRATE_OUT_BASE}}"
+    if [ -z "$out_base" ]; then out_base="${COMED_MIGRATE_OUT_BASE:-}"; fi
+    if [ -z "$out_base" ]; then out_base="/ebs/home/$(whoami)/runs"; fi
+
     INPUT_LIST="$HOME/s3_paths_{{YEAR_MONTH}}_full.txt"
-    OUT_ROOT="/ebs/home/griffin_switch_box/runs/out_{{YEAR_MONTH}}_production"
-    echo "Generating S3 input list for {{YEAR_MONTH}}..."
-    aws s3 ls "s3://smart-meter-data-sb/sharepoint-files/Zip4/{{YEAR_MONTH}}/" --recursive \
-        | awk '{print "s3://smart-meter-data-sb/"$4}' \
-        | sort > "$INPUT_LIST"
-    N=$(wc -l < "$INPUT_LIST")
-    if [ "$N" -eq 0 ]; then
-        echo "ERROR: No S3 objects found for {{YEAR_MONTH}}. Check bucket path." >&2
+    OUT_ROOT="${out_base}/out_{{YEAR_MONTH}}_production"
+
+    AWS_PAGER="" aws s3 ls "${prefix}{{YEAR_MONTH}}/" --recursive \
+      | awk -v b="s3://${bucket}/" '{print b $4}' \
+      | sort > "$INPUT_LIST"
+
+    if [ "$(wc -l < "$INPUT_LIST")" -eq 0 ]; then
+        echo "ERROR: No CSVs found for {{YEAR_MONTH}}" >&2
         exit 1
     fi
-    echo "migrate-month {{YEAR_MONTH}}: $N inputs -> $OUT_ROOT"
+
     python scripts/csv_to_parquet/migrate_month_runner.py \
-        --input-list "$INPUT_LIST" \
-        --out-root "$OUT_ROOT" \
-        --year-month {{YEAR_MONTH}} \
-        --batch-size 100 \
-        --workers 6 \
-        --resume \
-        --exec-mode lazy_sink
+      --input-list "$INPUT_LIST" \
+      --out-root "$OUT_ROOT" \
+      --year-month "{{YEAR_MONTH}}" \
+      --batch-size "{{MIGRATE_BATCH_SIZE}}" \
+      --workers "{{MIGRATE_WORKERS}}" \
+      --resume \
+      --exec-mode lazy_sink
 
-# =============================================================================
-# 🧪 SAMPLE DATA (S3 + Synthetic)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Multi-month migration (sequential)
+# -----------------------------------------------------------------------------
 
-download-samples YEAR_MONTH="202308" NUM_FILES="5":
-    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files {{NUM_FILES}}
-
-download-samples-small YEAR_MONTH="202308":
-    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 3
-
-download-samples-large YEAR_MONTH="202308":
-    uv run python scripts/testing/download_samples_from_s3.py --year-month {{YEAR_MONTH}} --num-files 10
-
-generate-samples:
-    uv run python scripts/testing/generate_sample_data.py
-
-generate-samples-custom ACCOUNTS DAYS START_DATE:
-    uv run python scripts/testing/generate_sample_data.py --num-accounts {{ACCOUNTS}} --num-days {{DAYS}} --start-date {{START_DATE}}
-
-validate-local:
-    uv run python scripts/diagnostics/validate_pipeline.py --input data/processed/comed_samples.parquet
-
-inspect-dst-local:
-    uv run python scripts/diagnostics/inspect_dst_days.py --input data/processed/comed_samples.parquet --start 2023-11-01 --end 2023-11-10
-
-view-sample:
-    @ls data/samples/*.csv 2>/dev/null | head -1 | xargs head -n 5 || echo "No samples found. Run: just download-samples"
-
-clean-samples:
-    rm -rf data/samples/*.csv
-    @echo "Sample data cleaned"
-
-# =============================================================================
-# 🗄️  DATA COLLECTION
-# =============================================================================
-
-download-ameren:
-    uv run python scripts/data_collection/ameren_scraper.py
-
-download-ameren-force:
-    uv run python scripts/data_collection/ameren_scraper.py --force
-
-download-ameren-debug:
-    uv run python scripts/data_collection/ameren_scraper.py --debug
-
-# =============================================================================
-# 🏙️ CHICAGO-WIDE SAMPLER
-# =============================================================================
-
-sample-city zips start end out bucket prefix target="200" cm90="":
+migrate-months MONTHS_FILE:
     #!/usr/bin/env bash
     set -euo pipefail
-    CM90="{{cm90}}"
-    if [ -n "$CM90" ]; then EXTRA="--cm90 $CM90"; else EXTRA=""; fi
-    python scripts/tasks/task_runner.py sample \
-      --zips "{{zips}}" \
-      --start "{{start}}" \
-      --end "{{end}}" \
-      --bucket "{{bucket}}" \
-      --prefix-base "{{prefix}}" \
-      --target-per-zip {{target}} \
-      --out "{{out}}" \
-      $EXTRA
+    if [ -f ".env.comed" ]; then source ".env.comed"; fi
 
-sample-city-file zips_file start end out bucket prefix target="100" cm90="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    CM90="{{cm90}}"
-    if [ -n "$CM90" ]; then EXTRA="--cm90 $CM90"; else EXTRA=""; fi
-    python scripts/tasks/task_runner.py sample \
-      --zips-file "{{zips_file}}" \
-      --start "{{start}}" \
-      --end "{{end}}" \
-      --bucket "{{bucket}}" \
-      --prefix-base "{{prefix}}" \
-      --target-per-zip {{target}} \
-      --out "{{out}}" \
-      $EXTRA
-
-viz inp out:
-    python scripts/tasks/task_runner.py viz --inp "{{inp}}" --out "{{out}}"
-
-# =============================================================================
-# 📊 BENCHMARKS (eager vs lazy)
-# =============================================================================
-
-# Run a specific benchmark: N in {100, 1000, 10000}
-bench-run N MODE="lazy":
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py run \
-        --mode {{MODE}} \
-        --n {{N}}
-
-# Build summary CSV from stored profiles
-bench-summary:
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py summary
-
-# Plot memory curves (requires existing profiles)
-bench-plot:
-    uv run python scripts/bench/eager_vs_lazy_benchmarks.py plot
-
-# Run all benchmarks for eager + lazy
-bench-all:
-    just bench-run 100 eager
-    just bench-run 100 lazy
-    just bench-run 1000 eager
-    just bench-run 1000 lazy
-    just bench-run 10000 eager
-    # lazy 10k intentionally omitted (8+ hrs)
-    @echo "✔ Benchmark suite complete"
-
-# =============================================================================
-# 🔍 CODE QUALITY & TESTING
-# =============================================================================
-
-check:
-    echo "🚀 Checking lock file consistency with 'pyproject.toml'"
-    uv lock --locked
-    echo "🚀 Linting code: Running pre-commit"
-    uv run pre-commit run -a
-    echo "🚀 Static type checking: Running mypy"
-    uv run mypy
-    echo "🚀 Checking for obsolete dependencies: Running deptry"
-    uv run deptry .
-
-test:
-    echo "🚀 Testing code: Running pytest"
-    uv run python -m pytest --doctest-modules
-
-lint:
-    uv run ruff check .
-
-lint-fix:
-    uv run ruff check --fix .
-
-format:
-    uv run ruff format .
-
-typecheck:
-    uv run mypy smart_meter_analysis
-
-test-coverage:
-    uv run pytest --cov=smart_meter_analysis --cov-report=html
-
-# =============================================================================
-# 📚 DOCUMENTATION
-# =============================================================================
-
-docs-test:
-    uv run mkdocs build -s
-
-docs:
-    uv run mkdocs serve
-
-docs-serve:
-    uv run pdoc smart_meter_analysis
-
-# =============================================================================
-# 📊 DATA EXPLORATION
-# =============================================================================
-
-notebook:
-    uv run jupyter notebook
-
-lab:
-    uv run jupyter lab
-
-inspect-data FILE N="10":
-    uv run python -c "import polars as pl; df = pl.scan_parquet('{{FILE}}').limit({{N}}).collect(); print(df)"
-
-inspect-schema FILE:
-    uv run python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').collect_schema())"
-
-count-rows FILE:
-    uv run python -c "import polars as pl; print(pl.scan_parquet('{{FILE}}').select(pl.len()).collect())"
-
-# =============================================================================
-# 🧹 UTILITIES
-# =============================================================================
-
-clean:
-    rm -rf .pytest_cache
-    rm -rf .mypy_cache
-    rm -rf .ruff_cache
-    rm -rf htmlcov
-    rm -rf dist
-    rm -rf *.egg-info
-    find . -type d -name __pycache__ -exec rm -rf {} +
-    find . -type f -name "*.pyc" -delete
-
-clean-data:
-    #!/usr/bin/env bash
-    echo "This will delete processed data files!"
-    echo "Raw data in S3 will not be affected."
-    read -p "Are you sure? (y/N) " -n 1 -r
-    if [[ $$REPLY =~ ^[Yy]$ ]]; then
-        rm -rf data/processed/*
-        echo "Data cleaned"
+    if [ ! -d /ebs ]; then
+        echo "ERROR: /ebs not found. Must run on EC2." >&2
+        exit 1
     fi
 
-du:
-    @echo "Data directory sizes:"
-    @du -sh data/* 2>/dev/null || echo "No data directories found"
+    log_dir="{{ORCHESTRATOR_LOG_DIR}}"
+    if [ -z "$log_dir" ]; then log_dir="/ebs/home/$(whoami)/runs/_orchestrator_logs"; fi
+    mkdir -p "$log_dir"
 
-# =============================================================================
-# 📦 BUILD & RELEASE
-# =============================================================================
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    log_file="$log_dir/migrate_${ts}.log"
 
-clean-build:
+    succeeded=0; failed=0; skipped=0; failures=""
+
+    log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$log_file"; }
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        month=$(echo "$line" | sed 's/#.*//' | tr -d '[:space:]')
+        [ -z "$month" ] && continue
+        if ! echo "$month" | grep -qE '^[0-9]{6}$'; then
+            log "SKIP invalid month: $month"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        rc=0
+        log "START $month"
+        just migrate-month "$month" 2>&1 | tee -a "$log_file" || rc=$?
+        log "END $month rc=$rc"
+
+        if [ "$rc" -eq 0 ]; then
+            succeeded=$((succeeded + 1))
+        else
+            failed=$((failed + 1))
+            failures="$failures $month"
+            if [ "{{CONTINUE_ON_ERROR}}" != "1" ]; then
+                log "ABORT on first failure"
+                break
+            fi
+        fi
+    done < "{{MONTHS_FILE}}"
+
+    log "DONE succeeded=$succeeded failed=$failed skipped=$skipped"
+    [ "$failed" -eq 0 ]
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+validate-month YEAR_MONTH OUT_ROOT MAX_FILES="50" CHECK_MODE="sample" DST="1":
     #!/usr/bin/env bash
-    echo "🚀 Removing build artifacts"
-    rm -rf dist
-    echo "Removed 'dist' (if it existed)."
+    set -euo pipefail
+    run_base="{{OUT_ROOT}}/_runs/{{YEAR_MONTH}}"
+    run_dir=$(ls -1dt "$run_base"/*/ 2>/dev/null | head -1 || true)
+    run_dir="${run_dir%/}"
 
-build: clean-build
-    echo "🚀 Creating wheel file"
-    uvx --from build pyproject-build --installer uv
+    if [ -z "$run_dir" ]; then
+        run_dir="$run_base/_unknown"
+        mkdir -p "$run_dir"
+    fi
 
-publish:
-    echo "🚀 Publishing."
-    uvx twine upload --repository-url https://upload.pypi.org/legacy/ dist/*
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    report="$run_dir/validation_${ts}.json"
 
-build-and-publish: build publish
+    dst_flag=""
+    if [ "{{DST}}" = "1" ]; then dst_flag="--dst-month-check"; fi
 
-# =============================================================================
-# 💡 EXAMPLES
-# =============================================================================
+    python scripts/csv_to_parquet/validate_month_output.py \
+      --out-root "{{OUT_ROOT}}" \
+      --check-mode "{{CHECK_MODE}}" \
+      --max-files "{{MAX_FILES}}" \
+      $dst_flag \
+      --run-dir "$run_dir" \
+      --output-report "$report"
 
-example-quick:
-    @echo "Step 1: Download 5 sample files from S3..."
-    just download-samples-small 202308
-    @echo ""
-    @echo "Step 2: Run pipeline on samples..."
-    just test-pipeline-local
-    @echo ""
-    @echo "Step 3: Inspect results..."
-    just inspect-data data/processed/comed_samples.parquet 10
+    echo "Report: $report"
 
-example-quick-offline:
-    @echo "Step 1: Generate synthetic sample data..."
-    just generate-samples
-    @echo ""
-    @echo "Step 2: Run pipeline on samples..."
-    just test-pipeline-local
-    @echo ""
-    @echo "Step 3: Inspect results..."
-    just inspect-data data/processed/comed_samples.parquet 10
+validate-months MONTHS_FILE OUT_BASE_DIR="/ebs/home/$(whoami)/runs":
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-example-test:
-    @echo "Running test pipeline with 10 files from S3..."
-    just test-pipeline 202308 10
+    log_dir="{{ORCHESTRATOR_LOG_DIR}}"
+    if [ -z "$log_dir" ]; then log_dir="$OUT_BASE_DIR/_orchestrator_logs"; fi
+    mkdir -p "$log_dir"
 
-example-full:
-    @echo "Running full pipeline for August 2023..."
-    @echo "This will take approximately 5-8 hours."
-    just pipeline 202308
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    log_file="$log_dir/validate_${ts}.log"
 
-example-rerun:
-    @echo "Re-running analysis on existing August 2023 data..."
-    just pipeline-skip-download 202308
+    while read -r month; do
+        [ -z "$month" ] && continue
+        out_root="$OUT_BASE_DIR/out_${month}_production"
+        just validate-month "$month" "$out_root" 2>&1 | tee -a "$log_file"
+    done < "{{MONTHS_FILE}}"
+
+# -----------------------------------------------------------------------------
+# Status dashboard
+# -----------------------------------------------------------------------------
+
+migration-status OUT_BASE_DIR="/ebs/home/$(whoami)/runs":
+    #!/usr/bin/env bash
+    for d in "$OUT_BASE_DIR"/out_*_production; do
+        [ -d "$d" ] || continue
+        m=$(basename "$d" | grep -oE '[0-9]{6}')
+        files=$(find "$d" -name "*.parquet" | wc -l)
+        run=$(ls -1dt "$d/_runs/$m/"* 2>/dev/null | head -1)
+        if [ -f "$run/run_summary.json" ]; then
+            python - <<EOF
+import json
+s=json.load(open("$run/run_summary.json"))
+print(f"{m} files={files} success={s['total_success']} failure={s['total_failure']}")
+EOF
+        else
+            echo "$m files=$files (no run_summary.json)"
+        fi
+    done
