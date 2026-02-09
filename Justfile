@@ -129,15 +129,17 @@ migrate-month YEAR_MONTH:
     OUT_ROOT="${out_base}/out_{{YEAR_MONTH}}_production"
 
     AWS_PAGER="" aws s3 ls "${prefix}{{YEAR_MONTH}}/" --recursive \
-      | awk -v b="s3://${bucket}/" '{print b $4}' \
-      | sort > "$INPUT_LIST"
+        | awk -v b="s3://${bucket}/" -v m="{{YEAR_MONTH}}" 'match($4,/ANONYMOUS_DATA_([0-9]{6})_/,a) && a[1]==m {print b $4}' \
+        | sort -u > "$INPUT_LIST"
 
     if [ "$(wc -l < "$INPUT_LIST")" -eq 0 ]; then
         echo "ERROR: No CSVs found for {{YEAR_MONTH}}" >&2
         exit 1
     fi
 
-    python scripts/csv_to_parquet/migrate_month_runner.py \
+    echo "Wrote $(wc -l < "$INPUT_LIST") CSVs to $INPUT_LIST"
+
+    python3 scripts/csv_to_parquet/migrate_month_runner.py \
       --input-list "$INPUT_LIST" \
       --out-root "$OUT_ROOT" \
       --year-month "{{YEAR_MONTH}}" \
@@ -222,7 +224,7 @@ validate-month YEAR_MONTH OUT_ROOT MAX_FILES="50" CHECK_MODE="sample" DST="1":
     dst_flag=""
     if [ "{{DST}}" = "1" ]; then dst_flag="--dst-month-check"; fi
 
-    python scripts/csv_to_parquet/validate_month_output.py \
+    python3 scripts/csv_to_parquet/validate_month_output.py \
       --out-root "{{OUT_ROOT}}" \
       --check-mode "{{CHECK_MODE}}" \
       --max-files "{{MAX_FILES}}" \
@@ -261,11 +263,7 @@ migration-status OUT_BASE_DIR="/ebs/home/$(whoami)/runs":
         files=$(find "$d" -name "*.parquet" | wc -l)
         run=$(ls -1dt "$d/_runs/$m/"* 2>/dev/null | head -1)
         if [ -f "$run/run_summary.json" ]; then
-            python - <<EOF
-import json
-s=json.load(open("$run/run_summary.json"))
-print(f"{m} files={files} success={s['total_success']} failure={s['total_failure']}")
-EOF
+            python3 -c 'import json; s=json.load(open("$run/run_summary.json")); print(f"{m} files={files} success={s['total_success']} failure={s['total_failure']}")'
         else
             echo "$m files=$files (no run_summary.json)"
         fi
