@@ -197,7 +197,7 @@ just dev-teardown-all
 ```
 ⚠️  WARNING: This will destroy EVERYTHING including the data volume!
    All data on the EBS volume will be permanently deleted.
-Are you sure? Type 'yes' to confirm: 
+Are you sure? Type 'yes' to confirm:
 ```
 Type `yes` to confirm, then the cleanup proceeds.
 

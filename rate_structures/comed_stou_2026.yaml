@@ -1,0 +1,47 @@
+name: comed_stou_2026_rate_best_supply
+timezone: America/Chicago
+unit: cents_per_kwh
+holiday_rule: treat_as_weekend
+
+seasons:
+  - name: summer
+    start_mmdd: "06-01"
+    end_mmdd: "09-30"
+    periods:
+      - period: morning
+        start_hour: 6
+        end_hour: 13
+        price: 3.013
+      - period: midday_peak
+        start_hour: 13
+        end_hour: 19
+        price: 18.219
+      - period: evening
+        start_hour: 19
+        end_hour: 21
+        price: 3.090
+      - period: overnight
+        start_hour: 21
+        end_hour: 6
+        price: 1.870
+
+  - name: nonsummer
+    start_mmdd: "10-01"
+    end_mmdd: "05-31"
+    periods:
+      - period: morning
+        start_hour: 6
+        end_hour: 13
+        price: 2.829
+      - period: midday_peak
+        start_hour: 13
+        end_hour: 19
+        price: 16.814
+      - period: evening
+        start_hour: 19
+        end_hour: 21
+        price: 3.086
+      - period: overnight
+        start_hour: 21
+        end_hour: 6
+        price: 2.012
