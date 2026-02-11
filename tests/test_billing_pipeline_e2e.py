@@ -32,7 +32,8 @@ TARIFF_B = Path("data/reference/comed_stou_hourly_prices_2023.parquet")
 CROSSWALK = Path("data/reference/comed_bg_zip4_crosswalk.txt")
 CENSUS = Path("data/reference/census_17_2023.parquet")
 
-# Skip entire module if sample data is missing
+# Skip entire module if sample data is missing. Module-level skip keeps
+# test collection clean in CI environments without the full data checkout.
 pytestmark = pytest.mark.skipif(
     not INTERVAL_DATA.exists() or not TARIFF_A.exists() or not TARIFF_B.exists(),
     reason="Sample data files not found; skipping E2E pipeline tests.",
@@ -42,6 +43,10 @@ pytestmark = pytest.mark.skipif(
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
 
+# Two fixtures: pipeline_run (with regression) and pipeline_skip_regression
+# (without). The full fixture validates regression outputs; the skip fixture
+# runs faster and is used for all non-regression assertions, keeping the
+# test suite tolerable on CI where the E2E run takes ~2 minutes.
 @pytest.fixture(scope="module")
 def pipeline_run(tmp_path_factory: pytest.TempPathFactory) -> dict:
     """Run the orchestrator once for the module; return paths + metadata."""
@@ -64,8 +69,16 @@ def pipeline_run(tmp_path_factory: pytest.TempPathFactory) -> dict:
         str(CROSSWALK),
         "--census",
         str(CENSUS),
+        # Use a single explicit predictor instead of "core" mode because
+        # the smoke-test dataset may not have enough BGs for multi-predictor
+        # OLS to converge. One predictor is sufficient to exercise the full
+        # regression path (join, aggregate, OLS, JSON output).
         "--predictors",
         "median_household_income",
+        # Relaxed thresholds: the smoke-test sample has limited ZIP+4
+        # coverage and few households per BG. In production these would
+        # be 5% / 3 respectively; here we loosen them so the E2E test
+        # exercises the pipeline end-to-end without needing full data.
         "--min-obs-per-bg",
         "1",
         "--max-crosswalk-drop-pct",

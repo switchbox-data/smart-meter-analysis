@@ -56,6 +56,9 @@ def build_hourly_prices(rates: pl.DataFrame, year: int) -> pl.DataFrame:
     )
 
     # --- DST fall-back deduplication (keep earliest UTC per local hour) ---
+    # Must exactly mirror the STOU builder's dedup strategy so the two
+    # price calendars have identical datetime_chicago keys—otherwise the
+    # billing join would fail on one tariff but not the other.
     n_total = df.height
     n_unique = df.select(pl.col("datetime_chicago").n_unique()).item()
     if n_unique != n_total:
@@ -75,6 +78,10 @@ def build_hourly_prices(rates: pl.DataFrame, year: int) -> pl.DataFrame:
     df = df.drop("datetime_aware")
 
     # --- Enforce uniqueness -----------------------------------------------
+    # Belt-and-suspenders: the dedup above should have handled it, but a
+    # bug in the Polars range or an unexpected DST rule change could
+    # reintroduce duplicates—fail loudly rather than let them propagate
+    # into the billing join.
     final_unique = df.select(pl.col("datetime_chicago").n_unique()).item()
     if final_unique != df.height:
         raise ValueError(

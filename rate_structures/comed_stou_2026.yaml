@@ -1,8 +1,13 @@
+# ComEd Space-Time-of-Use rate structure for 2026 (BES supply).
+# All prices are in cents/kWh—matches the pipeline's internal convention
+# and avoids floating-point confusion between cents and dollars.
 name: comed_stou_2026_rate_best_supply
 timezone: America/Chicago
 unit: cents_per_kwh
 holiday_rule: treat_as_weekend
 
+# Hour ranges are half-open [start_hour, end_hour) so adjacent periods
+# tile without overlap.  Wrap-around (e.g. 21→6) is handled in code.
 seasons:
   - name: summer
     start_mmdd: "06-01"
@@ -25,6 +30,8 @@ seasons:
         end_hour: 6
         price: 1.870
 
+  # Nonsummer wraps around the calendar year (Oct 1 → May 31).
+  # _in_season() handles this wrap via day-of-year comparison.
   - name: nonsummer
     start_mmdd: "10-01"
     end_mmdd: "05-31"

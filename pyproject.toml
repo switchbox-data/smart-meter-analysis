@@ -148,6 +148,8 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "analysis/clustering/stage2_multinomial.py" = ["C901"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
+# S603/S607: subprocess calls with variable args are inherent to the
+# orchestrator design (each pipeline step runs as a child process).
 "scripts/run_billing_pipeline.py" = ["S603", "S607"]
 "tests/*" = ["S101", "S603", "RUF001"]
 

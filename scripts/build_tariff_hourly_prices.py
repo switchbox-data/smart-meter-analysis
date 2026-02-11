@@ -96,7 +96,11 @@ def validate_period_coverage(seasons: list[dict[str, Any]]) -> None:
 
 
 def _expand_hour_range(start: int, end: int) -> list[int]:
-    """Expand [start, end) with midnight wrap-around into a list of hours."""
+    """Expand [start, end) with midnight wrap-around into a list of hours.
+
+    Half-open [start, end) so adjacent periods tile without overlap:
+    e.g. [6,13) + [13,19) + [19,21) + [21,6) covers all 24 hours exactly once.
+    """
     if end > start:
         return list(range(start, end))
     # wrap: e.g. 21->6 means [21..24) U [0..6)
@@ -177,7 +181,10 @@ def build_hourly_prices(cfg: dict[str, Any], year: int) -> pl.DataFrame:
         pl.col("datetime_aware").dt.replace_time_zone(None).alias("datetime_chicago"),
     )
 
-    # DST fall-back deduplication: keep earliest UTC occurrence per local hour
+    # DST fall-back deduplication: keep the *first* UTC instant (the CDT
+    # occurrence before the clock falls back). This is arbitrary but
+    # consistent with the flat-rate builder, and downstream joins key on
+    # naive datetime_chicago which must be unique.
     n_total = df.height
     n_unique = df.select(pl.col("datetime_chicago").n_unique()).item()
     if n_unique != n_total:
@@ -211,7 +218,10 @@ def build_hourly_prices(cfg: dict[str, Any], year: int) -> pl.DataFrame:
         (pl.col("day_of_week") >= 5).alias("is_weekend"),
     )
 
-    # Map each row to season / period / price via Python UDF (simple & correct)
+    # Map each row to season / period / price via Python UDF. A pure-Polars
+    # expression would need nested when/then chains for season date ranges
+    # with wrap-around + hour ranges per period—fragile and hard to audit.
+    # The Python loop is ~1s for 8760 rows and trivially matches the YAML.
     season_names: list[str] = []
     period_names: list[str] = []
     prices: list[float] = []

@@ -94,6 +94,9 @@ def _get_git_sha(repo_root: Path) -> str | None:
 
 
 def _run_subprocess(cmd: list[str], *, label: str) -> None:
+    # Each pipeline step runs as a subprocess so that (a) memory is fully
+    # released between steps (Polars/Arrow can be hungry), and (b) a step
+    # crash produces a clean exit code without taking down the orchestrator.
     logger.info("[%s] Running: %s", label, " ".join(cmd))
     r = subprocess.run(cmd, check=False)
     if r.returncode != 0:
@@ -101,6 +104,9 @@ def _run_subprocess(cmd: list[str], *, label: str) -> None:
 
 
 def generate_run_id(months: list[str]) -> str:
+    # Hash includes both the month list and a timestamp so that (a) re-runs
+    # of the same months get distinct directories, and (b) the ID is short
+    # enough for friendly directory names while still collision-resistant.
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     hash_input = ",".join(sorted(months)) + "|" + ts
     short_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:12]
@@ -238,7 +244,9 @@ def build_annual_aggregate(
 
     annual = all_bills.group_by("account_identifier").agg(agg_exprs)
 
-    # Recompute percentage savings from annual totals
+    # Recompute pct_savings from annual sums rather than averaging the
+    # monthly percentages—averaging percentages would weight low-bill
+    # months equally with high-bill months, distorting the result.
     if "bill_a_dollars" in annual.columns and "bill_diff_dollars" in annual.columns:
         annual = annual.with_columns(
             pl.when(pl.col("bill_a_dollars") > 0)
@@ -367,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     # ── Run ID + directories ─────────────────────────────────────────────
     run_id = args.run_name or generate_run_id(months)
     run_dir = args.output_dir / run_id
+    # Hourly loads are large intermediate files only needed during the run;
+    # _tmp/ signals they can be deleted after the pipeline completes.
     tmp_dir = run_dir / "_tmp"
     regression_dir = run_dir / "regression"
 

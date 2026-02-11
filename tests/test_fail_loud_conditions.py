@@ -16,6 +16,10 @@ from pathlib import Path
 import polars as pl
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+# All tests use tiny synthetic DataFrames so the suite runs in seconds
+# with no network, no real data, and no side effects. This is important
+# because these are negative tests that intentionally trigger errors—we
+# don't want real data files accidentally corrupted or large downloads.
 
 
 def _write_minimal_bills(path: Path, *, include_savings: bool = True, include_bill_diff: bool = True) -> None:
@@ -51,6 +55,8 @@ def _write_minimal_census(path: Path) -> None:
     }).write_parquet(path)
 
 
+# 120s timeout is generous but necessary: on slow CI runners, subprocess
+# startup + Polars import + parquet I/O can exceed the default 30s.
 def _run_regression(args: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess:
     """Run build_regression_dataset.py as subprocess."""
     cmd = [sys.executable, "analysis/rtp/build_regression_dataset.py", *args]
@@ -159,7 +165,11 @@ class TestCrosswalkCoverageThreshold:
         assert r.returncode != 0, "Should fail when crosswalk drop rate exceeds threshold"
 
     def test_high_threshold_allows_low_coverage(self, tmp_path: Path) -> None:
-        """With threshold=100, even total mismatch should still try to proceed."""
+        """With threshold=100, even total mismatch should still try to proceed.
+
+        This verifies that the threshold is a gate (not a hard-coded constant)
+        and that a different error ("No block groups remain") fires downstream.
+        """
         bills_path = tmp_path / "bills.parquet"
         _write_minimal_bills(bills_path)
 

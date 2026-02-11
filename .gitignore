@@ -156,6 +156,8 @@ data/
 # Temporary files
 scratch/
 *_sample_*.csv
+# Ignore ad-hoc test scripts in the project root (test_foo.py scratch files)
+# but keep real test files in the tests/ directory via negation pattern.
 test_*.py
 !tests/test_*.py
 debug_*.py

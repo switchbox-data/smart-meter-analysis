@@ -18,6 +18,11 @@ Inputs:
          - datetime_chicago (local naive datetime, hourly)
          - price_cents_per_kwh
 
+The script is deliberately generalized to "tariff A vs tariff B" rather
+than hard-coded as "flat vs RTP".  This lets us reuse the same billing
+logic for any pair of rate structures (e.g., STOU vs DTOU) without code
+changes—only the input price files differ.
+
 This script:
   * Joins hourly loads to BOTH tariff price calendars on local time
     (fail-loud: every load hour must match in both tariffs, no silent drops)
@@ -101,6 +106,8 @@ def _join_tariff(
     """Left-join a tariff onto df, fail-loud on nulls or row-count changes."""
     n_before = df.height
 
+    # Left join so we can detect unmatched hours explicitly via nulls,
+    # rather than silently dropping rows with an inner join.
     joined = df.join(
         tariff,
         left_on="hour_chicago",
@@ -108,11 +115,16 @@ def _join_tariff(
         how="left",
     )
 
+    # Fail-loud: any null price means the tariff calendar has gaps
+    # (e.g. missing DST hours). Better to crash here than produce
+    # bills with silently missing hours.
     n_null = joined.select(pl.col(price_col).is_null().sum()).item()
     if n_null > 0:
         unmatched = joined.filter(pl.col(price_col).is_null()).select("hour_chicago").unique().sort("hour_chicago")
         raise ValueError(f"Tariff {label}: {n_null} load rows have no matching price. Unmatched hours:\n{unmatched}")
 
+    # Row-count check catches duplicate datetime_chicago in the tariff,
+    # which would silently inflate bills via a many-to-one fan-out.
     if joined.height != n_before:
         raise RuntimeError(
             f"Tariff {label}: join changed row count {n_before} → {joined.height}. "
@@ -155,7 +167,9 @@ def compute_household_bills(
     if joined.is_empty():
         raise RuntimeError("Join produced no rows. Check datetime alignment and inputs.")
 
-    # Compute hourly costs and difference
+    # Compute hourly costs and difference.
+    # Sign convention: bill_diff = A - B, so positive means B is cheaper.
+    # This matches the intuition "savings from switching TO the alternative."
     joined = joined.with_columns(
         (pl.col("kwh_hour") * pl.col("price_a_cents")).alias("bill_a_cents"),
         (pl.col("kwh_hour") * pl.col("price_b_cents")).alias("bill_b_cents"),
@@ -194,7 +208,9 @@ def compute_household_bills(
         .alias("pct_savings"),
     )
 
-    # Capacity + admin adjustments (costs specific to tariff B)
+    # Capacity + admin adjustments are costs unique to tariff B (the
+    # alternative), not present in baseline A. They reduce the savings
+    # from switching A→B, modeling real-world RTP program fees.
     apply_capacity = capacity_rate_dollars_per_kw_month > 0
     apply_admin = admin_fee_dollars > 0
 
@@ -210,7 +226,8 @@ def compute_household_bills(
             pl.lit(admin_fee_dollars).alias("admin_fee_dollars"),
         )
     else:
-        # Keep columns explicit but zeroed so schema is stable
+        # Keep columns explicit but zeroed so downstream code never has
+        # to branch on "does this column exist?" — stable schema always.
         monthly = monthly.with_columns(
             pl.lit(0.0).alias("capacity_charge_dollars"),
             pl.lit(0.0).alias("admin_fee_dollars"),

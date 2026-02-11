@@ -250,7 +250,13 @@ def _aggregate_hourly(df: pl.DataFrame) -> pl.DataFrame:
 
 
 class TestDSTRollInSynthetic:
-    """Synthetic end-to-end checks for DST edge-case months."""
+    """Synthetic end-to-end checks for DST edge-case months.
+
+    Three months are tested: November (fall-back), March (spring-forward),
+    and August (no DST). The first two exercise the two DST edge cases;
+    August provides a "nothing special happens" baseline that would catch
+    regressions in the non-DST path.
+    """
 
     # -- November 2023: fall-back (2 AM → 1 AM on Nov 5) --------------------
 
@@ -377,6 +383,9 @@ class TestDSTRollInSampleData:
 # ═══════════════════════════════════════════════════════════════════════════
 # Script-mode runner (exit non-zero on first failure)
 # ═══════════════════════════════════════════════════════════════════════════
+# Dual mode: importable as pytest tests AND runnable as a standalone
+# script (python tests/test_dst_rollin.py). The script mode is useful
+# for ad-hoc validation on EC2 where pytest may not be configured.
 
 
 def _run_synthetic_checks() -> list[str]:

@@ -11,6 +11,9 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
+# Direct imports (not subprocess) so we can test individual functions in
+# isolation without the overhead and fragility of CLI round-trips. The
+# fail-loud tests in test_fail_loud_conditions.py cover subprocess behavior.
 from analysis.rtp.build_regression_dataset import (
     EXCLUDE_COLS,
     _normalize_zip4_expr,
@@ -23,6 +26,9 @@ from analysis.rtp.build_regression_dataset import (
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+# Fixture includes both CORE_PREDICTORS (income, building_pct), additional
+# numeric columns, an all-null column, and an EXCLUDE_COLS member (NAME).
+# This exercises every branch in detect_predictors with a single fixture.
 @pytest.fixture()
 def census_df() -> pl.DataFrame:
     """Synthetic census DataFrame with known columns and types."""

@@ -51,6 +51,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Preferred and fallback column names for the two OLS outcomes.
+# The pipeline orchestrator may or may not add capacity/admin adjustments,
+# so we prefer the "net" column (which accounts for those) but fall back
+# to the gross column when the caller didn't compute net values.
 SAVINGS_COLS = ("net_pct_savings", "pct_savings")
 BILL_DIFF_COLS = ("bill_diff_dollars", "net_bill_diff_dollars")
 CORE_PREDICTORS = ("median_household_income", "old_building_pct")
@@ -59,6 +62,10 @@ CORE_PREDICTORS = ("median_household_income", "old_building_pct")
 # ---------------------------------------------------------------------------
 # ZIP+4 normalisation (mirrors R normalize_zip4)
 # ---------------------------------------------------------------------------
+# ComEd meter data carries 9-digit ZIP+4, not 5-digit ZIP. Using ZIP+4
+# gives us ~10x more geographic resolution for the BG crosswalk—most
+# ZIP+4s map to a single Census block group, whereas a 5-digit ZIP can
+# span dozens of BGs and would require probabilistic allocation.
 
 
 def _normalize_zip4_expr() -> pl.Expr:
@@ -81,6 +88,10 @@ def _normalize_zip4_expr() -> pl.Expr:
 # ---------------------------------------------------------------------------
 # Crosswalk loading (duplicated from stage2_logratio_regression.py:184-226)
 # ---------------------------------------------------------------------------
+# This logic is intentionally duplicated rather than shared: the R-based
+# stage-2 code and this Python pipeline must stay 1:1 identical in their
+# crosswalk semantics. A shared helper would tempt divergence when one
+# side is updated but the other isn't.
 
 
 def load_crosswalk_one_to_one(
@@ -132,7 +143,9 @@ def load_crosswalk_one_to_one(
             f"{fanout:,}",
         )
 
-    # Deterministic 1:1: smallest GEOID per zip4
+    # Deterministic 1:1: smallest GEOID per zip4.
+    # min() is arbitrary but reproducible—it guarantees the same mapping
+    # across runs without depending on row order in the crosswalk file.
     mapping = lf.group_by("zip4").agg(
         pl.col("block_group_geoid").min().alias("block_group_geoid"),
     )
@@ -245,7 +258,10 @@ def detect_predictors(
             )
         return requested, []
 
-    # Auto-infer: all numeric columns minus id/name/all-null
+    # Auto-infer: all numeric columns minus id/name/all-null.
+    # This lets the census file evolve (add new demographic columns)
+    # without requiring code changes—new numeric columns are picked up
+    # automatically, which is the right default for exploratory modeling.
     numeric_types = {pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.Int16, pl.Int8, pl.UInt64, pl.UInt32}
     candidates = [c for c, dt in census.schema.items() if c not in EXCLUDE_COLS and dt in numeric_types]
     # Drop all-null columns
