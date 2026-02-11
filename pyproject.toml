@@ -149,7 +149,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
 "scripts/run_billing_pipeline.py" = ["S603", "S607"]
-"tests/*" = ["S101", "RUF001"]
+"tests/*" = ["S101", "S603", "RUF001"]
 
 
 [tool.ruff.format]
