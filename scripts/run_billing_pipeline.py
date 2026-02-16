@@ -4,8 +4,8 @@
 Chains the full billing analysis pipeline for one or more months:
 
 1. Per month: compute_hourly_loads -> compute_household_bills
-2. Annual aggregate across all months
-3. (Optional) build_regression_dataset on the annual aggregate
+2. Concatenate monthly bills into all_months_household_bills.parquet (no aggregation)
+3. (Optional) build_regression_dataset on the concatenated bills
 
 Directory layout::
 
@@ -13,8 +13,11 @@ Directory layout::
       _tmp/
         month=YYYYMM/hourly_loads.parquet
       month=YYYYMM/household_bills.parquet
-      annual_household_aggregate.parquet
+      all_months_household_bills.parquet
       regression/
+        bg_month_outcomes.parquet
+        bg_annual_outcomes.parquet
+        bg_season_outcomes.parquet
         regression_dataset_bg.parquet
         regression_results.json
         regression_summary.txt
@@ -176,6 +179,7 @@ def step_build_regression(
     predictors: str,
     max_crosswalk_drop_pct: float,
     min_obs_per_bg: int,
+    regression_level: str = "annual",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -195,74 +199,50 @@ def step_build_regression(
         str(max_crosswalk_drop_pct),
         "--min-obs-per-bg",
         str(min_obs_per_bg),
+        "--regression-level",
+        regression_level,
     ]
     _run_subprocess(cmd, label="regression")
 
 
 # ---------------------------------------------------------------------------
-# Annual aggregation
+# Concatenate monthly bills (no cross-month aggregation by account_identifier)
 # ---------------------------------------------------------------------------
 
 
-def build_annual_aggregate(
+def build_all_months_bills(
     run_dir: Path,
     months: list[str],
-) -> pl.DataFrame:
-    """Concatenate per-month bills and aggregate to annual per-household totals."""
-    frames: list[pl.DataFrame] = []
+    out_path: Path,
+) -> int:
+    """Concatenate per-month household bills with a ``month`` column.
+
+    Household IDs do NOT persist across months, so we must NOT aggregate
+    by account_identifier across months.  This function simply stacks the
+    monthly bill files and tags each row with its YYYYMM month string.
+
+    Returns:
+        Number of rows in the concatenated output.
+    """
+    lfs: list[pl.LazyFrame] = []
     for ym in months:
         path = run_dir / f"month={ym}" / "household_bills.parquet"
         if not path.exists():
             raise FileNotFoundError(f"Monthly bills not found: {path}")
-        df = pl.read_parquet(path).with_columns(pl.lit(ym).alias("month"))
-        frames.append(df)
+        lf = pl.scan_parquet(path).with_columns(pl.lit(ym).alias("month"))
+        lfs.append(lf)
 
-    all_bills = pl.concat(frames)
+    combined = pl.concat(lfs, how="vertical")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.sink_parquet(out_path)
+    n_rows = pl.scan_parquet(out_path).select(pl.len()).collect().item()
     logger.info(
-        "Concatenated %d monthly bill files: %d total rows.",
-        len(frames),
-        all_bills.height,
+        "Concatenated %d monthly bill files: %d total rows -> %s",
+        len(lfs),
+        n_rows,
+        out_path,
     )
-
-    # Sum-based columns (accumulate across months)
-    sum_cols = [
-        "total_kwh",
-        "bill_a_dollars",
-        "bill_b_dollars",
-        "bill_diff_dollars",
-        "capacity_charge_dollars",
-        "admin_fee_dollars",
-        "net_bill_diff_dollars",
-    ]
-    # Only sum columns that actually exist
-    available_sum_cols = [c for c in sum_cols if c in all_bills.columns]
-
-    agg_exprs: list[pl.Expr] = [pl.col(c).sum().alias(c) for c in available_sum_cols]
-    # Carry forward zip_code (first seen)
-    if "zip_code" in all_bills.columns:
-        agg_exprs.append(pl.col("zip_code").first().alias("zip_code"))
-
-    annual = all_bills.group_by("account_identifier").agg(agg_exprs)
-
-    # Recompute pct_savings from annual sums rather than averaging the
-    # monthly percentages—averaging percentages would weight low-bill
-    # months equally with high-bill months, distorting the result.
-    if "bill_a_dollars" in annual.columns and "bill_diff_dollars" in annual.columns:
-        annual = annual.with_columns(
-            pl.when(pl.col("bill_a_dollars") > 0)
-            .then(pl.col("bill_diff_dollars") / pl.col("bill_a_dollars") * 100)
-            .otherwise(None)
-            .alias("pct_savings"),
-        )
-    if "bill_a_dollars" in annual.columns and "net_bill_diff_dollars" in annual.columns:
-        annual = annual.with_columns(
-            pl.when(pl.col("bill_a_dollars") > 0)
-            .then(pl.col("net_bill_diff_dollars") / pl.col("bill_a_dollars") * 100)
-            .otherwise(None)
-            .alias("net_pct_savings"),
-        )
-
-    return annual.sort("account_identifier")
+    return n_rows
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +336,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--run-name", type=str, default=None, help="Override run ID.")
     p.add_argument("--output-dir", type=Path, default=Path("data/bills"), help="Base output dir.")
     p.add_argument("--skip-regression", action="store_true", help="Skip regression step.")
+    p.add_argument(
+        "--regression-level",
+        type=str,
+        choices=["annual", "bg_month"],
+        default="annual",
+        help="Regression granularity: 'annual' or 'bg_month' (BG x month + month FE).",
+    )
 
     return p.parse_args(argv)
 
@@ -370,7 +357,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Resolve months ───────────────────────────────────────────────────
     months = resolve_months(args)
-    logger.info("Months to process: %s", months)
 
     # ── Run ID + directories ─────────────────────────────────────────────
     run_id = args.run_name or generate_run_id(months)
@@ -381,7 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     regression_dir = run_dir / "regression"
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Configure logging BEFORE first logger.info() call
     _configure_logging(run_dir / "pipeline.log")
+    logger.info("Months to process: %s", months)
     logger.info("Run ID: %s", run_id)
     logger.info("Output directory: %s", run_dir)
 
@@ -413,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_crosswalk_drop_pct": args.max_crosswalk_drop_pct,
             "min_obs_per_bg": args.min_obs_per_bg,
             "skip_regression": args.skip_regression,
+            "regression_level": args.regression_level,
         },
         "steps_completed": [],
     }
@@ -467,26 +456,25 @@ def main(argv: list[str] | None = None) -> int:
         manifest["steps_completed"].append(ym)
         logger.info("Month %s complete: %d loads rows, %d bills rows.", ym, loads_rows, bills_rows)
 
-    # ── Annual aggregate ─────────────────────────────────────────────────
-    logger.info("════ Building annual aggregate ════")
-    annual = build_annual_aggregate(run_dir, months)
-    annual_path = run_dir / "annual_household_aggregate.parquet"
-    annual.write_parquet(annual_path)
-    manifest["annual_aggregate_rows"] = annual.height
-    manifest["steps_completed"].append("annual_aggregate")
-    logger.info("Annual aggregate: %d households -> %s", annual.height, annual_path)
+    # ── Concatenate all months bills ────────────────────────────────────
+    logger.info("════ Building all-months household bills ════")
+    all_months_bills_path = run_dir / "all_months_household_bills.parquet"
+    n_all = build_all_months_bills(run_dir, months, all_months_bills_path)
+    manifest["all_months_bills_rows"] = n_all
+    manifest["steps_completed"].append("all_months_bills")
 
     # ── Regression ───────────────────────────────────────────────────────
     if not args.skip_regression:
         logger.info("════ Running regression ════")
         step_build_regression(
-            bills_path=annual_path,
+            bills_path=all_months_bills_path,
             crosswalk_path=args.crosswalk,
             census_path=args.census,
             output_dir=regression_dir,
             predictors=args.predictors,
             max_crosswalk_drop_pct=args.max_crosswalk_drop_pct,
             min_obs_per_bg=args.min_obs_per_bg,
+            regression_level=args.regression_level,
         )
         manifest["steps_completed"].append("regression")
     else:

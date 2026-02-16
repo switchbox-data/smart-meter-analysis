@@ -2,16 +2,23 @@
 """
 Compute hourly household loads for RTP billing analysis.
 
-Takes interval-level ComEd smart meter data (5- or 30-minute intervals)
-and aggregates to hourly kWh per household, *restricted to* the set of
-households that appear in the clustering assignments.
+Takes interval-level ComEd smart meter data (30-minute intervals in this pipeline)
+and aggregates to hourly kWh per household.
 
-Typical usage:
+If --cluster-assignments is provided, restrict to households that appear
+in the clustering assignments using a lazy semi-join (memory-safe).
 
-    python analysis/rtp/compute_hourly_loads.py \
-        --input data/validation_runs/202308_1000/processed/comed_202308.parquet \
-        --cluster-assignments data/validation_runs/202308_1000/clustering/results/cluster_assignments.parquet \
-        --output data/validation_runs/202308_1000/rtp/hourly_loads_202308.parquet
+Expected input columns (from processed interval parquet):
+  - account_identifier
+  - zip_code
+  - datetime       (naive local time, Datetime[us], tz=None)
+  - energy_kwh
+
+Output columns:
+  - account_identifier
+  - zip_code
+  - hour_chicago   (datetime truncated to hour)
+  - kwh_hour       (sum of energy_kwh within that hour)
 """
 
 from __future__ import annotations
@@ -22,128 +29,84 @@ from pathlib import Path
 
 import polars as pl
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def load_sampled_accounts(assignments_path: Path) -> pl.Series:
-    """
-    Load the set of sampled households from cluster_assignments.parquet.
-
-    Returns:
-        Series of unique account_identifier values.
-    """
-    if not assignments_path.exists():
-        raise FileNotFoundError(f"Cluster assignments not found: {assignments_path}")
-
-    logger.info("Loading sampled households from %s", assignments_path)
-    lf_assign = pl.scan_parquet(assignments_path)
-
-    if "account_identifier" not in lf_assign.collect_schema().names():
-        raise ValueError("Cluster assignments file has no 'account_identifier' column")
-
-    df_accounts = lf_assign.select(pl.col("account_identifier").unique()).collect()
-
-    accounts = df_accounts["account_identifier"]
-    logger.info("Found %d unique sampled households", len(accounts))
-    return accounts
 
 
 def compute_hourly_loads(
     input_path: Path,
     assignments_path: Path | None,
     output_path: Path,
+    *,
+    sort_output: bool,
 ) -> None:
-    """
-    Aggregate interval-level kWh to hourly totals per household.
-
-    If assignments_path is provided, restrict to households that appear
-    in the clustering assignments (to keep memory manageable).
-
-    Expects input schema to include at least:
-        - account_identifier
-        - zip_code
-        - datetime   (naive local time, at 5- or 30-minute resolution)
-        - kwh
-
-    Produces:
-        - account_identifier
-        - zip_code
-        - hour_chicago   (datetime truncated to the top of the hour)
-        - kwh_hour       (sum of kWh within that hour)
-    """
     if not input_path.exists():
         raise FileNotFoundError(f"Input parquet not found: {input_path}")
 
-    logger.info("Loading interval data from %s", input_path)
+    logger.info("Scanning interval data: %s", input_path)
     lf = pl.scan_parquet(input_path)
+    schema_names = set(lf.collect_schema().names())
 
-    required_cols = {"account_identifier", "zip_code", "datetime", "kwh"}
-    missing = required_cols - set(lf.collect_schema().names())
+    required = {"account_identifier", "zip_code", "datetime", "energy_kwh"}
+    missing = required - schema_names
     if missing:
         raise ValueError(f"Input file missing required columns: {sorted(missing)}")
 
-    # Optionally restrict to sampled / clustered accounts
+    # Optional: restrict to sampled / clustered accounts via lazy semi-join
     if assignments_path is not None:
-        accounts = load_sampled_accounts(assignments_path)
-        logger.info("Filtering interval data to sampled households only...")
-        lf = lf.filter(pl.col("account_identifier").is_in(accounts))
+        if not assignments_path.exists():
+            raise FileNotFoundError(f"Cluster assignments not found: {assignments_path}")
 
-    logger.info("Aggregating to hourly loads per (account_identifier, zip_code, hour)...")
+        lf_assign = pl.scan_parquet(assignments_path)
+        if "account_identifier" not in lf_assign.collect_schema().names():
+            raise ValueError("Cluster assignments file has no 'account_identifier' column")
+
+        logger.info("Restricting to accounts in cluster assignments via semi-join: %s", assignments_path)
+        lf = lf.join(
+            lf_assign.select(pl.col("account_identifier")).unique(),
+            on="account_identifier",
+            how="semi",
+        )
+
+    logger.info("Aggregating hourly loads (account_identifier, zip_code, hour_chicago)")
 
     lf_hourly = (
         lf.with_columns(pl.col("datetime").dt.truncate("1h").alias("hour_chicago"))
         .group_by(["account_identifier", "zip_code", "hour_chicago"])
-        .agg(pl.col("kwh").sum().alias("kwh_hour"))
-        .sort(["account_identifier", "hour_chicago"])
+        .agg(pl.col("energy_kwh").sum().alias("kwh_hour"))
     )
 
-    # Materialize and write
-    df_hourly = lf_hourly.collect()
+    if sort_output:
+        lf_hourly = lf_hourly.sort(["zip_code", "account_identifier", "hour_chicago"])
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df_hourly.write_parquet(output_path)
 
-    logger.info("Wrote %d hourly rows to %s", len(df_hourly), output_path)
-    logger.info(
-        "Hourly load summary: kwh_hour min=%.4f, max=%.4f, mean=%.4f",
-        df_hourly["kwh_hour"].min(),
-        df_hourly["kwh_hour"].max(),
-        df_hourly["kwh_hour"].mean(),
-    )
+    # Stream write (no full materialization)
+    lf_hourly.sink_parquet(output_path)
+
+    logger.info("Wrote hourly loads to %s", output_path)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Aggregate interval-level ComEd data to hourly loads per household.",
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        required=True,
-        help="Path to comed_YYYYMM.parquet (interval-level data).",
-    )
+    parser = argparse.ArgumentParser(description="Aggregate interval-level ComEd data to hourly loads per household.")
+    parser.add_argument("--input", type=Path, required=True, help="Path to comed_YYYYMM.parquet (interval-level data).")
     parser.add_argument(
         "--cluster-assignments",
         type=Path,
         default=None,
-        help=(
-            "Optional: cluster_assignments.parquet to restrict to sampled households (recommended for large months)."
-        ),
+        help="Optional: cluster_assignments.parquet to restrict to sampled households.",
     )
+    parser.add_argument("--output", type=Path, required=True, help="Output parquet for hourly loads.")
     parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output parquet for hourly loads.",
+        "--sort-output",
+        action="store_true",
+        help="If set, sort output rows by (zip_code, account_identifier, hour_chicago).",
     )
 
     args = parser.parse_args()
 
     try:
-        compute_hourly_loads(args.input, args.cluster_assignments, args.output)
+        compute_hourly_loads(args.input, args.cluster_assignments, args.output, sort_output=args.sort_output)
     except Exception as e:
         logger.error("Failed to compute hourly loads: %s", e)
         return 1

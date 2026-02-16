@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Build block-group regression dataset from household bills and run OLS.
 
-Joins household billing results to Census block groups via ZIP+4 crosswalk,
-aggregates to BG-level outcomes, joins BG demographics, and fits two OLS
-regressions.
+Produces three BG-level outcome tables:
+  - bg_month_outcomes.parquet   (BG x month)
+  - bg_annual_outcomes.parquet  (BG, summed over all months)
+  - bg_season_outcomes.parquet  (BG x season)
+
+Then joins the appropriate table to census demographics and fits OLS.
 
 Crosswalk logic mirrors the R script
 ``analysis/stage2/stage2_multinom_blockgroup_weighted.R`` exactly:
@@ -21,10 +24,17 @@ across northern Illinois, not just the City of Chicago.
 Typical usage::
 
     python analysis/rtp/build_regression_dataset.py \\
-        --bills data/bills/run123/annual_household_aggregate.parquet \\
+        --bills data/bills/run123/all_months_household_bills.parquet \\
         --crosswalk data/reference/comed_bg_zip4_crosswalk.txt \\
         --census data/reference/census_17_2023.parquet \\
         --output-dir data/bills/run123/regression
+
+    python analysis/rtp/build_regression_dataset.py \\
+        --bills data/bills/run123/all_months_household_bills.parquet \\
+        --crosswalk data/reference/comed_bg_zip4_crosswalk.txt \\
+        --census data/reference/census_17_2023.parquet \\
+        --output-dir data/bills/run123/regression \\
+        --regression-level bg_month
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import polars as pl
 
 try:
@@ -55,7 +66,7 @@ log = logging.getLogger(__name__)
 # so we prefer the "net" column (which accounts for those) but fall back
 # to the gross column when the caller didn't compute net values.
 SAVINGS_COLS = ("net_pct_savings", "pct_savings")
-BILL_DIFF_COLS = ("bill_diff_dollars", "net_bill_diff_dollars")
+BILL_DIFF_COLS = ("net_bill_diff_dollars", "bill_diff_dollars")
 CORE_PREDICTORS = ("median_household_income", "old_building_pct")
 
 
@@ -74,7 +85,7 @@ def _normalize_zip4_expr() -> pl.Expr:
     Handles both ``#####-####`` (already correct) and ``#########`` (9-digit).
     """
     raw = pl.col("zip_code").cast(pl.Utf8).str.strip_chars()
-    # Already has dash → keep as-is; 9-digit → insert dash; else null
+    # Already has dash -> keep as-is; 9-digit -> insert dash; else null
     return (
         pl.when(raw.str.contains(r"^\d{5}-\d{4}$"))
         .then(raw)
@@ -153,7 +164,7 @@ def load_crosswalk_one_to_one(
 
 
 # ---------------------------------------------------------------------------
-# Join + aggregation
+# Join bills -> BG
 # ---------------------------------------------------------------------------
 
 
@@ -196,25 +207,109 @@ def attach_block_groups(
     return joined.drop_nulls("block_group_geoid"), metrics
 
 
-def aggregate_bg_outcomes(
+# ---------------------------------------------------------------------------
+# BG x month outcomes + rollups
+# ---------------------------------------------------------------------------
+
+
+def build_bg_month_outcomes(
     bills_bg: pl.DataFrame,
     *,
-    savings_col: str,
     bill_diff_col: str,
 ) -> pl.DataFrame:
-    """Aggregate household bills to block-group-level outcomes."""
-    return (
-        bills_bg.group_by("block_group_geoid")
-        .agg(
-            pl.col("account_identifier").n_unique().alias("n_households"),
-            pl.col(savings_col).mean().alias(f"mean_{savings_col}"),
-            pl.col(savings_col).median().alias(f"median_{savings_col}"),
-            pl.col(bill_diff_col).mean().alias(f"mean_{bill_diff_col}"),
-            pl.col(bill_diff_col).median().alias(f"median_{bill_diff_col}"),
-            pl.col("total_kwh").sum().alias("total_kwh"),
-            pl.col("total_kwh").mean().alias("mean_total_kwh"),
+    """Aggregate household bills to BG x month outcomes.
+
+    Returns one row per (block_group_geoid, month) with additive sums and
+    bill-weighted savings percentages.  ``n_household_months`` counts unique
+    account_identifiers per BG-month (not persistent across months).
+    """
+    always_sum = ["total_kwh", "bill_a_dollars"]
+    optional_sum = ["bill_b_dollars", "bill_diff_dollars", "net_bill_diff_dollars"]
+    sum_cols = always_sum + [c for c in optional_sum if c in bills_bg.columns]
+
+    agg_exprs: list[pl.Expr] = [pl.col(c).sum().alias(f"sum_{c}") for c in sum_cols]
+    agg_exprs.append(pl.col("account_identifier").n_unique().alias("n_household_months"))
+
+    result = bills_bg.group_by(["block_group_geoid", "month"]).agg(agg_exprs)
+
+    # Bill-weighted pct savings: sum_diff / sum_bill_a * 100
+    diff_sum_col = f"sum_{bill_diff_col}"
+    result = result.with_columns(
+        pl.when(pl.col("sum_bill_a_dollars") > 0)
+        .then(pl.col(diff_sum_col) / pl.col("sum_bill_a_dollars") * 100)
+        .otherwise(None)
+        .alias("pct_savings_weighted"),
+    )
+
+    # Also compute net-weighted pct if net is present and wasn't the resolved col
+    if "net_bill_diff_dollars" in bills_bg.columns and bill_diff_col != "net_bill_diff_dollars":
+        result = result.with_columns(
+            pl.when(pl.col("sum_bill_a_dollars") > 0)
+            .then(pl.col("sum_net_bill_diff_dollars") / pl.col("sum_bill_a_dollars") * 100)
+            .otherwise(None)
+            .alias("net_pct_savings_weighted"),
         )
-        .sort("block_group_geoid")
+
+    return result.sort(["block_group_geoid", "month"])
+
+
+def _rollup_bg_outcomes(
+    bg_month: pl.DataFrame,
+    group_cols: list[str],
+    *,
+    bill_diff_col: str,
+) -> pl.DataFrame:
+    """Roll up BG x month outcomes by summing additive columns and recomputing pct.
+
+    Works for both annual (group by block_group_geoid) and seasonal
+    (group by block_group_geoid + season) rollups.
+    """
+    additive = [c for c in bg_month.columns if c.startswith("sum_")]
+
+    agg_exprs: list[pl.Expr] = [pl.col(c).sum() for c in additive]
+    agg_exprs.append(pl.col("n_household_months").sum())
+
+    result = bg_month.group_by(group_cols).agg(agg_exprs)
+
+    # Recompute weighted pct savings from ratio of sums
+    diff_sum_col = f"sum_{bill_diff_col}"
+    if diff_sum_col in result.columns and "sum_bill_a_dollars" in result.columns:
+        result = result.with_columns(
+            pl.when(pl.col("sum_bill_a_dollars") > 0)
+            .then(pl.col(diff_sum_col) / pl.col("sum_bill_a_dollars") * 100)
+            .otherwise(None)
+            .alias("pct_savings_weighted"),
+        )
+
+    if "sum_net_bill_diff_dollars" in result.columns and bill_diff_col != "net_bill_diff_dollars":
+        result = result.with_columns(
+            pl.when(pl.col("sum_bill_a_dollars") > 0)
+            .then(pl.col("sum_net_bill_diff_dollars") / pl.col("sum_bill_a_dollars") * 100)
+            .otherwise(None)
+            .alias("net_pct_savings_weighted"),
+        )
+
+    return result.sort(group_cols)
+
+
+def _derive_season_expr() -> pl.Expr:
+    """Polars expression: derive season from YYYYMM ``month`` column.
+
+    Winter=12,01,02  Spring=03,04,05  Summer=06,07,08  Fall=09,10,11
+    Deterministic; no locale or timezone dependence.
+    """
+    mm = pl.col("month").str.slice(4, 2)
+    return (
+        pl.when(mm.is_in(["12", "01", "02"]))
+        .then(pl.lit("Winter"))
+        .when(mm.is_in(["03", "04", "05"]))
+        .then(pl.lit("Spring"))
+        .when(mm.is_in(["06", "07", "08"]))
+        .then(pl.lit("Summer"))
+        .when(mm.is_in(["09", "10", "11"]))
+        .then(pl.lit("Fall"))
+        .otherwise(pl.lit(None))
+        .alias("season")
     )
 
 
@@ -283,25 +378,47 @@ def fit_ols(
     y_col: str,
     predictors: list[str],
     label: str,
+    month_fe_col: str | None = None,
 ) -> dict[str, Any]:
-    """Fit OLS: y_col ~ predictors.  Returns structured results dict."""
-    pdf = df.select([y_col, *predictors]).to_pandas().dropna()
+    """Fit OLS: y_col ~ predictors [+ month fixed effects].
+
+    When ``month_fe_col`` is set, month dummies (drop_first=True) are appended
+    to the predictor matrix.  Month FE columns are recorded in the result but
+    kept separate from the census predictors list.
+    """
+    select_cols = [y_col, *predictors]
+    if month_fe_col:
+        select_cols.append(month_fe_col)
+
+    pdf = df.select(select_cols).to_pandas().dropna()
     n_obs = len(pdf)
 
-    if n_obs < len(predictors) + 1:
+    month_fe_names: list[str] = []
+    if month_fe_col:
+        month_dummies = pd.get_dummies(pdf[month_fe_col], drop_first=True, prefix="month")
+        month_fe_names = list(month_dummies.columns)
+        X_df = pd.concat([pdf[predictors], month_dummies], axis=1)
+    else:
+        X_df = pdf[predictors]
+
+    all_predictor_names = list(X_df.columns)
+    n_total_params = len(all_predictor_names) + 1  # +1 for constant
+
+    if n_obs < n_total_params + 1:
         raise RuntimeError(
             f"OLS '{label}': only {n_obs} complete observations for "
-            f"{len(predictors)} predictors. Need at least {len(predictors) + 1}."
+            f"{n_total_params} parameters (incl. constant). "
+            f"Need at least {n_total_params + 1}."
         )
 
     y = pdf[y_col].values
-    X = sm.add_constant(pdf[predictors].values)
-    predictor_names = ["const", *predictors]
+    X = sm.add_constant(X_df.values)
+    full_names = ["const", *all_predictor_names]
 
     model = sm.OLS(y, X).fit()
 
     coefficients = {}
-    for i, name in enumerate(predictor_names):
+    for i, name in enumerate(full_names):
         coefficients[name] = {
             "estimate": float(model.params[i]),
             "std_error": float(model.bse[i]),
@@ -314,6 +431,8 @@ def fit_ols(
         "outcome": y_col,
         "n_obs": n_obs,
         "n_predictors": len(predictors),
+        "n_month_fe": len(month_fe_names),
+        "month_fe_columns": month_fe_names,
         "r_squared": float(model.rsquared),
         "adj_r_squared": float(model.rsquared_adj),
         "f_statistic": float(model.fvalue),
@@ -380,7 +499,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--min-obs-per-bg",
         type=int,
         default=3,
-        help="Minimum households per BG for regression (default: 3).",
+        help="Minimum household-months per BG for regression (default: 3).",
+    )
+    p.add_argument(
+        "--regression-level",
+        type=str,
+        choices=["annual", "bg_month"],
+        default="annual",
+        help="Regression granularity: 'annual' (BG annual, default) or 'bg_month' (BG x month + month FE).",
     )
     return p.parse_args(argv)
 
@@ -388,7 +514,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:  # noqa: C901
     args = parse_args(argv)
 
-    # ── Validate input files ─────────────────────────────────────────────
+    # -- Validate input files -------------------------------------------------
     for path, label in [
         (args.bills, "bills"),
         (args.crosswalk, "crosswalk"),
@@ -398,19 +524,27 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             log.error("%s file not found: %s", label.title(), path)
             return 1
 
-    # ── Load bills ───────────────────────────────────────────────────────
+    # -- Load bills -----------------------------------------------------------
     log.info("Loading bills: %s", args.bills)
     bills = pl.read_parquet(args.bills)
-    log.info("Bills: %d rows, columns: %s", bills.height, bills.columns)
+    n_bills_total = bills.height
+    log.info("Bills: %d rows, columns: %s", n_bills_total, bills.columns)
 
-    # Validate required columns
+    # Validate required columns (including month and bill_a_dollars)
     cols = set(bills.columns)
-    for req in ("account_identifier", "zip_code", "total_kwh"):
+    for req in ("account_identifier", "zip_code", "total_kwh", "bill_a_dollars", "month"):
         if req not in cols:
             log.error("Bills missing required column: '%s'. Found: %s", req, sorted(cols))
             return 1
 
-    # ── Resolve outcome columns ──────────────────────────────────────────
+    # Validate month format: YYYYMM, 6 digits
+    months_unique = bills.select("month").unique().to_series().to_list()
+    for m in months_unique:
+        if not isinstance(m, str) or len(m) != 6 or not m.isdigit():
+            raise ValueError(f"Invalid month value '{m}'; expected YYYYMM (6 digits).")
+    log.info("Months in bills: %s", sorted(months_unique))
+
+    # -- Resolve outcome columns ----------------------------------------------
     savings_col, savings_fallback = _resolve_col(
         cols,
         SAVINGS_COLS[0],
@@ -425,18 +559,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
     )
     log.info("Outcome columns: savings='%s', bill_diff='%s'", savings_col, bill_diff_col)
 
-    # ── Derive zip4 from zip_code ────────────────────────────────────────
+    # -- Derive zip4 from zip_code --------------------------------------------
     bills = bills.with_columns(_normalize_zip4_expr())
     n_null_zip4 = bills.filter(pl.col("zip4").is_null()).height
     if n_null_zip4:
         log.warning("%d rows have un-parseable zip_code -> null zip4; these will be dropped.", n_null_zip4)
         bills = bills.drop_nulls("zip4")
 
-    # ── Load crosswalk ───────────────────────────────────────────────────
+    # -- Load crosswalk -------------------------------------------------------
     crosswalk_lf, crosswalk_metrics = load_crosswalk_one_to_one(args.crosswalk)
     log.info("Crosswalk: %s", crosswalk_metrics)
 
-    # ── Join bills → BG ──────────────────────────────────────────────────
+    # -- Join bills -> BG -----------------------------------------------------
     bills_bg, join_metrics = attach_block_groups(
         bills,
         crosswalk_lf,
@@ -444,15 +578,35 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
     )
     log.info("Join metrics: %s", join_metrics)
 
-    # ── Aggregate to BG-level outcomes ───────────────────────────────────
-    bg_outcomes = aggregate_bg_outcomes(
-        bills_bg,
-        savings_col=savings_col,
+    # -- Build BG x month outcomes --------------------------------------------
+    bg_month = build_bg_month_outcomes(bills_bg, bill_diff_col=bill_diff_col)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    bg_month_path = args.output_dir / "bg_month_outcomes.parquet"
+    bg_month.write_parquet(bg_month_path)
+    log.info("Wrote BG x month outcomes: %s (%d rows)", bg_month_path, bg_month.height)
+
+    # -- BG annual rollup -----------------------------------------------------
+    bg_annual = _rollup_bg_outcomes(
+        bg_month,
+        ["block_group_geoid"],
         bill_diff_col=bill_diff_col,
     )
-    log.info("BG outcomes: %d block groups", bg_outcomes.height)
+    bg_annual_path = args.output_dir / "bg_annual_outcomes.parquet"
+    bg_annual.write_parquet(bg_annual_path)
+    log.info("Wrote BG annual outcomes: %s (%d rows)", bg_annual_path, bg_annual.height)
 
-    # ── Load census + rename GEOID ───────────────────────────────────────
+    # -- BG seasonal rollup ---------------------------------------------------
+    bg_month_with_season = bg_month.with_columns(_derive_season_expr())
+    bg_season = _rollup_bg_outcomes(
+        bg_month_with_season,
+        ["block_group_geoid", "season"],
+        bill_diff_col=bill_diff_col,
+    )
+    bg_season_path = args.output_dir / "bg_season_outcomes.parquet"
+    bg_season.write_parquet(bg_season_path)
+    log.info("Wrote BG seasonal outcomes: %s (%d rows)", bg_season_path, bg_season.height)
+
+    # -- Load census + rename GEOID -------------------------------------------
     log.info("Loading census: %s", args.census)
     census = pl.read_parquet(args.census)
     if "GEOID" in census.columns and "block_group_geoid" not in census.columns:
@@ -461,19 +615,26 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         log.error("Census has no 'GEOID' or 'block_group_geoid' column.")
         return 1
 
-    # ── Join BG outcomes → census ────────────────────────────────────────
-    bg_data = bg_outcomes.join(census, on="block_group_geoid", how="left")
+    # -- Choose regression table based on --regression-level ------------------
+    if args.regression_level == "annual":
+        bg_data = bg_annual.join(census, on="block_group_geoid", how="left")
+    else:
+        bg_data = bg_month.join(census, on="block_group_geoid", how="left")
+
+    # -- Census join match rate (robust: check any non-key col is not null) ---
+    census_nonkey = [c for c in census.columns if c != "block_group_geoid"]
     n_census_match = bg_data.filter(
-        pl.col(census.columns[1]).is_not_null(),
+        pl.any_horizontal(pl.col(c).is_not_null() for c in census_nonkey),
     ).height
+    n_bg_total = bg_data.height
     log.info(
-        "Census join: %d/%d BGs matched (%.1f%%)",
+        "Census join: matched %d/%d BGs (%.1f%%)",
         n_census_match,
-        bg_data.height,
-        n_census_match / bg_data.height * 100 if bg_data.height else 0,
+        n_bg_total,
+        n_census_match / n_bg_total * 100 if n_bg_total else 0,
     )
 
-    # ── Detect predictors ────────────────────────────────────────────────
+    # -- Detect predictors ----------------------------------------------------
     predictors, excluded_null = detect_predictors(census, mode=args.predictors)
     if not predictors:
         log.error("No usable predictors found (mode='%s').", args.predictors)
@@ -482,12 +643,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
     if excluded_null:
         log.info("Excluded (all null): %s", excluded_null)
 
-    # ── Filter: min obs + complete case ──────────────────────────────────
+    # -- Filter: min obs + complete case --------------------------------------
     n_before_filter = bg_data.height
-    bg_data = bg_data.filter(pl.col("n_households") >= args.min_obs_per_bg)
+    bg_data = bg_data.filter(pl.col("n_household_months") >= args.min_obs_per_bg)
     n_after_min_obs = bg_data.height
     log.info(
-        "Min-obs filter (%d): %d -> %d BGs",
+        "Min-obs filter (%d): %d -> %d",
         args.min_obs_per_bg,
         n_before_filter,
         n_after_min_obs,
@@ -495,32 +656,41 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
     bg_data = bg_data.drop_nulls(subset=predictors)
     n_complete = bg_data.height
-    log.info("Complete-case filter: %d -> %d BGs", n_after_min_obs, n_complete)
+    log.info("Complete-case filter: %d -> %d", n_after_min_obs, n_complete)
 
     if n_complete == 0:
         log.error("No block groups remain after filtering.")
         return 1
 
-    # ── Write regression dataset ─────────────────────────────────────────
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
+    # -- Write regression dataset ---------------------------------------------
     dataset_path = args.output_dir / "regression_dataset_bg.parquet"
     bg_data.write_parquet(dataset_path)
     log.info("Wrote regression dataset: %s (%d rows)", dataset_path, bg_data.height)
 
-    # ── Fit OLS models ───────────────────────────────────────────────────
-    mean_savings_col = f"mean_{savings_col}"
-    mean_bill_diff_col = f"mean_{bill_diff_col}"
+    # -- Fit OLS models -------------------------------------------------------
+    diff_sum_col = f"sum_{bill_diff_col}"
+    month_fe_col = "month" if args.regression_level == "bg_month" else None
 
-    results = {}
+    results: dict[str, Any] = {}
     summary_texts: list[str] = []
 
     for y_col, label in [
-        (mean_savings_col, "model_1_savings"),
-        (mean_bill_diff_col, "model_2_bill_diff"),
+        ("pct_savings_weighted", "model_1_pct_savings_weighted"),
+        (diff_sum_col, "model_2_sum_bill_diff"),
     ]:
-        log.info("Fitting OLS: %s ~ %d predictors", y_col, len(predictors))
-        res = fit_ols(bg_data, y_col=y_col, predictors=predictors, label=label)
+        log.info(
+            "Fitting OLS: %s ~ %d predictors%s",
+            y_col,
+            len(predictors),
+            " + month FE" if month_fe_col else "",
+        )
+        res = fit_ols(
+            bg_data,
+            y_col=y_col,
+            predictors=predictors,
+            label=label,
+            month_fe_col=month_fe_col,
+        )
         results[label] = {k: v for k, v in res.items() if k != "summary_text"}
         summary_texts.append(f"{'=' * 70}\n{label}: {y_col}\n{'=' * 70}\n{res['summary_text']}\n")
         log.info(
@@ -532,26 +702,34 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             res["n_obs"],
         )
 
-    # ── Write results JSON ───────────────────────────────────────────────
+    # -- Write results JSON ---------------------------------------------------
     results_path = args.output_dir / "regression_results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     log.info("Wrote regression results: %s", results_path)
 
-    # ── Write summary text ───────────────────────────────────────────────
+    # -- Write summary text ---------------------------------------------------
     summary_path = args.output_dir / "regression_summary.txt"
     with open(summary_path, "w") as f:
         f.write("\n".join(summary_texts))
     log.info("Wrote regression summary: %s", summary_path)
 
-    # ── Write metadata JSON ──────────────────────────────────────────────
-    metadata = {
+    # -- Write metadata JSON --------------------------------------------------
+    metadata: dict[str, Any] = {
         "created_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "regression_level": args.regression_level,
+        "months_included": sorted(months_unique),
         "bills_path": str(args.bills),
         "crosswalk_path": str(args.crosswalk),
         "census_path": str(args.census),
         "crosswalk_metrics": crosswalk_metrics,
         "join_metrics": join_metrics,
+        "crosswalk_exposure": {
+            "n_bills_total": n_bills_total,
+            "n_zip4_parse_dropped": n_null_zip4,
+            "pct_zip4_parse_dropped": round(n_null_zip4 / n_bills_total * 100, 3) if n_bills_total else 0.0,
+            "pct_crosswalk_no_bg_match": join_metrics["pct_dropped"],
+        },
         "savings_column_used": savings_col,
         "savings_fallback_used": savings_fallback,
         "bill_diff_column_used": bill_diff_col,
@@ -564,6 +742,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         "n_bg_before_filter": n_before_filter,
         "n_bg_after_min_obs": n_after_min_obs,
         "n_bg_complete_case": n_complete,
+        "files_written": {
+            "bg_month_outcomes": str(bg_month_path),
+            "bg_annual_outcomes": str(bg_annual_path),
+            "bg_season_outcomes": str(bg_season_path),
+            "regression_dataset": str(dataset_path),
+        },
     }
     metadata_path = args.output_dir / "regression_metadata.json"
     with open(metadata_path, "w") as f:

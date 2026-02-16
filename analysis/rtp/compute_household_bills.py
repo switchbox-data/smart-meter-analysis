@@ -121,7 +121,15 @@ def _join_tariff(
     n_null = joined.select(pl.col(price_col).is_null().sum()).item()
     if n_null > 0:
         unmatched = joined.filter(pl.col(price_col).is_null()).select("hour_chicago").unique().sort("hour_chicago")
-        raise ValueError(f"Tariff {label}: {n_null} load rows have no matching price. Unmatched hours:\n{unmatched}")
+        n_unmatched = unmatched.height
+        hour_min = unmatched["hour_chicago"][0]
+        hour_max = unmatched["hour_chicago"][-1]
+        preview = unmatched.head(24)
+        raise ValueError(
+            f"Tariff {label}: {n_null} load rows have no matching price. "
+            f"{n_unmatched} distinct unmatched hours (min={hour_min}, max={hour_max}). "
+            f"First {min(24, n_unmatched)}:\n{preview}"
+        )
 
     # Row-count check catches duplicate datetime_chicago in the tariff,
     # which would silently inflate bills via a many-to-one fan-out.
@@ -150,8 +158,8 @@ def compute_household_bills(
 
     Args:
         hourly_loads: Hourly kWh per household for a single month.
-        prices_a: Baseline tariff with price_a_cents column.
-        prices_b: Alternative tariff with price_b_cents column.
+        prices_a: Baseline tariff with price_A_cents column.
+        prices_b: Alternative tariff with price_B_cents column.
         capacity_rate_dollars_per_kw_month: Capacity charge rate ($/kW-month).
         admin_fee_dollars: Fixed monthly admin fee per household.
 
@@ -161,8 +169,8 @@ def compute_household_bills(
     n_loads = hourly_loads.height
     logger.info("Joining %d load rows with two tariff price calendars...", n_loads)
 
-    joined = _join_tariff(hourly_loads, prices_a, "price_a_cents", "A")
-    joined = _join_tariff(joined, prices_b, "price_b_cents", "B")
+    joined = _join_tariff(hourly_loads, prices_a, "price_A_cents", "A")
+    joined = _join_tariff(joined, prices_b, "price_B_cents", "B")
 
     if joined.is_empty():
         raise RuntimeError("Join produced no rows. Check datetime alignment and inputs.")
@@ -171,8 +179,8 @@ def compute_household_bills(
     # Sign convention: bill_diff = A - B, so positive means B is cheaper.
     # This matches the intuition "savings from switching TO the alternative."
     joined = joined.with_columns(
-        (pl.col("kwh_hour") * pl.col("price_a_cents")).alias("bill_a_cents"),
-        (pl.col("kwh_hour") * pl.col("price_b_cents")).alias("bill_b_cents"),
+        (pl.col("kwh_hour") * pl.col("price_A_cents")).alias("bill_a_cents"),
+        (pl.col("kwh_hour") * pl.col("price_B_cents")).alias("bill_b_cents"),
     ).with_columns(
         (pl.col("bill_a_cents") - pl.col("bill_b_cents")).alias("bill_diff_cents"),
     )
@@ -328,8 +336,8 @@ def main() -> int:
     logger.info("Starting household bill computation...")
 
     hourly_loads = load_hourly_loads(args.hourly_loads)
-    prices_a = load_tariff_prices(args.tariff_prices_a, "a")
-    prices_b = load_tariff_prices(args.tariff_prices_b, "b")
+    prices_a = load_tariff_prices(args.tariff_prices_a, "A")
+    prices_b = load_tariff_prices(args.tariff_prices_b, "B")
 
     bills = compute_household_bills(
         hourly_loads,
