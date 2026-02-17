@@ -45,10 +45,12 @@ Repository = "https://github.com/switchbox-data/smart-meter-analysis"
 Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 
 [tool.deptry]
-exclude = ["archive", ".venv", "tests"]
+exclude = ["archive", ".venv", "tests", ".claude_quarantine_*"]
 
 [tool.deptry.per_rule_ignores]
+DEP001 = ["compact_month_output"]
 DEP002 = [
+  "fsspec",
   "ipykernel",
   "cenpy",
   "openpyxl",
@@ -187,6 +189,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
 "scripts/csv_to_parquet/migrate_month_runner.py" = ["C901"]
+"scripts/csv_to_parquet/compact_month_output.py" = ["C901", "S603", "S607"]
 "scripts/validate_wide_to_long_batched.py" = []
 "smart_meter_analysis/wide_to_long.py" = ["C901"]
 "tests/*" = ["S101", "RUF001"]

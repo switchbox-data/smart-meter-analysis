@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
+from compact_month_output import DEFAULT_COMPACT_TARGET_SIZE_BYTES, CompactionConfig, run_compaction
 
 from smart_meter_analysis.wide_to_long import transform_wide_to_long, transform_wide_to_long_lf
 
@@ -160,6 +161,13 @@ class RunnerConfig:
     debug_mem: bool
     debug_temp_scan: bool
     polars_temp_dir: str | None
+
+    # Compaction stage (optional; runs after all batches complete).
+    compact_month: bool
+    compact_target_size_bytes: int
+    compact_max_files: int | None
+    overwrite_compact: bool
+    compact_dry_run: bool
 
 
 @dataclass(frozen=True)
@@ -1044,6 +1052,35 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
     )
     ap.add_argument("--print-failures", type=int, default=DEFAULT_PRINT_FAILURES)
 
+    # Compaction flags (all optional; compaction is off by default).
+    ap.add_argument(
+        "--compact-month",
+        action="store_true",
+        help="Run month-level compaction after all batches complete successfully.",
+    )
+    ap.add_argument(
+        "--compact-target-size-bytes",
+        type=int,
+        default=DEFAULT_COMPACT_TARGET_SIZE_BYTES,
+        help="Target on-disk size per compacted Parquet file (default 1 GiB).",
+    )
+    ap.add_argument(
+        "--compact-max-files",
+        type=int,
+        default=None,
+        help="Optional cap on the number of compacted output files.",
+    )
+    ap.add_argument(
+        "--overwrite-compact",
+        action="store_true",
+        help="Allow overwriting existing compacted_*.parquet files.",
+    )
+    ap.add_argument(
+        "--compact-dry-run",
+        action="store_true",
+        help="Plan and validate compaction but skip the atomic swap.",
+    )
+
     ns = ap.parse_args(list(argv))
 
     ym = ns.year_month.strip()
@@ -1091,6 +1128,11 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
         debug_mem=ns.debug_mem,
         debug_temp_scan=ns.debug_temp_scan,
         polars_temp_dir=ns.polars_temp_dir,
+        compact_month=ns.compact_month,
+        compact_target_size_bytes=ns.compact_target_size_bytes,
+        compact_max_files=ns.compact_max_files,
+        overwrite_compact=ns.overwrite_compact,
+        compact_dry_run=ns.compact_dry_run,
     )
 
 
@@ -1290,6 +1332,61 @@ def main(argv: Sequence[str]) -> int:
     total_failure = sum(int(x.get("n_failure", 0)) for x in summaries)
     total_skip = sum(int(x.get("n_skip", 0)) for x in summaries)
 
+    # ── Optional month-level compaction ──────────────────────────────────────
+    # Runs only when explicitly requested AND the month completed cleanly:
+    # - zero file-level failures across all batches
+    # - cooperative stop flag was never set (no mid-run abort)
+    # - every planned batch produced a summary (no futures dropped silently)
+    compaction_summary: JsonDict | None = None
+    if cfg.compact_month:
+        compaction_eligible = total_failure == 0 and not stop_flag.is_set() and len(summaries) == len(batches)
+        if not compaction_eligible:
+            logger.log({
+                "ts_utc": now_utc_iso(),
+                "event": "compaction_skipped",
+                "status": "warning",
+                "year_month": cfg.year_month,
+                "run_id": cfg.run_id,
+                "reason": ("total_failure > 0 or stop_flag set or incomplete batches"),
+                "total_failure": total_failure,
+                "stop_requested": stop_flag.is_set(),
+                "n_summaries": len(summaries),
+                "n_batches_planned": len(batches),
+            })
+        else:
+            compact_cfg = CompactionConfig(
+                year_month=cfg.year_month,
+                run_id=cfg.run_id,
+                out_root=cfg.out_root,
+                run_dir=cfg.run_dir,
+                target_size_bytes=cfg.compact_target_size_bytes,
+                max_files=cfg.compact_max_files,
+                overwrite=cfg.overwrite_compact,
+                dry_run=cfg.compact_dry_run,
+            )
+            try:
+                compaction_summary = run_compaction(compact_cfg, logger)
+            except Exception as compact_err:
+                logger.log({
+                    "ts_utc": now_utc_iso(),
+                    "event": "compaction_failure",
+                    "status": "failure",
+                    "year_month": cfg.year_month,
+                    "run_id": cfg.run_id,
+                    "exception_type": type(compact_err).__name__,
+                    "exception_msg": str(compact_err),
+                    "traceback": traceback.format_exc(),
+                })
+                # Compaction failure is surfaced in the run summary but does
+                # NOT retroactively fail the batch migration exit code — the
+                # batch Parquet files are intact and usable.
+                compaction_summary = {
+                    "status": "failure",
+                    "exception_type": type(compact_err).__name__,
+                    "exception_msg": str(compact_err),
+                }
+
+    t1 = time.time()
     batches_written = sum(1 for x in summaries if x.get("wrote_file") is True)
     batches_skipped_existing_output = sum(1 for x in summaries if x.get("skip_reason") == "existing_batch_output")
     batches_with_failures = sum(1 for x in summaries if int(x.get("n_failure", 0)) > 0)
@@ -1319,6 +1416,7 @@ def main(argv: Sequence[str]) -> int:
         "polars_temp_dir_env": os.environ.get("POLARS_TEMP_DIR"),
         "skip_existing_batch_outputs": cfg.skip_existing_batch_outputs,
         "overwrite": cfg.overwrite,
+        "compaction": compaction_summary,
     }
     write_json(cfg.run_dir / "run_summary.json", run_summary)
     logger.log({"ts_utc": now_utc_iso(), "event": "run_end", "status": "info", **run_summary})
