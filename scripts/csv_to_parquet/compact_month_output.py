@@ -104,8 +104,8 @@ class CompactionConfig:
     target_size_bytes: int  # target on-disk size per output Parquet file
     max_files: int | None  # optional cap on number of output compacted files
     overwrite: bool  # allow overwriting existing compacted_*.parquet
-    dry_run: bool  # plan + validate + write artifacts; skip swap
-
+    dry_run: bool  # plan only: write plan + original inventory + summary; skip write/validate/swap
+    no_swap: bool  # run compaction + validation + write artifacts; skip atomic swap
 
 # ---------------------------------------------------------------------------
 # Utilities (self-contained; no runner imports)
@@ -847,6 +847,47 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         "n_output_files": len(output_files),
         "total_output_bytes_staging": total_output_bytes_staging,
     })
+
+    # ── No-swap mode: keep staged outputs, skip atomic swap ──────────────────
+    if cfg.no_swap:
+        t_end = time.time()
+        summary: JsonDict = {
+            "ts_utc": _now_utc_iso(),
+            "git_sha": git_sha,
+            "year_month": cfg.year_month,
+            "run_id": cfg.run_id,
+            "status": "no_swap",
+            "n_input_files": len(input_files),
+            "n_output_files": len(output_files),
+            "pre_rows": pre_rows,
+            "post_rows": post_rows,
+            "total_input_bytes": total_input_bytes,
+            "total_output_bytes_staging": total_output_bytes_staging,
+            "rows_per_chunk": rows_per_chunk,
+            "target_size_bytes": cfg.target_size_bytes,
+            "month_canonical_dir": str(month_canonical_dir),
+            "staging_month_dir": str(staging_month_dir),
+            "precompact_dir": str(precompact_dir),
+            "elapsed_ms": _elapsed_ms(t_start, t_end),
+            "sort_keys": list(SORT_KEYS),
+            "input_file_list_hash": _file_list_hash(input_files),
+            "staged_output_file_list_hash": _file_list_hash(output_files),
+        }
+        _write_json(audit_dir / "compaction_summary.json", summary)
+
+        logger.log({
+            **log_ctx,
+            "event": "compaction_complete",
+            "status": "info",
+            "msg": "no_swap=True; staging+validation complete; swap skipped",
+            "pre_rows": pre_rows,
+            "post_rows": post_rows,
+            "n_input_files": len(input_files),
+            "n_output_files": len(output_files),
+            "total_output_bytes_staging": total_output_bytes_staging,
+            "elapsed_ms": _elapsed_ms(t_start, t_end),
+        })
+        return summary
 
     # ── 10. Atomic directory swap ─────────────────────────────────────────────
     try:

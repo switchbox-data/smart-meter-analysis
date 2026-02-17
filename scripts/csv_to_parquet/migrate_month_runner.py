@@ -131,6 +131,7 @@ class RunnerConfig:
     All filesystem paths are resolved to absolute at construction time so that
     batch workers can operate independently of working-directory changes.
     """
+    compact_no_swap: bool
 
     year_month: str  # YYYYMM
     input_list: Path
@@ -1078,7 +1079,15 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
     ap.add_argument(
         "--compact-dry-run",
         action="store_true",
-        help="Plan and validate compaction but skip the atomic swap.",
+        help="Plan-only: write compaction_plan.json + original inventory + summary; do not write compacted outputs.",
+    )
+    ap.add_argument(
+        "--compact-no-swap",
+        action="store_true",
+        help=(
+            "Run full month compaction into staging and perform all post-write validations, "
+            "but DO NOT atomically swap staged outputs into the canonical month directory."
+        ),
     )
 
     ns = ap.parse_args(list(argv))
@@ -1133,6 +1142,7 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
         compact_max_files=ns.compact_max_files,
         overwrite_compact=ns.overwrite_compact,
         compact_dry_run=ns.compact_dry_run,
+        compact_no_swap=ns.compact_no_swap,
     )
 
 
@@ -1363,6 +1373,7 @@ def main(argv: Sequence[str]) -> int:
                 max_files=cfg.compact_max_files,
                 overwrite=cfg.overwrite_compact,
                 dry_run=cfg.compact_dry_run,
+                no_swap=cfg.compact_no_swap,
             )
             try:
                 compaction_summary = run_compaction(compact_cfg, logger)
