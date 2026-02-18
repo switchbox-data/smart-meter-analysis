@@ -24,6 +24,7 @@ Output columns:
 from __future__ import annotations
 
 import argparse
+import glob as _glob
 import logging
 from pathlib import Path
 
@@ -33,6 +34,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _resolve_parquet_paths(input_path: Path) -> list[str]:
+    """Resolve input to a list of parquet paths (file, directory, or glob)."""
+    input_str = str(input_path)
+    if any(ch in input_str for ch in ["*", "?", "["]):
+        paths = sorted(_glob.glob(input_str))
+        if not paths:
+            raise FileNotFoundError(f"Input parquet glob matched 0 files: {input_str}")
+        return paths
+    if input_path.is_dir():
+        paths = sorted(str(p) for p in input_path.glob("*.parquet"))
+        if not paths:
+            raise FileNotFoundError(f"Input parquet directory has 0 *.parquet files: {input_path}")
+        return paths
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input parquet not found: {input_path}")
+    return [str(input_path)]
+
+
 def compute_hourly_loads(
     input_path: Path,
     assignments_path: Path | None,
@@ -40,11 +59,11 @@ def compute_hourly_loads(
     *,
     sort_output: bool,
 ) -> None:
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input parquet not found: {input_path}")
+    scan_paths = _resolve_parquet_paths(input_path)
+    input_str = str(input_path)
+    logger.info("Scanning interval data (%d files): %s", len(scan_paths), scan_paths[0] if scan_paths else input_str)
+    lf = pl.scan_parquet(scan_paths)
 
-    logger.info("Scanning interval data: %s", input_path)
-    lf = pl.scan_parquet(input_path)
     schema_names = set(lf.collect_schema().names())
 
     required = {"account_identifier", "zip_code", "datetime", "energy_kwh"}
