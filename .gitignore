@@ -182,3 +182,6 @@ subagent_packages/
 
 # Operator-only env (do not commit)
 .env.comed
+
+# Pricing pilot data
+data/pilot_interval_parquet/
