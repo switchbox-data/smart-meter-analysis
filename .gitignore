@@ -175,3 +175,6 @@ results/
 profiles/
 docs/*.html
 docs/index_files/
+
+# Pricing pilot data
+data/pilot_interval_parquet/
