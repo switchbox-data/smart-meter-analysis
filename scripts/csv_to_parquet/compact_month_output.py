@@ -370,12 +370,12 @@ def _validate_adjacent_keys(
             continue
 
         # Extract first / last key as Python tuples (constant cost per file).
-        zips = df["zip_code"].to_list()
-        accts = df["account_identifier"].to_list()
-        dts = df["datetime"].to_list()
+        # Constant-memory: avoid converting full columns to Python lists.
+        first_row = df.select(KEY_COLS).head(1).row(0)
+        last_row = df.select(KEY_COLS).tail(1).row(0)
 
-        file_first_key: tuple[Any, Any, Any] = (zips[0], accts[0], dts[0])
-        file_last_key: tuple[Any, Any, Any] = (zips[-1], accts[-1], dts[-1])
+        file_first_key: tuple[Any, Any, Any] = (first_row[0], first_row[1], first_row[2])
+        file_last_key: tuple[Any, Any, Any] = (last_row[0], last_row[1], last_row[2])
 
         if key_min is None:
             key_min = file_first_key
