@@ -151,6 +151,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 # S603/S607: subprocess calls with variable args are inherent to the
 # orchestrator design (each pipeline step runs as a child process).
 "scripts/run_billing_pipeline.py" = ["S603", "S607"]
+"scripts/pricing_pilot/*.py" = ["C901"]
 "tests/*" = ["S101", "S603", "RUF001"]
 
 

@@ -64,23 +64,17 @@ def stage1_raw_counts(chicago_root: Path) -> dict[tuple[str, str], int]:
                 out[(yyyymm, dc)] = 0
             continue
 
-        # Print schema once (first month)
-        if yyyymm == "202301":
-            first = pl.scan_parquet(parts[0])
-            print(f"[Stage 1] Raw interval schema: {first.collect_schema().names()}")
-            if class_col not in first.collect_schema().names():
-                print(f"[Stage 1] WARNING: column '{class_col}' not in schema", file=sys.stderr)
+        first = pl.scan_parquet(parts[0])
+        schema_names = first.collect_schema().names()
+        print(f"[Stage 1] Raw interval schema ({yyyymm}): {schema_names}")
+        if class_col not in schema_names:
+            print(f"[Stage 1] WARNING: column '{class_col}' not in schema for {yyyymm}", file=sys.stderr)
 
         # Per-part distinct (account, class) then concat and count distinct per class
         print(f"[Stage 1] Counting distinct accounts for {yyyymm} ({len(parts)} parts)...", flush=True)
         part_dfs = []
         for p in parts:
-            part_dfs.append(
-                pl.scan_parquet(p)
-                .select(pl.col(account_col), pl.col(class_col))
-                .unique()
-                .collect()
-            )
+            part_dfs.append(pl.scan_parquet(p).select(pl.col(account_col), pl.col(class_col)).unique().collect())
         combined = pl.concat(part_dfs).unique()
         counts = combined.group_by(class_col).agg(pl.col(account_col).n_unique().alias("n"))
         for row in counts.iter_rows(named=True):
@@ -129,7 +123,7 @@ def stage2_bill_counts(bills_dir: Path) -> tuple[dict[tuple[str, str], int], dic
         else:
             stou_counts[(yyyymm, dc)] = n
 
-    for (yyyymm, dc) in list(dtou_counts) + list(stou_counts):
+    for yyyymm, dc in set(dtou_counts) | set(stou_counts):
         key = (yyyymm, dc)
         d = dtou_counts.get(key, 0)
         s = stou_counts.get(key, 0)
@@ -188,9 +182,13 @@ def main() -> int:
     default_map = str(Path.home() / "pricing_pilot" / "account_bg_map_{yyyymm}.parquet")
 
     parser = argparse.ArgumentParser(description="Account count chain-of-custody across delivery classes.")
-    parser.add_argument("--chicago-root", type=Path, default=default_root, help="Root for chicago_only/year=.../month=...")
+    parser.add_argument(
+        "--chicago-root", type=Path, default=default_root, help="Root for chicago_only/year=.../month=..."
+    )
     parser.add_argument("--bills-dir", type=Path, default=default_bills, help="Directory of bill parquets")
-    parser.add_argument("--account-bg-map-pattern", type=str, default=default_map, help="Path with {yyyymm} for account_bg_map")
+    parser.add_argument(
+        "--account-bg-map-pattern", type=str, default=default_map, help="Path with {yyyymm} for account_bg_map"
+    )
     args = parser.parse_args()
 
     chicago_root = args.chicago_root
@@ -237,14 +235,15 @@ def main() -> int:
     # Load account sets for sampling (only where we need them)
     for yyyymm in ["202301", "202307"]:
         map_path = Path(map_pattern.replace("{yyyymm}", yyyymm))
-        amap = pl.read_parquet(map_path) if map_path.exists() else pl.DataFrame({"account_identifier": [], "geoid_bg": []})
+        amap = (
+            pl.read_parquet(map_path) if map_path.exists() else pl.DataFrame({"account_identifier": [], "geoid_bg": []})
+        )
 
         for dc in DELIVERY_CLASSES:
             r = table.filter((pl.col("month") == yyyymm) & (pl.col("delivery_class") == dc)).to_dicts()[0]
             raw_n = r["raw_interval_accounts"]
             bill_d = r["bill_dtou_accounts"]
             bill_s = r["bill_stou_accounts"]
-            with_bg_n = r["accounts_with_bg_match"]
             without_bg_n = r["accounts_without_bg_match"]
 
             # Drop from raw to bill (use DTOU as bill reference)
@@ -252,17 +251,29 @@ def main() -> int:
                 any_drops = True
                 year, month = yyyymm[:4], yyyymm[4:6]
                 dir_path = chicago_root / f"year={year}" / f"month={month}"
-                parts = _filter_valid_parquet(sorted(dir_path.glob("*.parquet")), MIN_PART_BYTES) if dir_path.exists() else []
+                parts = (
+                    _filter_valid_parquet(sorted(dir_path.glob("*.parquet")), MIN_PART_BYTES)
+                    if dir_path.exists()
+                    else []
+                )
                 raw_accounts = set()
                 if parts:
-                    raw_df = pl.scan_parquet(parts).filter(pl.col("delivery_service_class") == dc).select("account_identifier").unique().collect()
+                    raw_df = (
+                        pl.scan_parquet(parts)
+                        .filter(pl.col("delivery_service_class") == dc)
+                        .select("account_identifier")
+                        .unique()
+                        .collect()
+                    )
                     raw_accounts = set(raw_df["account_identifier"].cast(pl.Utf8).to_list())
                 bill_path = bills_dir / f"{yyyymm}_flat_vs_dtou_{CODE_TO_SUFFIX[dc]}.parquet"
                 bill_accounts = set()
                 if bill_path.exists():
                     bill_accounts = set(pl.read_parquet(bill_path)["account_identifier"].cast(pl.Utf8).to_list())
                 samples = sample_missing(raw_accounts, bill_accounts, 5)
-                print(f"  {yyyymm} {dc}: raw ({raw_n}) -> bill ({bill_d}); sample accounts in raw but not in bills: {samples}")
+                print(
+                    f"  {yyyymm} {dc}: raw ({raw_n}) -> bill ({bill_d}); sample accounts in raw but not in bills: {samples}"
+                )
 
             # Drop from bill to bg_match (accounts in bills without geoid_bg)
             if (bill_d > 0 or bill_s > 0) and without_bg_n > 0:
@@ -271,9 +282,17 @@ def main() -> int:
                 if bill_path.exists():
                     bills_df = pl.read_parquet(bill_path).select("account_identifier")
                     joined = bills_df.join(amap, on="account_identifier", how="left")
-                    no_bg = joined.filter(pl.col("geoid_bg").is_null()).select("account_identifier").to_series().cast(pl.Utf8).to_list()
+                    no_bg = (
+                        joined.filter(pl.col("geoid_bg").is_null())
+                        .select("account_identifier")
+                        .to_series()
+                        .cast(pl.Utf8)
+                        .to_list()
+                    )
                     samples = no_bg[:5]
-                    print(f"  {yyyymm} {dc}: bill accounts without BG match: {without_bg_n}; sample account IDs: {samples}")
+                    print(
+                        f"  {yyyymm} {dc}: bill accounts without BG match: {without_bg_n}; sample account IDs: {samples}"
+                    )
 
     if not any_drops:
         print("  (No drops between stages.)")

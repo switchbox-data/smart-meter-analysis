@@ -10,7 +10,7 @@ aggregates mean bill delta to block group (geoid_bg), joins to BG geometry, writ
 Delta column: bill_diff_dollars with fallback to net_bill_diff_dollars (same as
 bill_stats_and_bg_correlation.py).
 
-Produces 16 GeoJSON files (2 months × 2 rate comparisons × 4 delivery classes).
+Produces 16 GeoJSON files (2 months x 2 rate comparisons x 4 delivery classes).
 
 Each GeoJSON contains:
   - geoid_bg: string, 12-digit Census block group ID (FIPS)
@@ -99,7 +99,7 @@ def main() -> int:
         "--account-bg-map-pattern",
         type=str,
         default=default_map_pattern,
-        help='Path with {yyyymm} placeholder for account->BG crosswalk (default: ~/pricing_pilot/account_bg_map_{{yyyymm}}.parquet).',
+        help="Path with {yyyymm} placeholder for account->BG crosswalk (default: ~/pricing_pilot/account_bg_map_{{yyyymm}}.parquet).",
     )
     parser.add_argument(
         "--shapefile",
@@ -124,7 +124,10 @@ def main() -> int:
     # Keep only files that parse correctly
     bill_paths = [p for p in bill_paths if _parse_bill_filename(p) is not None]
     if not bill_paths:
-        print(f"No bill files matching *_flat_vs_*_*.parquet (with parseable month/rate/class) in {bills_dir}", file=sys.stderr)
+        print(
+            f"No bill files matching *_flat_vs_*_*.parquet (with parseable month/rate/class) in {bills_dir}",
+            file=sys.stderr,
+        )
         return 1
 
     if not args.shapefile.exists():
@@ -188,6 +191,13 @@ def main() -> int:
         bg_pd["mean_delta"] = bg_pd["mean_delta"].astype("float64")
         bg_pd["n_households"] = bg_pd["n_households"].astype("int64")
         merged = g.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="inner")
+        n_unmatched = len(bg_pd) - len(merged)
+        if n_unmatched > 0:
+            print(
+                f"  WARNING: {n_unmatched}/{len(bg_pd)} BG(s) in {bill_path.name} had no"
+                " matching GEOID in shapefile and were dropped.",
+                file=sys.stderr,
+            )
         out_gdf = merged[["geoid_bg", "mean_delta", "n_households", "geometry"]].copy()
         out_gdf.set_geometry("geometry", inplace=True)
 
