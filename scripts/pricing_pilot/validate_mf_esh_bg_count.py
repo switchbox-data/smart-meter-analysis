@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate mf_esh block-group count: A) distinct accounts in bills, B) distinct BGs after join, C) features in GeoJSON."""
+
 from pathlib import Path
 
 import polars as pl
@@ -35,10 +36,14 @@ def main() -> None:
         a_count = bills.select(pl.col(account_col).n_unique()).item()
 
         # B) Join to account_bg_map, count distinct geoid_bg
-        amap = pl.read_parquet(map_path).select(
-            pl.col("account_identifier").cast(pl.Utf8),
-            pl.col("geoid_bg").cast(pl.Utf8),
-        ).unique(subset=["account_identifier"], keep="first")
+        amap = (
+            pl.read_parquet(map_path)
+            .select(
+                pl.col("account_identifier").cast(pl.Utf8),
+                pl.col("geoid_bg").cast(pl.Utf8),
+            )
+            .unique(subset=["account_identifier"], keep="first")
+        )
         accounts = bills.select(pl.col(account_col).cast(pl.Utf8).alias("account_identifier"))
         joined = accounts.join(amap, on="account_identifier", how="inner").filter(
             pl.col("geoid_bg").is_not_null() & (pl.col("geoid_bg").str.strip_chars() != "")
@@ -48,6 +53,7 @@ def main() -> None:
 
         # C) Count features in GeoJSON
         import json
+
         with open(geojson_path) as f:
             gj = json.load(f)
         features = gj.get("features", [])
@@ -65,7 +71,7 @@ def main() -> None:
         print(f"  B) Distinct geoid_bg (join):     {b_count}")
         print(f"  C) GeoJSON feature count:         {c_count}")
         if b_count != c_count:
-            print(f"  >>> B ≠ C: checking for join/type mismatches")
+            print("  >>> B ≠ C: checking for join/type mismatches")
             only_in_join = b_geoids - c_geoids
             only_in_geojson = c_geoids - b_geoids
             if only_in_join:
@@ -86,7 +92,7 @@ def main() -> None:
     print("=" * 60)
     print(f"{'Month':<12} {'A (accounts)':>14} {'B (BGs join)':>14} {'C (GeoJSON)':>14}")
     print("-" * 60)
-    for label, yyyymm, a, b, c in rows:
+    for label, _yyyymm, a, b, c in rows:
         print(f"{label:<12} {a:>14} {b:>14} {c:>14}")
     print("=" * 60)
 
