@@ -8,15 +8,20 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
 import statsmodels.api as sm
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from smart_meter_analysis.census import fetch_acs_data
+
+# Use Times New Roman throughout all figures.
+matplotlib.rcParams["font.family"] = "serif"
+matplotlib.rcParams["font.serif"] = ["Times New Roman"]
 
 logger = logging.getLogger(__name__)
 
@@ -406,7 +411,6 @@ def _plot_scatter(
     out_path: Path,
     *,
     stats_context: str = "",
-    sparse_caution: bool = False,
 ) -> None:
     """Produce one publication-ready scatterplot with OLS overlay.
 
@@ -417,8 +421,6 @@ def _plot_scatter(
     stats_context:
         Short identifier appended to the OLS stats box (month + class or "All
         Delivery Classes") so each plot is self-documenting without the title.
-    sparse_caution:
-        When True, adds "Caution: sparse sample." to the OLS stats box.
     """
     sns.set_theme(style="whitegrid")
 
@@ -445,20 +447,27 @@ def _plot_scatter(
     cbar = fig.colorbar(ax.collections[0], ax=ax, shrink=0.8)
     cbar.set_label("Block-Group Mean Usage (kWh)", fontsize=10)
 
-    # Regression line + 95% CI band
+    # Regression line, no CI band
     sns.regplot(
         data=pdf,
         x="median_income",
         y="mean_delta",
         scatter=False,
-        ci=95,
+        ci=None,
         ax=ax,
     )
 
+    # Remove any legend seaborn may have attached
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.remove()
+
     ax.set_xlabel("Median Household Income ($)")
     ax.set_ylabel(_y_label())
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(_dollar_formatter))
     ax.yaxis.set_major_formatter(FuncFormatter(_dollar_formatter))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     ax.set_title(title)
 
     # ── OLS stats panel (right side, out of the way) ──────────────────────
@@ -468,7 +477,7 @@ def _plot_scatter(
     r2 = float(model.rsquared)
 
     stats_parts = [
-        "OLS (HC1)",
+        "Ordinary Least Squares Regression",
         "",
         f"\u03b2\u2081 = {beta1:.4g}",
         f"SE   = {se:.4g}",
@@ -478,8 +487,6 @@ def _plot_scatter(
     ]
     if stats_context:
         stats_parts.extend(["", stats_context])
-    if sparse_caution:
-        stats_parts.extend(["", "Caution: sparse sample."])
 
     ax_stats.axis("off")
     ax_stats.text(
@@ -675,7 +682,6 @@ def main() -> int:  # noqa: C901
         comp_label = _comparison_label(lbl)
         class_lbl = _class_label(class_code)
         mp = _month_prefix(ym)
-        sparse = class_code == "mf_esh"
 
         title = f"{month_title} — {comp_label} — {class_lbl}\nBlock Group Level"
         stats_ctx = f"{month_title}\n{class_lbl}"
@@ -687,7 +693,6 @@ def main() -> int:  # noqa: C901
             title,
             out_fig_dir / f"{fig_stem}_scatter.png",
             stats_context=stats_ctx,
-            sparse_caution=sparse,
         )
         _save_regression_json(model, out_reg_dir / f"{fig_stem}_regression.json")
 
