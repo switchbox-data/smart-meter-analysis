@@ -20,8 +20,12 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 from smart_meter_analysis.census import fetch_acs_data
 
 # Use Times New Roman throughout all figures.
-matplotlib.rcParams["font.family"] = "serif"
-matplotlib.rcParams["font.serif"] = ["Times New Roman"]
+# NOTE: re-applied inside _plot_scatter after sns.set_theme(), which resets rcParams.
+matplotlib.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "font.size": 12,
+})
 
 logger = logging.getLogger(__name__)
 
@@ -409,8 +413,6 @@ def _plot_scatter(
     model: Any,
     title: str,
     out_path: Path,
-    *,
-    stats_context: str = "",
 ) -> None:
     """Produce one publication-ready scatterplot with OLS overlay.
 
@@ -418,11 +420,14 @@ def _plot_scatter(
     ----------
     title:
         Full two-line title already formatted as ``"Line1\\nBlock Group Level"``.
-    stats_context:
-        Short identifier appended to the OLS stats box (month + class or "All
-        Delivery Classes") so each plot is self-documenting without the title.
     """
     sns.set_theme(style="whitegrid")
+    # sns.set_theme() resets rcParams; re-apply font settings immediately after.
+    matplotlib.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman"],
+        "font.size": 12,
+    })
 
     fig, (ax, ax_stats) = plt.subplots(
         1,
@@ -445,7 +450,7 @@ def _plot_scatter(
 
     # Colorbar: dot colour encodes block-group mean electricity use
     cbar = fig.colorbar(ax.collections[0], ax=ax, shrink=0.8)
-    cbar.set_label("Block-Group Mean Usage (kWh)", fontsize=10)
+    cbar.set_label("Block-Group Mean Usage (kWh)", fontsize=10, fontfamily="serif")
 
     # Regression line, no CI band
     sns.regplot(
@@ -485,8 +490,6 @@ def _plot_scatter(
         f"R\u00b2  = {r2:.4f}",
         f"N    = {len(pdf)}",
     ]
-    if stats_context:
-        stats_parts.extend(["", stats_context])
 
     ax_stats.axis("off")
     ax_stats.text(
@@ -496,8 +499,14 @@ def _plot_scatter(
         ha="left",
         va="top",
         fontsize=10,
+        fontfamily="serif",
         bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "edgecolor": "0.8", "alpha": 0.95},
     )
+
+    # Safety net: force Times New Roman on every text element of the main axes.
+    for item in [ax.title, ax.xaxis.label, ax.yaxis.label, *ax.get_xticklabels(), *ax.get_yticklabels()]:
+        item.set_fontfamily("serif")
+        item.set_fontname("Times New Roman")
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -656,10 +665,9 @@ def main() -> int:  # noqa: C901
         mp = _month_prefix(ym)
 
         title = f"{month_title} — {comp_label} — All Delivery Classes\nBlock Group Level"
-        stats_ctx = f"{month_title}\nAll Delivery Classes"
         fig_stem = f"{mp}_{lbl}_aggregate"
 
-        _plot_scatter(pdf, model, title, out_fig_dir / f"{fig_stem}_scatter.png", stats_context=stats_ctx)
+        _plot_scatter(pdf, model, title, out_fig_dir / f"{fig_stem}_scatter.png")
         _save_regression_json(model, out_reg_dir / f"{fig_stem}_regression.json")
 
         summary_lines.append(f"=== AGGREGATE: {month_title} — {comp_label} — All Delivery Classes ===")
@@ -684,7 +692,6 @@ def main() -> int:  # noqa: C901
         mp = _month_prefix(ym)
 
         title = f"{month_title} — {comp_label} — {class_lbl}\nBlock Group Level"
-        stats_ctx = f"{month_title}\n{class_lbl}"
         fig_stem = f"{mp}_{lbl}_{class_code}"
 
         _plot_scatter(
@@ -692,7 +699,6 @@ def main() -> int:  # noqa: C901
             model,
             title,
             out_fig_dir / f"{fig_stem}_scatter.png",
-            stats_context=stats_ctx,
         )
         _save_regression_json(model, out_reg_dir / f"{fig_stem}_regression.json")
 
