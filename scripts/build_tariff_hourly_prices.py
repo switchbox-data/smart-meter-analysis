@@ -108,6 +108,90 @@ def _expand_hour_range(start: int, end: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
+# Window comparison
+# ---------------------------------------------------------------------------
+
+
+def _extract_window_definitions(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Extract season+period window definitions from a config, stripping prices.
+
+    Returns a dict keyed by season name; each value contains the season date
+    range and a sub-dict of period → {start_hour, end_hour}.  Price values are
+    intentionally excluded so comparisons are price-agnostic.
+    """
+    result: dict[str, Any] = {}
+    for season in cfg.get("seasons", []):
+        result[season["name"]] = {
+            "start_mmdd": season["start_mmdd"],
+            "end_mmdd": season["end_mmdd"],
+            "periods": {
+                p["period"]: {"start_hour": p["start_hour"], "end_hour": p["end_hour"]}
+                for p in season.get("periods", [])
+            },
+        }
+    return result
+
+
+def _diff_season(
+    sname: str,
+    sa: dict[str, Any],
+    sb: dict[str, Any],
+    name_a: str,
+    name_b: str,
+) -> list[str]:
+    """Return diff lines for a single season (date range + period hour boundaries)."""
+    lines: list[str] = []
+    for field in ("start_mmdd", "end_mmdd"):
+        if sa[field] != sb[field]:
+            lines.append(f"  season '{sname}' {field}: {name_a}={sa[field]!r} vs {name_b}={sb[field]!r}")
+    periods_a: dict[str, Any] = sa["periods"]
+    periods_b: dict[str, Any] = sb["periods"]
+    for pname in sorted(set(periods_a) | set(periods_b)):
+        if pname not in periods_a:
+            lines.append(f"  season '{sname}' period '{pname}': only in {name_b}")
+            continue
+        if pname not in periods_b:
+            lines.append(f"  season '{sname}' period '{pname}': only in {name_a}")
+            continue
+        pa, pb = periods_a[pname], periods_b[pname]
+        for field in ("start_hour", "end_hour"):
+            if pa[field] != pb[field]:
+                lines.append(
+                    f"  season '{sname}' period '{pname}' {field}: {name_a}={pa[field]} vs {name_b}={pb[field]}"
+                )
+    return lines
+
+
+def compare_window_definitions(
+    cfg_a: dict[str, Any],
+    cfg_b: dict[str, Any],
+    name_a: str = "config_a",
+    name_b: str = "config_b",
+) -> tuple[bool, str]:
+    """Compare TOU window definitions (season dates + period hour ranges) between two configs.
+
+    Prices are ignored — only season boundaries and period start/end hours matter.
+
+    Returns ``(True, "")`` when windows are identical, else ``(False, human_readable_diff)``
+    listing every differing field.
+    """
+    windows_a = _extract_window_definitions(cfg_a)
+    windows_b = _extract_window_definitions(cfg_b)
+    if windows_a == windows_b:
+        return True, ""
+
+    lines: list[str] = [f"TOU window mismatch between '{name_a}' and '{name_b}':"]
+    for sname in sorted(set(windows_a) | set(windows_b)):
+        if sname not in windows_a:
+            lines.append(f"  season '{sname}': only in {name_b}")
+        elif sname not in windows_b:
+            lines.append(f"  season '{sname}': only in {name_a}")
+        else:
+            lines.extend(_diff_season(sname, windows_a[sname], windows_b[sname], name_a, name_b))
+    return False, "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Season / period resolution
 # ---------------------------------------------------------------------------
 
@@ -306,6 +390,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging.",
     )
+    p.add_argument(
+        "--validate-windows-against",
+        type=Path,
+        default=None,
+        metavar="OTHER_YAML",
+        help=(
+            "After loading --config, compare its TOU window definitions (season dates "
+            "and period hour boundaries, not prices) against OTHER_YAML. "
+            "Exit non-zero if any boundary differs."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -323,6 +418,20 @@ def main(argv: list[str] | None = None) -> None:
     log.info("Validating period coverage …")
     validate_period_coverage(cfg["seasons"])
     log.info("Period coverage OK — all hours 0-23 mapped in every season.")
+
+    if args.validate_windows_against:
+        log.info("Comparing window definitions against: %s", args.validate_windows_against)
+        other_cfg = load_config(args.validate_windows_against)
+        ok, diff_msg = compare_window_definitions(
+            cfg,
+            other_cfg,
+            name_a=str(args.config),
+            name_b=str(args.validate_windows_against),
+        )
+        if not ok:
+            log.error("%s", diff_msg)
+            sys.exit(1)
+        log.info("Window definitions match: %s <-> %s", args.config, args.validate_windows_against)
 
     log.info("Building hourly prices for year %d …", args.year)
     df = build_hourly_prices(cfg, args.year)
