@@ -190,12 +190,22 @@ def main() -> int:
         bg_pd["geoid_bg"] = bg_pd["geoid_bg"].astype(str).str.strip()
         bg_pd["mean_delta"] = bg_pd["mean_delta"].astype("float64")
         bg_pd["n_households"] = bg_pd["n_households"].astype("int64")
-        merged = g.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="inner")
-        n_unmatched = len(bg_pd) - len(merged)
+
+        # Scope geometry to only the counties present in the bill data, then left-join
+        # so every BG in those counties appears in the output — null values for BGs
+        # with no household data (no sentinel values).
+        county_fips_set = set(bg_pd["geoid_bg"].str[:5])
+        g_counties = g[g["GEOID"].str[:5].isin(county_fips_set)]
+        merged = g_counties.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
+        # Fill geoid_bg from GEOID for rows with no matching household data.
+        merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
+
+        # Warn if any BGs with data had no matching geometry (data without geometry is lost).
+        n_unmatched = int((~bg_pd["geoid_bg"].isin(g_counties["GEOID"])).sum())
         if n_unmatched > 0:
             print(
-                f"  WARNING: {n_unmatched}/{len(bg_pd)} BG(s) in {bill_path.name} had no"
-                " matching GEOID in shapefile and were dropped.",
+                f"  WARNING: {n_unmatched}/{len(bg_pd)} BG(s) with data in {bill_path.name} had no"
+                " matching GEOID in shapefile and were excluded.",
                 file=sys.stderr,
             )
         out_gdf = merged[["geoid_bg", "mean_delta", "n_households", "geometry"]].copy()
@@ -204,11 +214,14 @@ def main() -> int:
         out_path = args.output_dir / f"{month}_{rate}_{delivery_class}.geojson"
         out_gdf.to_file(out_path, driver="GeoJSON")
         n_f = len(out_gdf)
+        n_with_data = int(out_gdf["n_households"].notna().sum())
         mean_d = out_gdf["mean_delta"].mean()
         min_d = out_gdf["mean_delta"].min()
         max_d = out_gdf["mean_delta"].max()
         written_paths.append((out_path, n_f, mean_d, min_d, max_d))
-        print(f"Wrote {out_path} | BGs: {n_f} | class: {delivery_class}")
+        print(
+            f"Wrote {out_path} | BGs: {n_f} ({n_with_data} with data, {n_f - n_with_data} null-fill) | class: {delivery_class}"
+        )
 
     print(f"\nDone. {len(written_paths)} GeoJSON file(s) in {args.output_dir}")
     if written_paths:

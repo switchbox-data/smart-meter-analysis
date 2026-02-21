@@ -1,7 +1,8 @@
 import glob
 import os
-import polars as pl
+
 import geopandas as gpd
+import polars as pl
 
 ROOT = "/ebs/home/griffin_switch_box"
 REPO = f"{ROOT}/smart-meter-analysis"
@@ -14,17 +15,35 @@ OUT_DIR = f"{ROOT}/pricing_pilot/regression/maps"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 jobs = [
-    ("jan_2023_dtou", f"{BILLS_DIR}/chicago_202301_*vs_dtou_scaled_allin_*.parquet", f"{MAP_DIR}/account_bg_map_202301.parquet"),
-    ("jan_2023_stou", f"{BILLS_DIR}/chicago_202301_*vs_rate_best*_scaled*.parquet", f"{MAP_DIR}/account_bg_map_202301.parquet"),
-    ("jul_2023_dtou", f"{BILLS_DIR}/chicago_202307_*vs_dtou*_scaled*.parquet", f"{MAP_DIR}/account_bg_map_202307.parquet"),
-    ("jul_2023_stou", f"{BILLS_DIR}/chicago_202307_*vs_rate_best*_scaled*.parquet", f"{MAP_DIR}/account_bg_map_202307.parquet"),
+    (
+        "jan_2023_dtou",
+        f"{BILLS_DIR}/chicago_202301_*vs_dtou_scaled_allin_*.parquet",
+        f"{MAP_DIR}/account_bg_map_202301.parquet",
+    ),
+    (
+        "jan_2023_stou",
+        f"{BILLS_DIR}/chicago_202301_*vs_rate_best*_scaled*.parquet",
+        f"{MAP_DIR}/account_bg_map_202301.parquet",
+    ),
+    (
+        "jul_2023_dtou",
+        f"{BILLS_DIR}/chicago_202307_*vs_dtou*_scaled*.parquet",
+        f"{MAP_DIR}/account_bg_map_202307.parquet",
+    ),
+    (
+        "jul_2023_stou",
+        f"{BILLS_DIR}/chicago_202307_*vs_rate_best*_scaled*.parquet",
+        f"{MAP_DIR}/account_bg_map_202307.parquet",
+    ),
 ]
+
 
 def pick_many(pattern: str) -> list[str]:
     hits = sorted(glob.glob(pattern))
     if not hits:
         raise RuntimeError(f"No files matched glob: {pattern}")
     return hits
+
 
 def choose_delta(cols: list[str]) -> pl.Expr:
     # IMPORTANT: these columns are already Alternative - Flat in your billing outputs.
@@ -35,6 +54,7 @@ def choose_delta(cols: list[str]) -> pl.Expr:
     if "bill_b_dollars" in cols and "bill_a_dollars" in cols:
         return pl.col("bill_b_dollars") - pl.col("bill_a_dollars")
     raise RuntimeError(f"No valid delta columns found. cols={cols}")
+
 
 if not os.path.exists(SHP_PATH):
     raise FileNotFoundError(SHP_PATH)
@@ -83,7 +103,7 @@ for label, bills_glob, map_path in jobs:
     ]).to_dict(as_series=False)
 
     print(f"\n[{label}] bills_files={len(bill_files)}")
-    for k,v in stats.items():
+    for k, v in stats.items():
         print(f"  {k}: {v[0]}")
 
     # Fail-loud guardrail: if everything is one sign AND magnitude is big, something is wrong.
@@ -93,13 +113,23 @@ for label, bills_glob, map_path in jobs:
     bg_pd = bg.to_pandas()
     bg_pd["geoid_bg"] = bg_pd["geoid_bg"].astype(str)
 
-    merged = g.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="inner")
+    # Scope geometry to only the counties present in the bill data, then left-join
+    # so every BG in those counties appears in the output — null values for BGs
+    # with no household data (no sentinel values).
+    county_fips_set = set(bg_pd["geoid_bg"].str[:5])
+    g_counties = g[g["GEOID"].str[:5].isin(county_fips_set)]
+    merged = g_counties.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
+    # Fill geoid_bg from GEOID for rows with no matching household data.
+    merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
 
     out_path = f"{OUT_DIR}/{label}_delta.geojson"
     merged.to_file(out_path, driver="GeoJSON")
 
+    n_with_data = int(merged["n_households"].notna().sum())
     used = ",".join([os.path.basename(x) for x in bill_files])
-    print(f"WROTE {out_path} | BG count: {len(merged)}")
+    print(
+        f"WROTE {out_path} | BG count: {len(merged)} ({n_with_data} with data, {len(merged) - n_with_data} null-fill)"
+    )
     print(f"  bills: {used}")
 
 print("\nDONE: 4 Felt-ready GeoJSON layers created.")
