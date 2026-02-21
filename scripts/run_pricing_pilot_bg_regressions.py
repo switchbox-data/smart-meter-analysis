@@ -82,6 +82,10 @@ def _dollar_formatter(x: float, _pos: int) -> str:
     return f"${x:,.0f}"
 
 
+def _pct_formatter(x: float, _pos: int) -> str:
+    return f"{x:.1f}%"
+
+
 def _month_title(month: str) -> str:
     if month == "202301":
         return "January 2023"
@@ -90,7 +94,9 @@ def _month_title(month: str) -> str:
     return month
 
 
-def _y_label() -> str:
+def _y_label(*, pct: bool = False) -> str:
+    if pct:
+        return "Average Monthly Bill Change (%)"
     # mean_delta = block-group average of (Flat - Alt); positive = savings under alternative.
     return "Average Monthly Savings (Flat \u2212 Alt, $)"
 
@@ -193,6 +199,75 @@ def _compute_household_delta(hh: pl.DataFrame) -> pl.DataFrame:
         pl.col("total_kwh").cast(pl.Float64).alias("kwh"),
         pl.col("account_identifier").cast(pl.Utf8).alias("account_identifier"),
     ])
+
+
+def _compute_household_pct_change(hh: pl.DataFrame) -> pl.DataFrame:
+    """Standardizes household-level percentage change for pilot bills.
+
+    pct_change = (flat_bill - alt_bill) / flat_bill * 100
+    (positive = savings under alternative)
+
+    Households where flat_bill <= 0 yield null and are dropped before return.
+
+    Column priority mirrors _compute_household_delta:
+      1) net_pct_savings   (pre-computed; matches net_bill_diff_dollars priority)
+      2) pct_savings       (pre-computed; matches bill_diff_dollars priority)
+      3) net_bill_diff_dollars / bill_a_dollars * 100
+      4) bill_diff_dollars / bill_a_dollars * 100
+      5) (bill_a_dollars - bill_b_dollars) / bill_a_dollars * 100
+    """
+    cols = set(hh.columns)
+
+    if "net_pct_savings" in cols:
+        pct_expr = pl.col("net_pct_savings").cast(pl.Float64)
+    elif "pct_savings" in cols:
+        pct_expr = pl.col("pct_savings").cast(pl.Float64)
+    elif "net_bill_diff_dollars" in cols and "bill_a_dollars" in cols:
+        pct_expr = (
+            pl.when(pl.col("bill_a_dollars").cast(pl.Float64) > 0)
+            .then(pl.col("net_bill_diff_dollars").cast(pl.Float64) / pl.col("bill_a_dollars").cast(pl.Float64) * 100)
+            .otherwise(None)
+        )
+    elif "bill_diff_dollars" in cols and "bill_a_dollars" in cols:
+        pct_expr = (
+            pl.when(pl.col("bill_a_dollars").cast(pl.Float64) > 0)
+            .then(pl.col("bill_diff_dollars").cast(pl.Float64) / pl.col("bill_a_dollars").cast(pl.Float64) * 100)
+            .otherwise(None)
+        )
+    elif "bill_a_dollars" in cols and "bill_b_dollars" in cols:
+        pct_expr = (
+            pl.when(pl.col("bill_a_dollars").cast(pl.Float64) > 0)
+            .then(
+                (pl.col("bill_a_dollars").cast(pl.Float64) - pl.col("bill_b_dollars").cast(pl.Float64))
+                / pl.col("bill_a_dollars").cast(pl.Float64)
+                * 100
+            )
+            .otherwise(None)
+        )
+    else:
+        raise RuntimeError(
+            "Could not compute household pct change. Expected one of: net_pct_savings, pct_savings, "
+            "(net_bill_diff_dollars & bill_a_dollars), (bill_diff_dollars & bill_a_dollars), "
+            "or (bill_a_dollars & bill_b_dollars). "
+            f"Got columns: {sorted(cols)}"
+        )
+
+    if "total_kwh" not in cols:
+        raise RuntimeError("Expected total_kwh column in pilot bills (for mean_kwh hue/diagnostics).")
+
+    # Reuse delta_dollars column name so all downstream aggregation/regression code
+    # works without modification; units are percent, not dollars.
+    out = hh.with_columns([
+        pct_expr.alias("delta_dollars"),
+        pl.col("total_kwh").cast(pl.Float64).alias("kwh"),
+        pl.col("account_identifier").cast(pl.Utf8).alias("account_identifier"),
+    ])
+    n_before = out.height
+    out = out.drop_nulls(["delta_dollars"])
+    n_dropped = n_before - out.height
+    if n_dropped:
+        logger.info("_compute_household_pct_change: dropped %d/%d rows with flat_bill <= 0.", n_dropped, n_before)
+    return out
 
 
 def _load_account_bg_map(path: Path) -> pl.DataFrame:
@@ -413,6 +488,8 @@ def _plot_scatter(
     model: Any,
     title: str,
     out_path: Path,
+    *,
+    pct: bool = False,
 ) -> None:
     """Produce one publication-ready scatterplot with OLS overlay.
 
@@ -420,6 +497,8 @@ def _plot_scatter(
     ----------
     title:
         Full two-line title already formatted as ``"Line1\\nBlock Group Level"``.
+    pct:
+        When True the y-axis is percentage change; adjusts label and tick formatter.
     """
     sns.set_theme(style="whitegrid")
     # sns.set_theme() resets rcParams; re-apply font settings immediately after.
@@ -468,10 +547,10 @@ def _plot_scatter(
         legend.remove()
 
     ax.set_xlabel("Median Household Income ($)")
-    ax.set_ylabel(_y_label())
+    ax.set_ylabel(_y_label(pct=pct))
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(_dollar_formatter))
-    ax.yaxis.set_major_formatter(FuncFormatter(_dollar_formatter))
+    ax.yaxis.set_major_formatter(FuncFormatter(_pct_formatter if pct else _dollar_formatter))
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     ax.set_title(title)
 
@@ -523,17 +602,20 @@ def _build_aggregate_bg(
     paths: list[Path],
     acct_bg: pl.DataFrame,
     tag: str,
+    *,
+    pct: bool = False,
 ) -> tuple[pl.DataFrame, float]:
     """Pool all delivery-class files for one scenario; aggregate to BG level.
 
-    Returns (bg_table, household_mean_delta).
+    Returns (bg_table, household_mean_delta_or_pct).
     """
     hh = pl.concat([pl.read_parquet(p) for p in paths], how="vertical")
-    hh = _compute_household_delta(hh)
+    hh = _compute_household_pct_change(hh) if pct else _compute_household_delta(hh)
     hh_mean = float(hh.select(pl.col("delta_dollars").mean()).item())
     logger.info(
-        "%s: household mean(delta_dollars)=%.6g (should be ~0; upstream authoritative)",
+        "%s: household mean(delta_%s)=%.6g (should be ~0; upstream authoritative)",
         tag,
+        "pct" if pct else "dollars",
         hh_mean,
     )
     hh = _attach_geoid_bg(hh, acct_bg)
@@ -546,10 +628,12 @@ def _build_per_class_bg(
     path: Path,
     acct_bg: pl.DataFrame,
     tag: str,
+    *,
+    pct: bool = False,
 ) -> pl.DataFrame:
     """Aggregate a single delivery-class bill file to BG level."""
     hh = pl.read_parquet(path)
-    hh = _compute_household_delta(hh)
+    hh = _compute_household_pct_change(hh) if pct else _compute_household_delta(hh)
     hh = _attach_geoid_bg(hh, acct_bg)
     bg = _aggregate_bg(hh)
     _assert_no_bg_duplicates(bg, tag=tag)
@@ -581,12 +665,28 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--income-cache", type=Path, default=DEFAULT_CENSUS_CACHE)
 
+    p.add_argument(
+        "--pct",
+        action="store_true",
+        default=False,
+        help=(
+            "Compute percentage change instead of absolute dollars. "
+            "pct_change = (flat_bill - alt_bill) / flat_bill * 100. "
+            "Households with flat_bill <= 0 are excluded. "
+            "Appends _pct to all output filenames (PNGs, JSONs) and writes "
+            "regression_summary_pct.txt instead of regression_summary.txt."
+        ),
+    )
+
     return p.parse_args()
 
 
 def main() -> int:  # noqa: C901
     _configure_logging()
     args = parse_args()
+
+    pct: bool = args.pct
+    file_suffix = "_pct" if pct else ""
 
     bills_dir: Path = args.bills_dir
     out_dir: Path = args.out_dir
@@ -618,7 +718,7 @@ def main() -> int:  # noqa: C901
         acct_bg = acct_bg_202301 if ym == "202301" else acct_bg_202307
 
         # Aggregate (pool all delivery classes)
-        bg, hh_mean = _build_aggregate_bg(paths, acct_bg, tag)
+        bg, hh_mean = _build_aggregate_bg(paths, acct_bg, tag, pct=pct)
         bg_agg[(ym, lbl)] = bg
         hh_mean_deltas[(ym, lbl)] = hh_mean
         needed_geoids.update(bg["geoid_bg"].to_list())
@@ -631,7 +731,7 @@ def main() -> int:  # noqa: C901
                 continue
             class_tag = f"{tag}_{class_code}"
             logger.info("Building per-class BG table: %s", class_tag)
-            bg_class[(ym, lbl, class_code)] = _build_per_class_bg(path, acct_bg, class_tag)
+            bg_class[(ym, lbl, class_code)] = _build_per_class_bg(path, acct_bg, class_tag, pct=pct)
 
     county_fips = args.county_fips.strip() or None
 
@@ -665,9 +765,9 @@ def main() -> int:  # noqa: C901
         mp = _month_prefix(ym)
 
         title = f"{month_title} — {comp_label} — All Delivery Classes\nBlock Group Level"
-        fig_stem = f"{mp}_{lbl}_aggregate"
+        fig_stem = f"{mp}_{lbl}_aggregate{file_suffix}"
 
-        _plot_scatter(pdf, model, title, out_fig_dir / f"{fig_stem}_scatter.png")
+        _plot_scatter(pdf, model, title, out_fig_dir / f"{fig_stem}_scatter.png", pct=pct)
         _save_regression_json(model, out_reg_dir / f"{fig_stem}_regression.json")
 
         summary_lines.append(f"=== AGGREGATE: {month_title} — {comp_label} — All Delivery Classes ===")
@@ -692,13 +792,14 @@ def main() -> int:  # noqa: C901
         mp = _month_prefix(ym)
 
         title = f"{month_title} — {comp_label} — {class_lbl}\nBlock Group Level"
-        fig_stem = f"{mp}_{lbl}_{class_code}"
+        fig_stem = f"{mp}_{lbl}_{class_code}{file_suffix}"
 
         _plot_scatter(
             pdf,
             model,
             title,
             out_fig_dir / f"{fig_stem}_scatter.png",
+            pct=pct,
         )
         _save_regression_json(model, out_reg_dir / f"{fig_stem}_regression.json")
 
@@ -710,15 +811,25 @@ def main() -> int:  # noqa: C901
     if not ran_any:
         raise RuntimeError("No regressions were run (likely due to too few BGs after income join). Check logs above.")
 
-    (out_reg_dir / "regression_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+    if pct:
+        summary_lines = [
+            "=== Percentage-change regressions (--pct) ===",
+            "Y variable: mean_pct_change = mean((flat_bill - alt_bill) / flat_bill * 100) per block group",
+            "Households with flat_bill <= 0 excluded.",
+            "",
+            *summary_lines,
+        ]
 
-    logger.info("Wrote regression_summary.txt -> %s", out_reg_dir / "regression_summary.txt")
+    summary_fname = f"regression_summary{file_suffix}.txt"
+    (out_reg_dir / summary_fname).write_text("\n".join(summary_lines), encoding="utf-8")
+
+    logger.info("Wrote %s -> %s", summary_fname, out_reg_dir / summary_fname)
     logger.info("Figures dir -> %s", out_fig_dir)
     logger.info("Income cache -> %s", args.income_cache)
 
     # Final validation summary (explicit, no silent assumptions)
     for (ym, lbl), v in sorted(hh_mean_deltas.items()):
-        logger.info("VALIDATION: %s_%s household mean(delta_dollars)=%.6g", ym, lbl, v)
+        logger.info("VALIDATION: %s_%s household mean(delta_%s)=%.6g", ym, lbl, "pct" if pct else "dollars", v)
 
     return 0
 
