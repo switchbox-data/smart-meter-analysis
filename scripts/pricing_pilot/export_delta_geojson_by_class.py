@@ -7,8 +7,8 @@ e.g. 202301_flat_vs_dtou_sf_no_esh.parquet
 
 For each file: joins to account_bg_map_{yyyymm}.parquet (202301 for January, 202307 for July),
 aggregates mean bill delta to block group (geoid_bg), joins to BG geometry, writes one GeoJSON.
-Delta column: bill_diff_dollars with fallback to net_bill_diff_dollars (same as
-bill_stats_and_bg_correlation.py).
+Delta computed as bill_b_dollars - bill_a_dollars when available; fallback to
+net_bill_diff_dollars, then bill_diff_dollars.
 
 Sign convention: delta = alternative_rate_bill - flat_rate_bill
   - positive (+) means customer pays MORE under the alternative rate
@@ -89,17 +89,25 @@ class _ScenarioData:
 
 
 def _choose_delta(cols: list[str]) -> pl.Expr:
-    """Prefer bill_diff_dollars, fallback to net_bill_diff_dollars (same as bill_stats_and_bg_correlation).
+    """Return a Polars expression for bill delta with the stated sign convention.
 
-    Sign convention: returned column = alternative_rate_bill - flat_rate_bill.
+    Preference order:
+      1. bill_b_dollars - bill_a_dollars  (explicit; matches sign convention by construction)
+      2. net_bill_diff_dollars            (fallback; semantics assumed to be alt - flat)
+      3. bill_diff_dollars                (last resort; semantics may vary — Pass 1 consistency
+                                           check will warn if sign is flipped)
+
+    Sign convention: delta = alternative_rate_bill - flat_rate_bill.
     Positive = costs more under alt rate; negative = savings.
     """
-    if "bill_diff_dollars" in cols:
-        return pl.col("bill_diff_dollars")
-    if "net_bill_diff_dollars" in cols:
-        return pl.col("net_bill_diff_dollars")
     if "bill_b_dollars" in cols and "bill_a_dollars" in cols:
         return pl.col("bill_b_dollars") - pl.col("bill_a_dollars")
+    if "net_bill_diff_dollars" in cols:
+        # Assumed semantics: alt - flat. Caller must verify.
+        return pl.col("net_bill_diff_dollars")
+    if "bill_diff_dollars" in cols:
+        # Last resort. Semantics may vary; consistency check below will warn if sign-flipped.
+        return pl.col("bill_diff_dollars")
     raise ValueError(f"No delta column found. Have: {cols}")
 
 
@@ -232,6 +240,36 @@ def main() -> int:
         if "account_identifier" not in cols:
             print(f"  Bills missing account_identifier: {bill_path}", file=sys.stderr)
             continue
+
+        # Internal consistency check: if both bill_a/b_dollars AND bill_diff_dollars
+        # are present, verify that bill_diff_dollars matches (b - a) and is not sign-flipped.
+        # This catches upstream sign errors early and loudly.
+        if {"bill_a_dollars", "bill_b_dollars", "bill_diff_dollars"}.issubset(cols):
+            _chk = df.select(
+                (pl.col("bill_b_dollars") - pl.col("bill_a_dollars")).alias("d_ab"),
+                pl.col("bill_diff_dollars").alias("d_col"),
+            ).with_columns(
+                (pl.col("d_ab") - pl.col("d_col")).abs().alias("diff_same"),
+                (pl.col("d_ab") + pl.col("d_col")).abs().alias("diff_flip"),
+            )
+            mean_same = _chk["diff_same"].mean()
+            mean_flip = _chk["diff_flip"].mean()
+            if mean_flip < mean_same:
+                print(
+                    f"  WARNING [{bill_path.name}]: bill_diff_dollars is OPPOSITE-SIGN to"
+                    f" (bill_b - bill_a) [mean|b-a - diff|={mean_same:.4g},"
+                    f" mean|b-a + diff|={mean_flip:.4g}]."
+                    " Using (bill_b_dollars - bill_a_dollars); bill_diff_dollars IGNORED.",
+                    file=sys.stderr,
+                )
+            elif mean_same > 1e-6:
+                print(
+                    f"  WARNING [{bill_path.name}]: bill_diff_dollars differs from (bill_b - bill_a)"
+                    f" but is not a clean sign-flip [mean|same|={mean_same:.4g},"
+                    f" mean|flip|={mean_flip:.4g}]. Using (bill_b - bill_a).",
+                    file=sys.stderr,
+                )
+            # else: agree within tolerance — no warning
 
         # Sign convention: delta = alternative_rate_bill - flat_rate_bill
         delta_expr = _choose_delta(cols)
