@@ -450,6 +450,7 @@ def _run_ols_hc1(df: pl.DataFrame, *, tag: str) -> tuple[Any, pd.DataFrame]:
     Logs N, no silent drops.
     """
     pdf = df.select(["median_income", "mean_delta", "mean_kwh", "n_households", "geoid_bg"]).to_pandas()
+    pdf["median_income"] = pdf["median_income"] / 10_000
     pdf = _sanitize_for_statsmodels(pdf, tag=tag)
 
     y = pdf["mean_delta"].astype(float)
@@ -546,7 +547,7 @@ def _plot_scatter(
     if legend is not None:
         legend.remove()
 
-    ax.set_xlabel("Median Household Income ($)")
+    ax.set_xlabel("Median Household Income ($10K)")
     ax.set_ylabel(_y_label(pct=pct))
     ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(_dollar_formatter))
