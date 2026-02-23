@@ -215,6 +215,34 @@ def main() -> int:
     g["GEOID"] = g["GEOID"].astype(str).str.strip()
 
     # =========================================================================
+    # Build Chicago BG universe from ZIP-based sample frame.
+    # Universe = all BG GEOIDs reachable from Chicago ZIP5s via the ZIP+4 crosswalk.
+    # BGs outside this universe are excluded entirely; BGs inside with no billing
+    # data are kept as gray "no-data" polygons (n_households=0, metric null).
+    # =========================================================================
+    _chi_zip_csv = REPO_ROOT / "data/reference/geography/chicago_zip_codes.csv"
+    _chi_xwalk = REPO_ROOT / "data/reference/comed_bg_zip4_crosswalk.txt"
+    if not _chi_zip_csv.exists() or not _chi_xwalk.exists():
+        print("ERROR: Chicago reference files not found:", file=sys.stderr)
+        print(f"  {_chi_zip_csv}", file=sys.stderr)
+        print(f"  {_chi_xwalk}", file=sys.stderr)
+        return 1
+    _zip5_raw = pl.read_csv(_chi_zip_csv, infer_schema_length=0)
+    _chi_zip5s = set(_zip5_raw["zip5"].str.strip_chars().str.zfill(5).to_list())
+    _xw = pl.read_csv(_chi_xwalk, separator="\t", infer_schema_length=0)
+    _xw_chi = _xw.filter(pl.col("Zip").str.strip_chars().str.zfill(5).is_in(_chi_zip5s))
+    _bg_universe_geoids = frozenset(_xw_chi["CensusKey2023"].str.strip_chars().str.slice(0, 12).unique().to_list())
+    g_universe = g[g["GEOID"].isin(_bg_universe_geoids)].copy()
+    if len(g_universe) == 0:
+        print(
+            "ERROR: Chicago ZIP-based BG universe produced 0 geometry features."
+            " Check reference files and shapefile GEOID format.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"[geo] BG universe (ZIP-based): kept {len(g_universe)}/{len(g)} features")
+
+    # =========================================================================
     # PASS 1: load all scenarios and aggregate to BG level.
     # We do this before writing any files so we can compute the global range X
     # from ALL scenarios before committing any output.
@@ -347,13 +375,16 @@ def main() -> int:
     expected_bg_count: int | None = args.expected_bg_count  # None until first file sets it
 
     for s in scenarios:
-        # Scope geometry to counties present in this scenario's data.
-        g_counties = g[g["GEOID"].str[:5].isin(s.county_fips_set)]
+        # Scope geometry to Chicago BG universe (ZIP-based sample frame).
+        # g_universe is fixed across all scenarios; computed once before Pass 1.
+        g_counties = g_universe
 
-        # Left join: every BG in the county geometry appears; null for BGs with no household data.
+        # Left join: every BG in the universe appears; null for BGs with no household data.
         merged = g_counties.merge(s.bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
         # Fill geoid_bg from GEOID for rows with no matching household data.
         merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
+        # Fill n_households to 0 for Chicago BGs with no modeled households.
+        merged["n_households"] = merged["n_households"].fillna(0).astype("int64")
 
         # ---- Fail-loud validation ----------------------------------------
 
