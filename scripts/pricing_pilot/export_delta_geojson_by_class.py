@@ -10,16 +10,25 @@ aggregates mean bill delta to block group (geoid_bg), joins to BG geometry, writ
 Delta column: bill_diff_dollars with fallback to net_bill_diff_dollars (same as
 bill_stats_and_bg_correlation.py).
 
+Sign convention: delta = alternative_rate_bill - flat_rate_bill
+  - positive (+) means customer pays MORE under the alternative rate
+  - negative (-) means customer SAVES under the alternative rate
+
 Produces 16 GeoJSON files (2 months x 2 rate comparisons x 4 delivery classes).
 
 Each GeoJSON contains:
   - geoid_bg: string, 12-digit Census block group ID (FIPS)
-  - mean_delta: float, mean monthly bill change ($)
-  - n_households: int, count of simulated households
+  - mean_delta: float, mean monthly bill change ($); null for BGs with no data
+  - n_households: int, count of simulated households; null for BGs with no data
+  - mean_delta_cap_global_sym: float, mean_delta clamped to [-X, +X] where X is
+      the p95 of |mean_delta| across ALL scenarios; null where mean_delta is null.
+      Use this field for Felt choropleth with a consistent legend range.
   - geometry: polygon, Census BG boundary
 
 Output files: {output_dir}/{yyyymm}_{dtou|stou}_{delivery_class}.geojson
 e.g. 202301_dtou_sf_no_esh.geojson, 202307_stou_mf_esh.geojson
+
+Sidecar: {output_dir}/range_global.json — contains bound_sym (X), method, sign convention.
 
 Geometry: Block group shapefile (default repo data/shapefiles/...). If missing, script
 exits with error; provide a path via --shapefile.
@@ -34,22 +43,57 @@ Usage::
     --account-bg-map-pattern ~/pricing_pilot/account_bg_map_{yyyymm}.parquet \\
     --shapefile /path/to/tl_2023_17_bg.shp \\
     --output-dir ~/pricing_pilot/geojson_out
+
+  # Disable global range (omits mean_delta_cap_global_sym and range_global.json):
+  uv run python scripts/pricing_pilot/export_delta_geojson_by_class.py --no-global-range
+
+Felt usage:
+  - Set numericAttribute to mean_delta_cap_global_sym (NOT mean_delta)
+  - Set legend min = -bound_sym, max = +bound_sym for ALL layers
+  - bound_sym is printed at run end and stored in range_global.json
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Sign convention applied consistently across all scenarios.
+# delta = alternative_rate_bill - flat_rate_bill
+# Positive (+) = customer pays MORE under alternative rate (costs more)
+# Negative (-) = customer SAVES under alternative rate (savings)
+SIGN_CONVENTION = (
+    "delta = alternative_rate_bill - flat_rate_bill (positive = higher bill under alt rate; negative = savings)"
+)
+
+
+@dataclass
+class _ScenarioData:
+    month: str
+    rate: str
+    delivery_class: str
+    bill_path: Path
+    # pandas DataFrame with columns: geoid_bg (str), mean_delta (float), n_households (int)
+    bg_pd: object  # pd.DataFrame
+    county_fips_set: frozenset
+
 
 def _choose_delta(cols: list[str]) -> pl.Expr:
-    """Prefer bill_diff_dollars, fallback to net_bill_diff_dollars (same as bill_stats_and_bg_correlation)."""
+    """Prefer bill_diff_dollars, fallback to net_bill_diff_dollars (same as bill_stats_and_bg_correlation).
+
+    Sign convention: returned column = alternative_rate_bill - flat_rate_bill.
+    Positive = costs more under alt rate; negative = savings.
+    """
     if "bill_diff_dollars" in cols:
         return pl.col("bill_diff_dollars")
     if "net_bill_diff_dollars" in cols:
@@ -113,15 +157,35 @@ def main() -> int:
         default=default_out,
         help=f"Output directory for GeoJSON files (default: {default_out}).",
     )
+    parser.add_argument(
+        "--no-global-range",
+        dest="global_range",
+        action="store_false",
+        default=True,
+        help="Disable global symmetric range: omits mean_delta_cap_global_sym column and range_global.json.",
+    )
+    parser.add_argument(
+        "--global-range-quantile",
+        type=float,
+        default=0.95,
+        metavar="Q",
+        help="Quantile of |mean_delta| used for global symmetric bound X (default: 0.95 = p95).",
+    )
+    parser.add_argument(
+        "--expected-bg-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Expected BG feature count per output file. If provided, fails if any file differs. "
+        "If omitted, the first file's count becomes the expectation and subsequent files are checked against it.",
+    )
     args = parser.parse_args()
 
-    # Glob: {yyyymm}_flat_vs_{dtou|stou}_{delivery_class}.parquet
     bills_dir = args.bills_dir
     if not bills_dir.exists():
         print(f"Bills directory not found: {bills_dir}", file=sys.stderr)
         return 1
     bill_paths = sorted(bills_dir.glob("*_flat_vs_*_*.parquet"))
-    # Keep only files that parse correctly
     bill_paths = [p for p in bill_paths if _parse_bill_filename(p) is not None]
     if not bill_paths:
         print(
@@ -142,7 +206,14 @@ def main() -> int:
         return 1
     g["GEOID"] = g["GEOID"].astype(str).str.strip()
 
-    written_paths: list[tuple[Path, int, float, float, float]] = []  # (path, n_features, mean, min, max)
+    # =========================================================================
+    # PASS 1: load all scenarios and aggregate to BG level.
+    # We do this before writing any files so we can compute the global range X
+    # from ALL scenarios before committing any output.
+    # =========================================================================
+    print(f"Pass 1: aggregating {len(bill_paths)} bill file(s) to block-group level...")
+    scenarios: list[_ScenarioData] = []
+    all_mean_deltas: list[float] = []  # collected across every scenario for global X
 
     for bill_path in bill_paths:
         bill_path = Path(bill_path)
@@ -153,15 +224,16 @@ def main() -> int:
 
         map_path = Path(args.account_bg_map_pattern.format(yyyymm=month))
         if not map_path.exists():
-            print(f"Account-BG map not found for {month}: {map_path}", file=sys.stderr)
+            print(f"  Account-BG map not found for {month}: {map_path}", file=sys.stderr)
             continue
 
         df = pl.read_parquet(bill_path)
         cols = df.columns
         if "account_identifier" not in cols:
-            print(f"Bills missing account_identifier: {bill_path}", file=sys.stderr)
+            print(f"  Bills missing account_identifier: {bill_path}", file=sys.stderr)
             continue
 
+        # Sign convention: delta = alternative_rate_bill - flat_rate_bill
         delta_expr = _choose_delta(cols)
         df = df.with_columns(delta_expr.alias("delta_dollars"))
 
@@ -183,51 +255,165 @@ def main() -> int:
             pl.len().alias("n_households"),
         )
         if bg.height == 0:
+            print(f"  No BG data after join for {bill_path.name}; skipping.", file=sys.stderr)
             continue
 
-        # geoid_bg: 12-digit string for join (same type/format as shapefile GEOID)
         bg_pd = bg.to_pandas()
         bg_pd["geoid_bg"] = bg_pd["geoid_bg"].astype(str).str.strip()
         bg_pd["mean_delta"] = bg_pd["mean_delta"].astype("float64")
         bg_pd["n_households"] = bg_pd["n_households"].astype("int64")
 
-        # Scope geometry to only the counties present in the bill data, then left-join
-        # so every BG in those counties appears in the output — null values for BGs
-        # with no household data (no sentinel values).
-        county_fips_set = set(bg_pd["geoid_bg"].str[:5])
-        g_counties = g[g["GEOID"].str[:5].isin(county_fips_set)]
-        merged = g_counties.merge(bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
+        county_fips_set = frozenset(bg_pd["geoid_bg"].str[:5])
+        all_mean_deltas.extend(bg_pd["mean_delta"].dropna().tolist())
+        scenarios.append(
+            _ScenarioData(
+                month=month,
+                rate=rate,
+                delivery_class=delivery_class,
+                bill_path=bill_path,
+                bg_pd=bg_pd,
+                county_fips_set=county_fips_set,
+            )
+        )
+        print(f"  Loaded {bill_path.name}: {bg.height} BGs with data, counties={sorted(county_fips_set)}")
+
+    if not scenarios:
+        print("No scenarios were successfully processed.", file=sys.stderr)
+        return 1
+
+    # =========================================================================
+    # Compute global symmetric bound X.
+    # X = quantile(|mean_delta|, q) across all non-null BG values in all scenarios.
+    # Using a symmetric bound ensures +$5 means the same thing on every layer.
+    # =========================================================================
+    bound_sym: float | None = None
+    if args.global_range:
+        if not all_mean_deltas:
+            print("WARNING: global range requested but no mean_delta values collected.", file=sys.stderr)
+        else:
+            q = args.global_range_quantile
+            bound_sym = float(np.quantile(np.abs(all_mean_deltas), q))
+            print(
+                f"\nGlobal symmetric bound: X = {bound_sym:.4f}"
+                f"  (p{int(q * 100)} of |mean_delta| across {len(scenarios)} scenarios,"
+                f" {len(all_mean_deltas)} BG values)"
+            )
+            print(f"  => Felt legend: min = -{bound_sym:.2f}  max = +{bound_sym:.2f}")
+            print(f"  => Sign convention: {SIGN_CONVENTION}\n")
+
+    # =========================================================================
+    # PASS 2: join geometry, add mean_delta_cap_global_sym, validate, write.
+    # =========================================================================
+    print(f"Pass 2: joining geometry and writing {len(scenarios)} GeoJSON file(s)...")
+    written_paths: list[Path] = []
+    expected_bg_count: int | None = args.expected_bg_count  # None until first file sets it
+
+    for s in scenarios:
+        # Scope geometry to counties present in this scenario's data.
+        g_counties = g[g["GEOID"].str[:5].isin(s.county_fips_set)]
+
+        # Left join: every BG in the county geometry appears; null for BGs with no household data.
+        merged = g_counties.merge(s.bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
         # Fill geoid_bg from GEOID for rows with no matching household data.
         merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
 
-        # Warn if any BGs with data had no matching geometry (data without geometry is lost).
-        n_unmatched = int((~bg_pd["geoid_bg"].isin(g_counties["GEOID"])).sum())
-        if n_unmatched > 0:
+        # ---- Fail-loud validation ----------------------------------------
+
+        # 1. geoid_bg uniqueness
+        if merged["geoid_bg"].duplicated().any():
+            dupes = merged.loc[merged["geoid_bg"].duplicated(keep=False), "geoid_bg"].tolist()
             print(
-                f"  WARNING: {n_unmatched}/{len(bg_pd)} BG(s) with data in {bill_path.name} had no"
-                " matching GEOID in shapefile and were excluded.",
+                f"ERROR: duplicate geoid_bg in {s.bill_path.name}: {dupes[:10]}",
                 file=sys.stderr,
             )
-        out_gdf = merged[["geoid_bg", "mean_delta", "n_households", "geometry"]].copy()
-        out_gdf.set_geometry("geometry", inplace=True)
+            return 1
 
-        out_path = args.output_dir / f"{month}_{rate}_{delivery_class}.geojson"
+        # 2. Feature count consistency across all files
+        n_f = len(merged)
+        if expected_bg_count is None:
+            expected_bg_count = n_f  # first file sets the expectation
+        elif n_f != expected_bg_count:
+            print(
+                f"ERROR: BG feature count mismatch in {s.bill_path.name}: got {n_f}, expected {expected_bg_count}.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # 3. Warn if any BGs with data had no matching geometry (data is lost).
+        n_unmatched = int((~s.bg_pd["geoid_bg"].isin(g_counties["GEOID"])).sum())
+        if n_unmatched > 0:
+            print(
+                f"  WARNING: {n_unmatched}/{len(s.bg_pd)} BG(s) with data in {s.bill_path.name}"
+                " had no matching GEOID in shapefile and were excluded.",
+                file=sys.stderr,
+            )
+
+        # ---- Build output GeoDataFrame -----------------------------------
+
+        out_cols = ["geoid_bg", "mean_delta", "n_households"]
+
+        if bound_sym is not None:
+            # Clamp mean_delta to [-X, +X]; NaN stays NaN (no data BGs remain null).
+            merged["mean_delta_cap_global_sym"] = merged["mean_delta"].clip(-bound_sym, bound_sym)
+            out_cols.append("mean_delta_cap_global_sym")
+
+        out_cols.append("geometry")
+        out_gdf = merged[out_cols].copy()
+        out_gdf = gpd.GeoDataFrame(out_gdf, geometry="geometry")
+
+        out_path = args.output_dir / f"{s.month}_{s.rate}_{s.delivery_class}.geojson"
         out_gdf.to_file(out_path, driver="GeoJSON")
-        n_f = len(out_gdf)
-        n_with_data = int(out_gdf["n_households"].notna().sum())
-        mean_d = out_gdf["mean_delta"].mean()
-        min_d = out_gdf["mean_delta"].min()
-        max_d = out_gdf["mean_delta"].max()
-        written_paths.append((out_path, n_f, mean_d, min_d, max_d))
-        print(
-            f"Wrote {out_path} | BGs: {n_f} ({n_with_data} with data, {n_f - n_with_data} null-fill) | class: {delivery_class}"
-        )
 
+        # ---- Per-file summary --------------------------------------------
+        n_nonnull = int(out_gdf["mean_delta"].notna().sum())
+        mean_d = float(out_gdf["mean_delta"].mean())
+        min_d = float(out_gdf["mean_delta"].min())
+        max_d = float(out_gdf["mean_delta"].max())
+        n_hh = int(out_gdf["n_households"].dropna().sum())
+
+        summary_parts = [
+            f"n_features_total={n_f}",
+            f"n_features_nonnull={n_nonnull}",
+            f"mean_delta min={min_d:.2f} mean={mean_d:.2f} max={max_d:.2f}",
+        ]
+        if bound_sym is not None:
+            cap_min = float(out_gdf["mean_delta_cap_global_sym"].min())
+            cap_max = float(out_gdf["mean_delta_cap_global_sym"].max())
+            summary_parts.append(f"cap=[{cap_min:.2f}, {cap_max:.2f}]")
+        summary_parts.append(f"n_households_nonnull={n_hh}")
+
+        print(f"  Wrote {out_path.name} | " + " | ".join(summary_parts))
+        written_paths.append(out_path)
+
+    # =========================================================================
+    # Write range_global.json sidecar.
+    # =========================================================================
+    if bound_sym is not None:
+        q = args.global_range_quantile
+        range_meta = {
+            "bound_sym": bound_sym,
+            "method": f"p{int(q * 100)}_abs_over_all_scenarios",
+            "global_range_quantile": q,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "sign_convention": SIGN_CONVENTION,
+            "n_scenarios": len(scenarios),
+            "n_bg_values_used": len(all_mean_deltas),
+        }
+        range_path = args.output_dir / "range_global.json"
+        range_path.write_text(json.dumps(range_meta, indent=2) + "\n")
+        print(f"\nWrote {range_path}")
+
+    # =========================================================================
+    # Final summary.
+    # =========================================================================
     print(f"\nDone. {len(written_paths)} GeoJSON file(s) in {args.output_dir}")
-    if written_paths:
-        print("\nSanity check (features and mean_delta stats per file):")
-        for path, n_f, mean_d, min_d, max_d in written_paths:
-            print(f"  {path.name}: features={n_f}, mean_delta={mean_d:.2f}, min={min_d:.2f}, max={max_d:.2f}")
+    if bound_sym is not None:
+        print(f"  All layers share bound_sym = ±{bound_sym:.4f}")
+        print(
+            f"  Felt: set numericAttribute=mean_delta_cap_global_sym, legend min=-{bound_sym:.2f}, max=+{bound_sym:.2f}"
+        )
+    if expected_bg_count is not None:
+        print(f"  All layers have {expected_bg_count} BG features (consistent coverage).")
     return 0
 
 
