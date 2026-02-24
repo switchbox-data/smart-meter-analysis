@@ -65,7 +65,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
-from compact_month_output import DEFAULT_COMPACT_TARGET_SIZE_BYTES, CompactionConfig, run_compaction
+from compact_month_output import (
+    DEFAULT_COMPACT_TARGET_SIZE_BYTES,
+    DEFAULT_VALIDATION_BATCH_SIZE,
+    CompactionConfig,
+    run_compaction,
+)
 
 from smart_meter_analysis.wide_to_long import transform_wide_to_long, transform_wide_to_long_lf
 
@@ -131,6 +136,7 @@ class RunnerConfig:
     All filesystem paths are resolved to absolute at construction time so that
     batch workers can operate independently of working-directory changes.
     """
+
     compact_no_swap: bool
 
     year_month: str  # YYYYMM
@@ -169,6 +175,7 @@ class RunnerConfig:
     compact_max_files: int | None
     overwrite_compact: bool
     compact_dry_run: bool
+    validation_batch_size: int
 
 
 @dataclass(frozen=True)
@@ -1089,6 +1096,16 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
             "but DO NOT atomically swap staged outputs into the canonical month directory."
         ),
     )
+    ap.add_argument(
+        "--validation-batch-size",
+        type=int,
+        default=DEFAULT_VALIDATION_BATCH_SIZE,
+        help=(
+            "Rows per PyArrow batch during streaming adjacent-key validation. "
+            "Lower values reduce peak memory; higher values improve throughput. "
+            f"Default: {DEFAULT_VALIDATION_BATCH_SIZE:,}."
+        ),
+    )
 
     ns = ap.parse_args(list(argv))
 
@@ -1143,6 +1160,7 @@ def parse_args(argv: Sequence[str]) -> RunnerConfig:
         overwrite_compact=ns.overwrite_compact,
         compact_dry_run=ns.compact_dry_run,
         compact_no_swap=ns.compact_no_swap,
+        validation_batch_size=ns.validation_batch_size,
     )
 
 
@@ -1374,6 +1392,7 @@ def main(argv: Sequence[str]) -> int:
                 overwrite=cfg.overwrite_compact,
                 dry_run=cfg.compact_dry_run,
                 no_swap=cfg.compact_no_swap,
+                validation_batch_size=cfg.validation_batch_size,
             )
             try:
                 compaction_summary = run_compaction(compact_cfg, logger)

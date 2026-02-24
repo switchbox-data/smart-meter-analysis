@@ -83,6 +83,9 @@ DEFAULT_COMPACT_TARGET_SIZE_BYTES: int = 1_073_741_824  # 1 GiB
 
 JsonDict = dict[str, Any]
 
+STREAMING_VALIDATOR_VERSION: str = "2.0.0-streaming-pyarrow"
+DEFAULT_VALIDATION_BATCH_SIZE: int = 1_000_000  # rows per PyArrow iter_batches call
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -106,6 +109,8 @@ class CompactionConfig:
     overwrite: bool  # allow overwriting existing compacted_*.parquet
     dry_run: bool  # plan only: write plan + original inventory + summary; skip write/validate/swap
     no_swap: bool  # run compaction + validation + write artifacts; skip atomic swap
+    validation_batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE  # rows per batch for streaming validation
+
 
 # ---------------------------------------------------------------------------
 # Utilities (self-contained; no runner imports)
@@ -317,133 +322,257 @@ def _stream_write_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Validation: adjacent-key sort order and uniqueness (no group_by)
+# Validation: pre-flight check for existing compacted files
 # ---------------------------------------------------------------------------
 
 
-def _validate_adjacent_keys(
+def _pre_validate_no_existing_compacted(
+    canonical_dir: Path,
+    overwrite: bool,
+) -> None:
+    """Fail-loud if compacted_*.parquet already exist in the canonical dir.
+
+    Called early in run_compaction() before any writes to prevent accidental
+    overwrites. Skipped when ``overwrite=True``.
+    """
+    if overwrite:
+        return
+    existing = sorted(canonical_dir.glob("compacted_*.parquet"))
+    if existing:
+        names = [p.name for p in existing[:5]]
+        suffix = f" (and {len(existing) - 5} more)" if len(existing) > 5 else ""
+        raise RuntimeError(
+            f"Canonical directory already contains {len(existing)} compacted_*.parquet "
+            f"file(s): {names}{suffix}. Use --overwrite-compact to allow replacement, "
+            f"or remove them manually before re-running compaction."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Validation: adjacent-key sort order and uniqueness — streaming (no group_by)
+# ---------------------------------------------------------------------------
+
+
+def _validate_adjacent_keys_streaming(
     sorted_files: list[Path],
     label: str,
+    batch_size: int = DEFAULT_VALIDATION_BATCH_SIZE,
+    logger: Any | None = None,
+    log_ctx: JsonDict | None = None,
 ) -> JsonDict:
-    """Validate global sort order and key uniqueness via a streaming adjacent-key pass.
+    """Validate global sort order and key uniqueness via true streaming batches.
 
     Algorithm
     ---------
-    Reads files one at a time (file-by-file, key columns only).  For each file:
+    Uses ``pyarrow.ParquetFile.iter_batches()`` to read only the three key
+    columns in fixed-size batches.  Memory is bounded to one batch (~1M rows
+    x 3 columns ~30-50 MB) plus a single carry-forward key tuple.
 
-    1. Checks the cross-file boundary: first key of current file must be
-       strictly greater than the last key of the previous file.
-    2. Checks within-file adjacent pairs using vectorized Polars shift(1)
-       comparisons — no Python-level row iteration, no ``group_by``.
+    For each batch:
 
-    The compound sort key is ``(zip_code, account_identifier, datetime)``.
-    Comparisons use lexicographic ordering: primary on zip_code, then
-    account_identifier, then datetime.
+    1. **Cross-boundary check** — first key of current batch must be strictly
+       greater than ``prev_key`` (last key of previous batch/file).
+    2. **Within-batch check** — vectorized Polars ``shift(1)`` on the three
+       key columns, bounded to ``batch_size`` rows.  No ``group_by``, no
+       Python-level row iteration.
+
+    The compound sort key is ``(zip_code, account_identifier, datetime)``
+    with lexicographic ordering.
 
     Parameters
     ----------
-    sorted_files:
-        Files to validate in order (their logical sort order is the sequence).
-    label:
-        Human-readable name for the dataset being validated (for error messages).
+    sorted_files :
+        Files to validate, in logical sort order (filename order).
+    label :
+        Human-readable name for the dataset being validated.
+    batch_size :
+        Rows per PyArrow batch.  Default 1,000,000.
+    logger :
+        Optional JsonlLogger for structured event logging.
+    log_ctx :
+        Optional base dict merged into every log event.
 
     Returns
     -------
-    dict with keys: ``passed`` (bool), ``error`` (str|None), ``n_files`` (int),
-    ``total_rows`` (int), ``key_min`` (str|None), ``key_max`` (str|None).
+    dict with keys: ``passed``, ``error``, ``error_location``, ``n_files``,
+    ``total_rows``, ``key_min``, ``key_max``, ``validator_version``,
+    ``validator_method``, ``batch_size``.
     """
     KEY_COLS: list[str] = list(SORT_KEYS)
-    last_key: tuple[Any, Any, Any] | None = None
+    _log_ctx: JsonDict = log_ctx or {}
+
+    prev_key: tuple[Any, ...] | None = None
     total_rows: int = 0
     n_files: int = 0
-    key_min: tuple[Any, Any, Any] | None = None
-    key_max: tuple[Any, Any, Any] | None = None
+    key_min: tuple[Any, ...] | None = None
+    key_max: tuple[Any, ...] | None = None
     error: str | None = None
+    error_location: JsonDict | None = None
 
-    for path in sorted_files:
-        # Read only the three key columns to minimise memory.
-        df = pl.read_parquet(str(path), columns=KEY_COLS)
+    for file_idx, path in enumerate(sorted_files):
+        pf = pq.ParquetFile(str(path))
         n_files += 1
-        total_rows += df.height
+        file_rows: int = 0
+        batch_idx: int = 0
 
-        if df.height == 0:
-            continue
+        if logger is not None:
+            logger.log({
+                **_log_ctx,
+                "event": "validation_file_start",
+                "status": "info",
+                "file": path.name,
+                "file_idx": file_idx,
+                "n_row_groups": pf.metadata.num_row_groups,
+            })
 
-        # Extract first / last key as Python tuples (constant cost per file).
-        # Constant-memory: avoid converting full columns to Python lists.
-        first_row = df.select(KEY_COLS).head(1).row(0)
-        last_row = df.select(KEY_COLS).tail(1).row(0)
+        for batch in pf.iter_batches(batch_size=batch_size, columns=KEY_COLS):
+            n = batch.num_rows
+            if n == 0:
+                batch_idx += 1
+                continue
 
-        file_first_key: tuple[Any, Any, Any] = (first_row[0], first_row[1], first_row[2])
-        file_last_key: tuple[Any, Any, Any] = (last_row[0], last_row[1], last_row[2])
+            # Convert PyArrow RecordBatch → Polars DataFrame (zero-copy where possible).
+            df = pl.from_arrow(batch)
 
-        if key_min is None:
-            key_min = file_first_key
-        key_max = file_last_key
+            # First/last key as Python tuples — constant cost per batch.
+            first_row = df.row(0)
+            last_row = df.row(df.height - 1)
+            batch_first_key: tuple[Any, ...] = (first_row[0], first_row[1], first_row[2])
+            batch_last_key: tuple[Any, ...] = (last_row[0], last_row[1], last_row[2])
 
-        # ── Cross-file boundary check ────────────────────────────────────────
-        if last_key is not None:
-            if file_first_key < last_key:
-                error = (
-                    f"{label}: sort violation at cross-file boundary: "
-                    f"file={path.name} first_key={file_first_key!r} "
-                    f"< prev_last_key={last_key!r}"
+            if key_min is None:
+                key_min = batch_first_key
+            key_max = batch_last_key
+
+            # ── Cross-boundary check ──────────────────────────────────────
+            if prev_key is not None:
+                if batch_first_key < prev_key:
+                    error = (
+                        f"{label}: sort violation at boundary: "
+                        f"file={path.name} batch={batch_idx} "
+                        f"first_key={batch_first_key!r} < prev_key={prev_key!r}"
+                    )
+                    error_location = {
+                        "file": path.name,
+                        "file_idx": file_idx,
+                        "batch_idx": batch_idx,
+                        "row_offset_in_file": file_rows,
+                        "row_offset_global": total_rows + file_rows,
+                    }
+                    break
+                if batch_first_key == prev_key:
+                    error = (
+                        f"{label}: duplicate key at boundary: "
+                        f"file={path.name} batch={batch_idx} "
+                        f"key={batch_first_key!r}"
+                    )
+                    error_location = {
+                        "file": path.name,
+                        "file_idx": file_idx,
+                        "batch_idx": batch_idx,
+                        "row_offset_in_file": file_rows,
+                        "row_offset_global": total_rows + file_rows,
+                    }
+                    break
+
+            # ── Within-batch adjacent-pair check (vectorized, bounded) ────
+            if n > 1:
+                zip_prev = pl.col("zip_code").shift(1)
+                acct_prev = pl.col("account_identifier").shift(1)
+                dt_prev = pl.col("datetime").shift(1)
+
+                zip_eq = zip_prev == pl.col("zip_code")
+                acct_eq = acct_prev == pl.col("account_identifier")
+                dt_eq = dt_prev == pl.col("datetime")
+
+                zip_gt = zip_prev > pl.col("zip_code")
+                acct_gt = acct_prev > pl.col("account_identifier")
+                dt_gt = dt_prev > pl.col("datetime")
+
+                sort_violation = zip_gt | (zip_eq & acct_gt) | (zip_eq & acct_eq & dt_gt)
+                dup_violation = zip_eq & acct_eq & dt_eq
+
+                check = (
+                    df.with_row_index("_row_idx")
+                    .with_columns([
+                        sort_violation.alias("_sort_viol"),
+                        dup_violation.alias("_dup_viol"),
+                    ])
+                    .slice(1)  # row 0 has null shift values
                 )
-                break
-            if file_first_key == last_key:
-                error = f"{label}: duplicate key at cross-file boundary: file={path.name} key={file_first_key!r}"
-                break
 
-        # ── Within-file adjacent-pair check (vectorized) ────────────────────
-        if df.height > 1:
-            # Build boolean masks comparing each row against its predecessor.
-            # shift(1) is null at row 0; we drop that row with .slice(1).
-            zip_prev = pl.col("zip_code").shift(1)
-            acct_prev = pl.col("account_identifier").shift(1)
-            dt_prev = pl.col("datetime").shift(1)
+                sort_bad = check.filter(pl.col("_sort_viol")).head(1)
+                if sort_bad.height > 0:
+                    bad = sort_bad.select([*KEY_COLS, "_row_idx"]).to_dicts()[0]
+                    row_in_file = file_rows + int(bad["_row_idx"])
+                    error = (
+                        f"{label}: sort violation in file={path.name} "
+                        f"batch={batch_idx} row_in_file={row_in_file} "
+                        f"bad_row={bad}"
+                    )
+                    error_location = {
+                        "file": path.name,
+                        "file_idx": file_idx,
+                        "batch_idx": batch_idx,
+                        "row_in_batch": int(bad["_row_idx"]),
+                        "row_offset_in_file": row_in_file,
+                        "row_offset_global": total_rows + row_in_file,
+                        "bad_key": {k: str(bad[k]) for k in KEY_COLS},
+                    }
+                    break
 
-            zip_eq = zip_prev == pl.col("zip_code")
-            acct_eq = acct_prev == pl.col("account_identifier")
-            dt_eq = dt_prev == pl.col("datetime")
+                dup_bad = check.filter(pl.col("_dup_viol")).head(1)
+                if dup_bad.height > 0:
+                    bad = dup_bad.select([*KEY_COLS, "_row_idx"]).to_dicts()[0]
+                    row_in_file = file_rows + int(bad["_row_idx"])
+                    error = (
+                        f"{label}: duplicate key in file={path.name} "
+                        f"batch={batch_idx} row_in_file={row_in_file} "
+                        f"bad_row={bad}"
+                    )
+                    error_location = {
+                        "file": path.name,
+                        "file_idx": file_idx,
+                        "batch_idx": batch_idx,
+                        "row_in_batch": int(bad["_row_idx"]),
+                        "row_offset_in_file": row_in_file,
+                        "row_offset_global": total_rows + row_in_file,
+                        "bad_key": {k: str(bad[k]) for k in KEY_COLS},
+                    }
+                    break
 
-            zip_gt = zip_prev > pl.col("zip_code")
-            acct_gt = acct_prev > pl.col("account_identifier")
-            dt_gt = dt_prev > pl.col("datetime")
+            prev_key = batch_last_key
+            file_rows += n
+            batch_idx += 1
 
-            # Sort violation: previous row > current row on the compound key.
-            sort_violation = zip_gt | (zip_eq & acct_gt) | (zip_eq & acct_eq & dt_gt)
-            # Duplicate: previous row == current row on all three key columns.
-            dup_violation = zip_eq & acct_eq & dt_eq
+        # Count rows scanned even on partial files.
+        total_rows += file_rows
 
-            check = (
-                df.with_columns([
-                    sort_violation.alias("_sort_viol"),
-                    dup_violation.alias("_dup_viol"),
-                ]).slice(1)  # drop first row where shift produces nulls
-            )
+        if error is not None:
+            break
 
-            n_sort_bad = int(check["_sort_viol"].sum() or 0)
-            n_dup_bad = int(check["_dup_viol"].sum() or 0)
-
-            if n_sort_bad > 0:
-                bad = check.filter(pl.col("_sort_viol")).head(1).to_dicts()[0]
-                error = f"{label}: sort violation in file={path.name} first_bad_row={bad}"
-                break
-
-            if n_dup_bad > 0:
-                bad = check.filter(pl.col("_dup_viol")).head(1).to_dicts()[0]
-                error = f"{label}: duplicate key in file={path.name} first_bad_row={bad}"
-                break
-
-        last_key = file_last_key
+        if logger is not None:
+            logger.log({
+                **_log_ctx,
+                "event": "validation_file_end",
+                "status": "info",
+                "file": path.name,
+                "file_idx": file_idx,
+                "file_rows": file_rows,
+                "running_total_rows": total_rows,
+            })
 
     return {
         "passed": error is None,
         "error": error,
+        "error_location": error_location,
         "n_files": n_files,
         "total_rows": total_rows,
         "key_min": str(key_min) if key_min is not None else None,
         "key_max": str(key_max) if key_max is not None else None,
+        "validator_version": STREAMING_VALIDATOR_VERSION,
+        "validator_method": "adjacent_key_streaming_pyarrow_iter_batches",
+        "batch_size": batch_size,
     }
 
 
@@ -694,6 +823,9 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
     if not input_schema_result["passed"]:
         raise RuntimeError(f"Input schema validation failed: {input_schema_result['errors']}")
 
+    # ── Pre-flight: check for existing compacted files in canonical dir ──
+    _pre_validate_no_existing_compacted(month_canonical_dir, cfg.overwrite)
+
     # ── 5. Estimate rows_per_chunk ───────────────────────────────────────────
     # We target on-disk chunk size.  bytes_per_row is estimated from the
     # actual compressed Parquet data, so the ratio accurately reflects
@@ -788,7 +920,13 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
     row_count_ok = post_rows == pre_rows
 
     output_schema_result = _validate_schema(output_files, label="output")
-    sort_dup_result = _validate_adjacent_keys(output_files, label="compacted")
+    sort_dup_result = _validate_adjacent_keys_streaming(
+        output_files,
+        label="compacted",
+        batch_size=cfg.validation_batch_size,
+        logger=logger,
+        log_ctx=log_ctx,
+    )
     partition_result = _validate_partition_uniformity(output_files, cfg.year_month)
 
     total_output_bytes_staging = sum(p.stat().st_size for p in output_files)
