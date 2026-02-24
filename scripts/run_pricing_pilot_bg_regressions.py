@@ -55,7 +55,7 @@ CLASS_LABELS: dict[str, str] = {
 }
 
 COMPARISON_LABELS: dict[str, str] = {
-    "stou_vs_flat": "Rate BEST vs Flat Rate",
+    "stou_vs_flat": "STOU vs Flat Rate",
     "dtou_vs_flat": "DTOU vs Flat Rate",
 }
 
@@ -107,7 +107,7 @@ def _class_label(code: str) -> str:
 
 
 def _comparison_label(lbl: str) -> str:
-    """Human-readable comparison label, e.g. 'stou_vs_flat' → 'Rate BEST vs Flat Rate'."""
+    """Human-readable comparison label, e.g. 'stou_vs_flat' → 'STOU vs Flat Rate'."""
     return COMPARISON_LABELS.get(lbl, lbl)
 
 
@@ -134,7 +134,7 @@ def _comparison_label_from_filename(name: str) -> str | None:
     """
     Pilot policy:
       - DTOU: filenames containing 'vs_dtou' (e.g. {yyyymm}_flat_vs_dtou_{sf_no_esh,...}.parquet)
-      - STOU: filenames containing 'vs_stou' or 'vs_rate_best' (rate_best only when _scaled_)
+      - STOU: filenames containing 'vs_stou' or 'vs_rate_best' (rate_best alias, only when _scaled_)
     """
     n = name.lower()
     if "vs_dtou" in n:
@@ -532,13 +532,13 @@ def _plot_scatter(
     cbar = fig.colorbar(ax.collections[0], ax=ax, shrink=0.8)
     cbar.set_label("Block-Group Mean Usage (kWh)", fontsize=10, fontfamily="serif")
 
-    # Regression line, no CI band
+    # Regression line with 95% CI band
     sns.regplot(
         data=pdf,
         x="median_income",
         y="mean_delta",
         scatter=False,
-        ci=None,
+        ci=95,
         ax=ax,
     )
 
