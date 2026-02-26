@@ -41,6 +41,7 @@ Design decisions
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -85,7 +86,7 @@ JsonDict = dict[str, Any]
 
 STREAMING_VALIDATOR_VERSION: str = "2.0.0-streaming-pyarrow"
 DEFAULT_VALIDATION_BATCH_SIZE: int = 1_000_000  # rows per PyArrow iter_batches call
-MAX_ROWS_PER_CHUNK: int = 50_000_000  # hard cap on in-memory accumulation during write
+ROWS_PER_ROW_GROUP: int = 50_000_000  # rows per row group; bounds peak RSS to ~2 GiB per group
 
 
 # ---------------------------------------------------------------------------
@@ -185,75 +186,39 @@ def _file_inventory_entry(path: Path) -> JsonDict:
 
 
 # ---------------------------------------------------------------------------
-# Core: write one compacted chunk to staging
-# ---------------------------------------------------------------------------
-
-
-def _write_compacted_chunk(
-    df: pl.DataFrame,
-    staging_month_dir: Path,
-    chunk_idx: int,
-    logger: Any,
-    log_ctx: JsonDict,
-) -> Path:
-    """Write one compacted Parquet chunk to the staging directory.
-
-    Naming convention: ``compacted_0000.parquet``, ``compacted_0001.parquet``, …
-    Uses snappy compression and Parquet statistics to match the runner's
-    batch output format.  Caller is responsible for enforcing ``max_files``.
-    """
-    t0 = time.time()
-    fname = f"compacted_{chunk_idx:04d}.parquet"
-    out_path = staging_month_dir / fname
-    staging_month_dir.mkdir(parents=True, exist_ok=True)
-
-    df.write_parquet(str(out_path), compression="snappy", statistics=True, use_pyarrow=False)
-    size = int(out_path.stat().st_size)
-
-    logger.log({
-        **log_ctx,
-        "event": "compaction_write_file",
-        "status": "info",
-        "chunk_idx": chunk_idx,
-        "chunk_path": str(out_path),
-        "num_rows": df.height,
-        "size_bytes": size,
-        "elapsed_ms": _elapsed_ms(t0, time.time()),
-    })
-    return out_path
-
-
-# ---------------------------------------------------------------------------
-# Core: memory-safe streaming write (file-by-file accumulation)
+# Core: memory-safe streaming write (multi-row-group ParquetWriter)
 # ---------------------------------------------------------------------------
 
 
 def _stream_write_chunks(
     sorted_input_files: list[Path],
     staging_month_dir: Path,
-    rows_per_chunk: int,
+    rows_per_row_group: int,
+    target_size_bytes: int,
     max_files: int | None,
     logger: Any,
     log_ctx: JsonDict,
 ) -> list[Path]:
-    """Stream through sorted batch files and write compacted output chunks.
+    """Stream through sorted batch files and write compacted output files.
 
     Memory-safety guarantee
     -----------------------
     Reads one batch Parquet file at a time.  Maintains a ``carry`` DataFrame
-    of rows that didn't fill the previous chunk.  Maximum RSS footprint is
-    approximately ``sizeof(current_file_df) + sizeof(carry_df)``.
+    of rows that didn't fill the previous row group.  Maximum RSS footprint is
+    approximately two row groups in memory simultaneously (~2 x 1.5 GiB).
 
     No global sort is performed here.  The function relies on the runner's
     invariant that input batch files are already globally sorted by SORT_KEYS
     and that lexicographic filename order preserves global sort order.  The
     post-write adjacent-key validation pass verifies this contract.
 
-    Chunk boundary semantics
-    ------------------------
-    When ``buffered_rows >= rows_per_chunk``, exactly ``rows_per_chunk`` rows
-    are written and the remainder is carried forward.  The final partial chunk
-    (if any) is always written regardless of size.
+    Row-group and file-rollover semantics
+    -------------------------------------
+    Rows are flushed to the current ``pq.ParquetWriter`` as row groups of up
+    to ``rows_per_row_group`` rows.  After each flush, if the on-disk file
+    size reaches ``target_size_bytes`` the writer is closed and a new file is
+    opened for the next row group.  The final partial row group is always
+    flushed regardless of size.
 
     Parameters
     ----------
@@ -261,8 +226,11 @@ def _stream_write_chunks(
         Input batch Parquet files in lexicographic order (deterministic).
     staging_month_dir:
         Directory to write ``compacted_NNNN.parquet`` files.
-    rows_per_chunk:
-        Target row count per output file derived from ``target_size_bytes``.
+    rows_per_row_group:
+        Maximum rows per row group; bounds peak RSS to ~2 GiB per group.
+    target_size_bytes:
+        Close the current file and open a new one when on-disk size reaches
+        this threshold after a row-group flush.
     max_files:
         Optional hard cap on the number of output files written.
     logger:
@@ -276,48 +244,92 @@ def _stream_write_chunks(
         Paths of written output Parquet files in write order.
     """
     output_files: list[Path] = []
-    chunk_idx = 0
-    carry: pl.DataFrame | None = None  # rows that didn't fill the last chunk
+    file_idx = 0
+    carry: pl.DataFrame | None = None
+    writer: pq.ParquetWriter | None = None
+    current_file_path: Path | None = None
+    arrow_schema: Any = None  # pa.Schema, derived from first flush
 
+    def flush_row_group(rg_df: pl.DataFrame) -> None:
+        nonlocal writer, file_idx, current_file_path, arrow_schema
+
+        t0 = time.time()
+        arrow_table = rg_df.to_arrow()
+        if arrow_schema is None:
+            arrow_schema = arrow_table.schema
+
+        if writer is None:
+            current_file_path = staging_month_dir / f"compacted_{file_idx:04d}.parquet"
+            writer = pq.ParquetWriter(
+                str(current_file_path),
+                arrow_schema,
+                compression="snappy",
+                write_statistics=True,
+            )
+            output_files.append(current_file_path)
+
+        writer.write_table(arrow_table)
+        if current_file_path is None:
+            raise RuntimeError("current_file_path is None after writer was opened")
+        size = int(current_file_path.stat().st_size)
+
+        logger.log({
+            **log_ctx,
+            "event": "compaction_write_row_group",
+            "status": "info",
+            "file_idx": file_idx,
+            "file_path": str(current_file_path),
+            "num_rows": rg_df.height,
+            "file_size_bytes": size,
+            "elapsed_ms": _elapsed_ms(t0, time.time()),
+        })
+
+        if size >= target_size_bytes:
+            writer.close()
+            writer = None
+            file_idx += 1
+            current_file_path = None
+
+    staging_month_dir.mkdir(parents=True, exist_ok=True)
     logger.log({
         **log_ctx,
         "event": "compaction_scan_start",
         "status": "info",
         "n_input_files": len(sorted_input_files),
-        "rows_per_chunk": rows_per_chunk,
+        "rows_per_row_group": rows_per_row_group,
+        "target_size_bytes": target_size_bytes,
     })
 
-    for input_path in sorted_input_files:
-        if max_files is not None and chunk_idx >= max_files:
-            break
-
-        # Materialize one batch file.  Batch files are bounded in size by
-        # batch_size (default 50 CSVs each), so this does not blow up RAM.
-        df = pl.read_parquet(str(input_path))
-
-        # Prepend any carry-over rows from the previous file boundary.
-        if carry is not None and carry.height > 0:
-            df = pl.concat([carry, df], how="vertical", rechunk=False)
-            carry = None
-
-        # Flush complete chunks (loop handles rare case where a single file
-        # exceeds the row budget, e.g. a very large batch).
-        while df.height >= rows_per_chunk:
-            if max_files is not None and chunk_idx >= max_files:
+    try:
+        for input_path in sorted_input_files:
+            if max_files is not None and file_idx >= max_files:
                 break
-            chunk_df = df.slice(0, rows_per_chunk)
-            out_path = _write_compacted_chunk(chunk_df, staging_month_dir, chunk_idx, logger, log_ctx)
-            output_files.append(out_path)
-            chunk_idx += 1
-            df = df.slice(rows_per_chunk)  # remainder; may be empty
 
-        # Hold remainder as carry for the next file.
-        carry = df if df.height > 0 else None
+            df = pl.read_parquet(str(input_path))
 
-    # Final partial chunk (always written; may be smaller than rows_per_chunk).
-    if carry is not None and carry.height > 0 and (max_files is None or chunk_idx < max_files):
-        out_path = _write_compacted_chunk(carry, staging_month_dir, chunk_idx, logger, log_ctx)
-        output_files.append(out_path)
+            if carry is not None and carry.height > 0:
+                df = pl.concat([carry, df], how="vertical", rechunk=False)
+                carry = None
+
+            while df.height >= rows_per_row_group:
+                if max_files is not None and file_idx >= max_files:
+                    break
+                flush_row_group(df.slice(0, rows_per_row_group))
+                df = df.slice(rows_per_row_group)
+
+            carry = df if df.height > 0 else None
+
+        if carry is not None and carry.height > 0 and (max_files is None or file_idx < max_files):
+            flush_row_group(carry)
+
+        if writer is not None:
+            writer.close()
+            writer = None
+    except Exception:
+        if writer is not None:
+            with contextlib.suppress(Exception):
+                writer.close()
+        raise
 
     return output_files
 
@@ -737,7 +749,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
        ``--overwrite-compact``).
     3. Read pre-compaction row counts from Parquet footer metadata (no I/O).
     4. Validate input schema against ``FINAL_LONG_COLS``.
-    5. Estimate ``rows_per_chunk`` from disk size ÷ row count.
+    5. Derive ``rows_per_row_group`` and estimate output file count.
     6. Write audit ``compaction_plan.json`` and ``original_file_inventory.json``.
     7. Stream-write compacted chunks to staging directory.
     8. Post-write validations: row count, schema, sort order, duplicates,
@@ -827,13 +839,13 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
     # ── Pre-flight: check for existing compacted files in canonical dir ──
     _pre_validate_no_existing_compacted(month_canonical_dir, cfg.overwrite)
 
-    # ── 5. Estimate rows_per_chunk ───────────────────────────────────────────
-    # We target on-disk chunk size.  bytes_per_row is estimated from the
-    # actual compressed Parquet data, so the ratio accurately reflects
-    # how many rows fit in target_size_bytes of Parquet output.
+    # ── 5. Derive row-group size and estimate output file count ──────────────
+    # rows_per_row_group is a fixed constant bounding peak RSS to ~2 GiB.
+    # estimated_n_output_files is for audit/logging only; actual file count is
+    # determined at runtime by on-disk size rollover in _stream_write_chunks.
     bytes_per_row: float = total_input_bytes / pre_rows
-    rows_per_chunk_raw: int = max(1, round(cfg.target_size_bytes / bytes_per_row))
-    rows_per_chunk: int = min(rows_per_chunk_raw, MAX_ROWS_PER_CHUNK)
+    rows_per_row_group: int = ROWS_PER_ROW_GROUP
+    estimated_n_output_files: int = max(1, round(total_input_bytes / cfg.target_size_bytes))
 
     # ── 6. Write audit plan ──────────────────────────────────────────────────
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -850,10 +862,8 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         "pre_rows": pre_rows,
         "total_input_bytes": total_input_bytes,
         "bytes_per_row_estimate": round(bytes_per_row, 4),
-        "rows_per_chunk": rows_per_chunk,
-        "rows_per_chunk_raw": rows_per_chunk_raw,
-        "rows_per_chunk_capped": rows_per_chunk != rows_per_chunk_raw,
-        "max_rows_per_chunk": MAX_ROWS_PER_CHUNK,
+        "rows_per_row_group": rows_per_row_group,
+        "estimated_n_output_files": estimated_n_output_files,
         "target_size_bytes": cfg.target_size_bytes,
         "max_files": cfg.max_files,
         "dry_run": cfg.dry_run,
@@ -873,7 +883,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
             "status": "info",
             "msg": "dry_run=True; validation plan written; swap skipped",
             "pre_rows": pre_rows,
-            "rows_per_chunk": rows_per_chunk,
+            "rows_per_row_group": rows_per_row_group,
             "n_input_files": len(input_files),
         })
         dry_summary: JsonDict = {
@@ -884,7 +894,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
             "status": "dry_run",
             "pre_rows": pre_rows,
             "n_input_files": len(input_files),
-            "rows_per_chunk": rows_per_chunk,
+            "rows_per_row_group": rows_per_row_group,
             "target_size_bytes": cfg.target_size_bytes,
             "elapsed_ms": _elapsed_ms(t_start, time.time()),
         }
@@ -897,7 +907,8 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         output_files = _stream_write_chunks(
             sorted_input_files=input_files,
             staging_month_dir=staging_month_dir,
-            rows_per_chunk=rows_per_chunk,
+            rows_per_row_group=rows_per_row_group,
+            target_size_bytes=cfg.target_size_bytes,
             max_files=cfg.max_files,
             logger=logger,
             log_ctx=log_ctx,
@@ -1006,7 +1017,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
             "post_rows": post_rows,
             "total_input_bytes": total_input_bytes,
             "total_output_bytes_staging": total_output_bytes_staging,
-            "rows_per_chunk": rows_per_chunk,
+            "rows_per_row_group": rows_per_row_group,
             "target_size_bytes": cfg.target_size_bytes,
             "month_canonical_dir": str(month_canonical_dir),
             "staging_month_dir": str(staging_month_dir),
@@ -1075,7 +1086,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         "post_rows": post_rows,
         "total_input_bytes": total_input_bytes,
         "total_output_bytes": total_output_bytes,
-        "rows_per_chunk": rows_per_chunk,
+        "rows_per_row_group": rows_per_row_group,
         "target_size_bytes": cfg.target_size_bytes,
         "month_canonical_dir": str(month_canonical_dir),
         "precompact_dir": str(precompact_dir),
