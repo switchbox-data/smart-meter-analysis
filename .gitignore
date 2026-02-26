@@ -157,6 +157,7 @@ data/
 scratch/
 *_sample_*.csv
 test_*.py
+!tests/test_*.py
 debug_*.py
 
 # Debug files

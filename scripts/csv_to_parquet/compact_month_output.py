@@ -85,6 +85,7 @@ JsonDict = dict[str, Any]
 
 STREAMING_VALIDATOR_VERSION: str = "2.0.0-streaming-pyarrow"
 DEFAULT_VALIDATION_BATCH_SIZE: int = 1_000_000  # rows per PyArrow iter_batches call
+MAX_ROWS_PER_CHUNK: int = 50_000_000  # hard cap on in-memory accumulation during write
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +832,8 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
     # actual compressed Parquet data, so the ratio accurately reflects
     # how many rows fit in target_size_bytes of Parquet output.
     bytes_per_row: float = total_input_bytes / pre_rows
-    rows_per_chunk: int = max(1, round(cfg.target_size_bytes / bytes_per_row))
+    rows_per_chunk_raw: int = max(1, round(cfg.target_size_bytes / bytes_per_row))
+    rows_per_chunk: int = min(rows_per_chunk_raw, MAX_ROWS_PER_CHUNK)
 
     # ── 6. Write audit plan ──────────────────────────────────────────────────
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -849,6 +851,9 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         "total_input_bytes": total_input_bytes,
         "bytes_per_row_estimate": round(bytes_per_row, 4),
         "rows_per_chunk": rows_per_chunk,
+        "rows_per_chunk_raw": rows_per_chunk_raw,
+        "rows_per_chunk_capped": rows_per_chunk != rows_per_chunk_raw,
+        "max_rows_per_chunk": MAX_ROWS_PER_CHUNK,
         "target_size_bytes": cfg.target_size_bytes,
         "max_files": cfg.max_files,
         "dry_run": cfg.dry_run,
