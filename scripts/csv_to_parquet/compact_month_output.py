@@ -149,7 +149,7 @@ def _try_git_sha() -> str | None:
 def _year_month_dirs(year_month: str) -> tuple[str, str]:
     y = int(year_month[:4])
     m = int(year_month[4:6])
-    return f"year={y:04d}", f"month={m:02d}"
+    return f"{y:04d}", f"{m:02d}"
 
 
 def _file_list_hash(paths: list[Path]) -> str:
@@ -183,6 +183,49 @@ def _file_inventory_entry(path: Path) -> JsonDict:
         "num_rows": int(meta.num_rows),
         "num_row_groups": int(meta.num_row_groups),
     }
+
+
+def _write_success_marker(
+    month_dir: Path,
+    output_names: list[str],
+    year_month: str,
+    run_id: str,
+    pre_rows: int,
+    post_rows: int,
+    total_output_bytes: int,
+    git_sha: str | None,
+    sort_keys: tuple[str, ...] = SORT_KEYS,
+    schema: tuple[str, ...] = FINAL_LONG_COLS,
+) -> None:
+    """Write a _SUCCESS.json marker with compaction metadata.
+
+    Follows the Spark convention of a per-partition success marker.  Contains
+    metadata for downstream validation without needing to read Parquet footers.
+    """
+    files_manifest = []
+    for name in output_names:
+        path = month_dir / name
+        meta = pq.read_metadata(str(path))
+        files_manifest.append({
+            "name": name,
+            "size_bytes": int(path.stat().st_size),
+            "num_rows": int(meta.num_rows),
+            "num_row_groups": int(meta.num_row_groups),
+        })
+
+    marker: JsonDict = {
+        "timestamp": _now_utc_iso(),
+        "git_sha": git_sha,
+        "year_month": year_month,
+        "compaction_run_id": run_id,
+        "n_files": len(output_names),
+        "total_rows": post_rows,
+        "total_bytes": total_output_bytes,
+        "sort_keys": list(sort_keys),
+        "schema": list(schema),
+        "files": files_manifest,
+    }
+    _write_json(month_dir / "_SUCCESS.json", marker)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +302,7 @@ def _stream_write_chunks(
             arrow_schema = arrow_table.schema
 
         if writer is None:
-            current_file_path = staging_month_dir / f"compacted_{file_idx:04d}.parquet"
+            current_file_path = staging_month_dir / f"part-{file_idx:05d}.parquet"
             writer = pq.ParquetWriter(
                 str(current_file_path),
                 arrow_schema,
@@ -343,19 +386,19 @@ def _pre_validate_no_existing_compacted(
     canonical_dir: Path,
     overwrite: bool,
 ) -> None:
-    """Fail-loud if compacted_*.parquet already exist in the canonical dir.
+    """Fail-loud if part-*.parquet already exist in the canonical dir.
 
     Called early in run_compaction() before any writes to prevent accidental
     overwrites. Skipped when ``overwrite=True``.
     """
     if overwrite:
         return
-    existing = sorted(canonical_dir.glob("compacted_*.parquet"))
+    existing = sorted(canonical_dir.glob("part-*.parquet"))
     if existing:
         names = [p.name for p in existing[:5]]
         suffix = f" (and {len(existing) - 5} more)" if len(existing) > 5 else ""
         raise RuntimeError(
-            f"Canonical directory already contains {len(existing)} compacted_*.parquet "
+            f"Canonical directory already contains {len(existing)} part-*.parquet "
             f"file(s): {names}{suffix}. Use --overwrite-compact to allow replacement, "
             f"or remove them manually before re-running compaction."
         )
@@ -808,7 +851,7 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
         raise RuntimeError(f"No .parquet files found in {month_canonical_dir}")
 
     # ── 2. Idempotency guard ─────────────────────────────────────────────────
-    existing_compacted = [p for p in all_parquet if p.name.startswith("compacted_")]
+    existing_compacted = [p for p in all_parquet if p.name.startswith("part-")]
     if existing_compacted and not cfg.overwrite:
         raise RuntimeError(
             f"Compacted files already exist in {month_canonical_dir}: "
@@ -1071,6 +1114,18 @@ def run_compaction(cfg: CompactionConfig, logger: Any) -> JsonDict:
     # Compute output bytes from the canonical location (staging dir is gone).
     output_names = [p.name for p in output_files]
     total_output_bytes = sum((month_canonical_dir / name).stat().st_size for name in output_names)
+
+    # Write _SUCCESS.json marker (Spark convention) with compaction metadata.
+    _write_success_marker(
+        month_dir=month_canonical_dir,
+        output_names=output_names,
+        year_month=cfg.year_month,
+        run_id=cfg.run_id,
+        pre_rows=pre_rows,
+        post_rows=post_rows,
+        total_output_bytes=total_output_bytes,
+        git_sha=git_sha,
+    )
 
     # ── 11. Final summary ─────────────────────────────────────────────────────
     t_end = time.time()

@@ -360,7 +360,7 @@ def make_batches(inputs_sorted: list[str], batch_size: int) -> list[BatchPlan]:
     n = len(inputs_sorted)
     for i in range(0, n, batch_size):
         j = i // batch_size
-        out.append(BatchPlan(batch_id=f"batch_{j:04d}", inputs=inputs_sorted[i : i + batch_size]))
+        out.append(BatchPlan(batch_id=f"batch_{j:05d}", inputs=inputs_sorted[i : i + batch_size]))
     return out
 
 
@@ -647,7 +647,7 @@ def validate_year_month_lf(lf: pl.LazyFrame, year_month: str) -> None:
 def year_month_dirs(year_month: str) -> tuple[str, str]:
     y = int(year_month[:4])
     m = int(year_month[4:6])
-    return f"year={y:04d}", f"month={m:02d}"
+    return f"{y:04d}", f"{m:02d}"
 
 
 def batch_output_filename(batch_id: str, shard_id: int | None) -> str:
