@@ -186,3 +186,5 @@ subagent_packages/
 
 # Pricing pilot data
 data/pilot_interval_parquet/
+CLAUDE.md
+.cursor/
