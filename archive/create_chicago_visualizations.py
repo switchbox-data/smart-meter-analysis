@@ -1,15 +1,25 @@
 #!/usr/bin/env python
 """
-Final visualizations for Chicago smart meter data (CM90 dataset):
+Visualizations for ComEd smart meter data (CM90 dataset):
 - Heatmap shows MEAN kWh per 30-min per customer.
 - Monthly bar chart annotates each bar with the month's mean kWh.
 - Hourly profile with peak/baseload annotations.
 - Weekend vs weekday comparison.
 
-Usage:
+Illinois is the default geographic scope. Pass --geography and --zip-codes
+to produce a named subset (e.g. Chicago).
+
+Usage (Illinois, all ZIPs):
     python scripts/analysis/create_chicago_visualizations.py \
-        --input analysis/chicago_2024/final/CLIPPED_CM90.parquet \
-        --output analysis/chicago_2024/visualizations
+        --input data/illinois_2024/CLIPPED_CM90.parquet \
+        --output figures/illinois_2024
+
+Usage (Chicago subset):
+    python scripts/analysis/create_chicago_visualizations.py \
+        --input data/illinois_2024/CLIPPED_CM90.parquet \
+        --output figures/chicago_2024 \
+        --geography Chicago \
+        --zip-codes 60601 60602 60603
 """
 
 import argparse
@@ -33,11 +43,18 @@ plt.rcParams.update({
 })
 
 
-def create_heatmap(data_path: str, output_path: Path):
+def _apply_zip_filter(lf: pl.LazyFrame, zip_codes: list[str] | None) -> pl.LazyFrame:
+    """Restrict to a named ZIP code subset when zip_codes is provided."""
+    if zip_codes is not None:
+        lf = lf.filter(pl.col("zip_code").is_in(zip_codes))
+    return lf
+
+
+def create_heatmap(data_path: str, output_path: Path, geography: str, zip_codes: list[str] | None):
     """Monthly-hourly heatmap (MEAN kWh per customer)."""
     print("\n📊 Creating heatmap (MEAN kWh per customer)...")
 
-    lf = pl.scan_parquet(data_path)
+    lf = _apply_zip_filter(pl.scan_parquet(data_path), zip_codes)
 
     stats = lf.select([
         pl.col("account_identifier").n_unique().alias("n_customers"),
@@ -53,6 +70,10 @@ def create_heatmap(data_path: str, output_path: Path):
         .sort(["sample_month", "hour"])
         .collect(engine="streaming")
     )
+
+    if monthly_hourly.is_empty():
+        print(f"⚠️  No data for geography '{geography}' — skipping heatmap.")
+        return
 
     matrix = monthly_hourly.pivot(index="hour", columns="sample_month", values="mean_kwh").fill_null(0)
 
@@ -83,7 +104,7 @@ def create_heatmap(data_path: str, output_path: Path):
     ax.set_ylabel("Hour of Day", fontsize=15, fontweight="bold", labelpad=12)
     ax.set_title(
         "Residential Electricity Load Patterns: Temporal Heat Map\n"
-        f"Chicago • {date_range} • {n_customers:,} Households",
+        f"{geography} • {date_range} • {n_customers:,} Households",
         fontsize=18,
         fontweight="bold",
         pad=25,
@@ -92,17 +113,18 @@ def create_heatmap(data_path: str, output_path: Path):
     ax.invert_yaxis()
 
     plt.tight_layout(rect=[0, 0.03, 1, 1])
-    output_file = output_path / "chicago_heatmap.png"
+    geo_slug = geography.lower().replace(" ", "_")
+    output_file = output_path / f"{geo_slug}_heatmap.png"
     plt.savefig(output_file, dpi=300, bbox_inches="tight", facecolor="white")
     print(f"✅ Saved: {output_file}")
     plt.close()
 
 
-def create_hourly_profile(data_path: str, output_path: Path):
+def create_hourly_profile(data_path: str, output_path: Path, geography: str, zip_codes: list[str] | None):
     """Average hourly profile across the year (mean and IQR)."""
     print("\n📊 Creating hourly profile...")
 
-    lf = pl.scan_parquet(data_path)
+    lf = _apply_zip_filter(pl.scan_parquet(data_path), zip_codes)
     n_customers = lf.select(pl.col("account_identifier").n_unique()).collect(engine="streaming")[0, 0]
 
     hourly = (
@@ -116,6 +138,10 @@ def create_hourly_profile(data_path: str, output_path: Path):
         .collect(engine="streaming")
     )
 
+    if hourly.is_empty():
+        print(f"⚠️  No data for geography '{geography}' — skipping hourly profile.")
+        return
+
     _fig, ax = plt.subplots(figsize=(15, 8))
     hours = hourly["hour"].to_list()
     mean = hourly["mean_kwh"].to_list()
@@ -128,7 +154,7 @@ def create_hourly_profile(data_path: str, output_path: Path):
     ax.set_xlabel("Hour of Day", fontsize=15, fontweight="bold", labelpad=12)
     ax.set_ylabel("Energy Consumption (kWh per 30-min)", fontsize=15, fontweight="bold", labelpad=12)
     ax.set_title(
-        f"Average Hourly Electricity Usage Profile\n{n_customers:,} Chicago Households",
+        f"Average Hourly Electricity Usage Profile\n{n_customers:,} {geography} Households",
         fontsize=18,
         fontweight="bold",
         pad=25,
@@ -167,17 +193,18 @@ def create_hourly_profile(data_path: str, output_path: Path):
 
     ax.legend(loc="upper left", framealpha=0.95, edgecolor="#000", fancybox=True, shadow=True, fontsize=12)
     plt.tight_layout()
-    output_file = output_path / "chicago_hourly_profile.png"
+    geo_slug = geography.lower().replace(" ", "_")
+    output_file = output_path / f"{geo_slug}_hourly_profile.png"
     plt.savefig(output_file, dpi=300, bbox_inches="tight", facecolor="white")
     print(f"✅ Saved: {output_file}")
     plt.close()
 
 
-def create_monthly_profile(data_path: str, output_path: Path):
+def create_monthly_profile(data_path: str, output_path: Path, geography: str, zip_codes: list[str] | None):
     """Monthly average bar chart with mean kWh annotations."""
     print("\n📊 Creating monthly profile...")
 
-    lf = pl.scan_parquet(data_path)
+    lf = _apply_zip_filter(pl.scan_parquet(data_path), zip_codes)
 
     monthly = (
         lf.group_by("sample_month")
@@ -189,6 +216,10 @@ def create_monthly_profile(data_path: str, output_path: Path):
         .sort("sample_month")
         .collect(engine="streaming")
     )
+
+    if monthly.is_empty():
+        print(f"⚠️  No data for geography '{geography}' — skipping monthly profile.")
+        return
 
     _fig, ax = plt.subplots(figsize=(15, 8))
     months = monthly["sample_month"].to_list()
@@ -214,7 +245,7 @@ def create_monthly_profile(data_path: str, output_path: Path):
 
     ax.set_xlabel("Month", fontsize=15, fontweight="bold", labelpad=12)
     ax.set_ylabel("Average Energy (kWh per 30-min)", fontsize=15, fontweight="bold", labelpad=12)
-    ax.set_title("Monthly Average Electricity Consumption\nChicago", fontsize=18, fontweight="bold", pad=25)
+    ax.set_title(f"Monthly Average Electricity Consumption\n{geography}", fontsize=18, fontweight="bold", pad=25)
 
     ax.set_xticks(range(len(months)))
     ax.set_xticklabels(month_labels, fontsize=12)
@@ -222,17 +253,18 @@ def create_monthly_profile(data_path: str, output_path: Path):
     ax.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout(rect=[0, 0.03, 1, 1])
-    output_file = output_path / "chicago_monthly_profile.png"
+    geo_slug = geography.lower().replace(" ", "_")
+    output_file = output_path / f"{geo_slug}_monthly_profile.png"
     plt.savefig(output_file, dpi=300, bbox_inches="tight", facecolor="white")
     print(f"✅ Saved: {output_file}")
     plt.close()
 
 
-def create_weekend_comparison(data_path: str, output_path: Path):
+def create_weekend_comparison(data_path: str, output_path: Path, geography: str, zip_codes: list[str] | None):
     """Weekday vs weekend mean kWh per 30-min."""
     print("\n📊 Creating weekend comparison...")
 
-    lf = pl.scan_parquet(data_path)
+    lf = _apply_zip_filter(pl.scan_parquet(data_path), zip_codes)
     comparison = (
         lf.group_by(["hour", "is_weekend"])
         .agg(pl.col("kwh").mean().alias("mean_kwh"))
@@ -240,8 +272,12 @@ def create_weekend_comparison(data_path: str, output_path: Path):
         .collect(engine="streaming")
     )
 
-    weekday = comparison.filter(not pl.col("is_weekend"))
+    weekday = comparison.filter(~pl.col("is_weekend"))
     weekend = comparison.filter(pl.col("is_weekend"))
+
+    if weekday.is_empty() or weekend.is_empty():
+        print(f"⚠️  Missing weekday or weekend data for geography '{geography}' — skipping weekend comparison.")
+        return
 
     _fig, ax = plt.subplots(figsize=(15, 9))
 
@@ -268,7 +304,7 @@ def create_weekend_comparison(data_path: str, output_path: Path):
 
     ax.set_xlabel("Hour of Day", fontsize=15, fontweight="bold", labelpad=12)
     ax.set_ylabel("Average Energy (kWh per 30-min)", fontsize=15, fontweight="bold", labelpad=12)
-    ax.set_title("Weekday vs Weekend Load Profiles\nChicago", fontsize=18, fontweight="bold", pad=30)
+    ax.set_title(f"Weekday vs Weekend Load Profiles\n{geography}", fontsize=18, fontweight="bold", pad=30)
     ax.grid(True, alpha=0.4, linestyle="--", linewidth=0.8)
     ax.set_xticks(range(0, 24, 2))
     ax.set_xlim(-0.5, 23.5)
@@ -279,50 +315,86 @@ def create_weekend_comparison(data_path: str, output_path: Path):
     ax.legend(loc="upper left", framealpha=0.95, edgecolor="#000", fancybox=True, shadow=True, fontsize=13)
 
     plt.tight_layout()
-    output_file = output_path / "chicago_weekend_comparison.png"
+    geo_slug = geography.lower().replace(" ", "_")
+    output_file = output_path / f"{geo_slug}_weekend_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches="tight", facecolor="white")
     print(f"✅ Saved: {output_file}")
     plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Create visualizations from Chicago smart meter data")
+    parser = argparse.ArgumentParser(
+        description="Create visualizations from ComEd smart meter data. "
+        "Illinois is the default geographic scope; use --geography and --zip-codes "
+        "to produce a named subset (e.g. Chicago)."
+    )
     parser.add_argument(
         "--input",
         required=True,
-        help="Path to input parquet file (e.g., analysis/chicago_2024/final/CLIPPED_CM90.parquet)",
+        help="Path to input parquet file (must contain a zip_code column).",
     )
     parser.add_argument(
         "--output",
         required=True,
-        help="Output directory for visualizations (e.g., analysis/chicago_2024/visualizations)",
+        help="Output directory for visualizations.",
+    )
+    parser.add_argument(
+        "--geography",
+        default="Illinois",
+        help="Geographic label used in figure titles and output filenames (default: Illinois).",
+    )
+    parser.add_argument(
+        "--zip-codes",
+        nargs="+",
+        default=None,
+        metavar="ZIP",
+        help="Optional list of 5-digit ZIP codes to restrict analysis to a subset "
+        "(e.g. --zip-codes 60601 60602). Omit to include all ZIPs in the input file.",
     )
 
     args = parser.parse_args()
 
     data_path = Path(args.input)
     output_dir = Path(args.output)
+    geography: str = args.geography
+    zip_codes: list[str] | None = args.zip_codes
 
-    # Validate input
+    # Validate input file exists
     if not data_path.exists():
         print(f"❌ File not found: {data_path}")
+        raise SystemExit(1)
+
+    # Preflight: check required columns before running any visualizations.
+    # sample_month and date are produced by chicago_sampler.py; hour/is_weekend
+    # come from add_time_columns(); kwh/account_identifier/zip_code are canonical.
+    required_cols = {"account_identifier", "zip_code", "date", "sample_month", "hour", "kwh", "is_weekend"}
+    actual_cols = set(pl.scan_parquet(data_path).collect_schema().names())
+    missing_cols = required_cols - actual_cols
+    if missing_cols:
+        print(f"❌ Input file is missing required columns: {sorted(missing_cols)}")
+        print(f"   Found: {sorted(actual_cols)}")
         raise SystemExit(1)
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
-    print("CHICAGO SMART METER VISUALIZATIONS")
+    print(f"{geography.upper()} SMART METER VISUALIZATIONS")
     print("=" * 80)
-    print(f"Input:  {data_path}")
-    print(f"Output: {output_dir}")
+    print(f"Input:      {data_path}")
+    print(f"Output:     {output_dir}")
+    print(f"Geography:  {geography}")
+    if zip_codes:
+        print(f"ZIP filter: {', '.join(zip_codes)}")
+    else:
+        print("ZIP filter: none (all ZIPs in input file)")
     print("=" * 80)
 
     # Create all visualizations
-    create_heatmap(str(data_path), output_dir)
-    create_hourly_profile(str(data_path), output_dir)
-    create_monthly_profile(str(data_path), output_dir)
-    create_weekend_comparison(str(data_path), output_dir)
+    create_heatmap(str(data_path), output_dir, geography, zip_codes)
+    create_hourly_profile(str(data_path), output_dir, geography, zip_codes)
+    create_monthly_profile(str(data_path), output_dir, geography, zip_codes)
+    create_weekend_comparison(str(data_path), output_dir, geography, zip_codes)
 
     print("\n" + "=" * 80)
     print("✅ ALL VISUALIZATIONS COMPLETE!")

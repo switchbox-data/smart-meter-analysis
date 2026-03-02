@@ -177,5 +177,17 @@ profiles/
 docs/*.html
 docs/index_files/
 
+# Local run artifacts (shard lists, input lists, temp dirs)
+*.txt
+.tmp/
+archive_quarantine/
+tmp_polars_run_*/
+subagent_packages/
+
+# Operator-only env (do not commit)
+.env.comed
+
 # Pricing pilot data
 data/pilot_interval_parquet/
+CLAUDE.md
+.cursor/
