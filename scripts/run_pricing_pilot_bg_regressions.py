@@ -610,7 +610,7 @@ def _build_aggregate_bg(
 
     Returns (bg_table, household_mean_delta_or_pct).
     """
-    hh = pl.concat([pl.read_parquet(p) for p in paths], how="vertical")
+    hh = pl.scan_parquet(paths).collect()
     hh = _compute_household_pct_change(hh) if pct else _compute_household_delta(hh)
     hh_mean = float(hh.select(pl.col("delta_dollars").mean()).item())
     logger.info(
