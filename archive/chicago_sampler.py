@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-CLI wrapper for Chicago smart meter sampling.
+CLI wrapper for ComEd smart meter sampling.
 Handles multiple ZIP codes and writes output for each.
+Pass --zips or --zips-file to specify which ZIP codes to sample.
 """
 
 import argparse
