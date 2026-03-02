@@ -415,7 +415,7 @@ def fit_ols(
     X = sm.add_constant(X_df.values)
     full_names = ["const", *all_predictor_names]
 
-    model = sm.OLS(y, X).fit()
+    model = sm.OLS(y, X).fit(cov_type="HC1")
 
     coefficients = {}
     for i, name in enumerate(full_names):
