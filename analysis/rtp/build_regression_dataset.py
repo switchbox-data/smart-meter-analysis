@@ -526,16 +526,19 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
     # -- Load bills -----------------------------------------------------------
     log.info("Loading bills: %s", args.bills)
-    bills = pl.read_parquet(args.bills)
-    n_bills_total = bills.height
-    log.info("Bills: %d rows, columns: %s", n_bills_total, bills.columns)
+    bills_lf = pl.scan_parquet(args.bills)
 
-    # Validate required columns (including month and bill_a_dollars)
-    cols = set(bills.columns)
+    # Validate required columns before collecting into memory
+    cols = set(bills_lf.collect_schema().names())
     for req in ("account_identifier", "zip_code", "total_kwh", "bill_a_dollars", "month"):
         if req not in cols:
             log.error("Bills missing required column: '%s'. Found: %s", req, sorted(cols))
             return 1
+
+    # Schema OK — collect into memory
+    bills = bills_lf.collect()
+    n_bills_total = bills.height
+    log.info("Bills: %d rows, columns: %s", n_bills_total, bills.columns)
 
     # Validate month format: YYYYMM, 6 digits
     months_unique = bills.select("month").unique().to_series().to_list()
