@@ -183,7 +183,7 @@ def _compute_household_delta(hh: pl.DataFrame) -> pl.DataFrame:
     elif "bill_diff_dollars" in cols:
         delta = pl.col("bill_diff_dollars").cast(pl.Float64)
     elif "bill_b_dollars" in cols and "bill_a_dollars" in cols:
-        delta = pl.col("bill_b_dollars").cast(pl.Float64) - pl.col("bill_a_dollars").cast(pl.Float64)
+        delta = pl.col("bill_a_dollars").cast(pl.Float64) - pl.col("bill_b_dollars").cast(pl.Float64)
     else:
         raise RuntimeError(
             "Could not compute household delta. Expected one of: net_bill_diff_dollars, bill_diff_dollars, "
