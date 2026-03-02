@@ -268,3 +268,36 @@ migration-status OUT_BASE_DIR="/ebs/home/$(whoami)/runs":
             echo "$m files=$files (no run_summary.json)"
         fi
     done
+
+# =============================================================================
+# 🔍 CODE QUALITY & TESTING
+# =============================================================================
+
+check:
+    echo "🚀 Checking lock file consistency with 'pyproject.toml'"
+    uv lock --locked
+    echo "🚀 Linting code: Running pre-commit"
+    uv run pre-commit run -a
+    echo "🚀 Static type checking: Running mypy"
+    uv run mypy
+    echo "🚀 Checking for obsolete dependencies: Running deptry"
+    uv run deptry .
+
+test:
+    echo "🚀 Testing code: Running pytest"
+    uv run python -m pytest --doctest-modules
+
+lint:
+    uv run ruff check .
+
+lint-fix:
+    uv run ruff check --fix .
+
+format:
+    uv run ruff format .
+
+typecheck:
+    uv run mypy smart_meter_analysis
+
+test-coverage:
+    uv run pytest --cov=smart_meter_analysis --cov-report=html
