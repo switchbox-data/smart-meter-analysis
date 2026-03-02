@@ -69,12 +69,10 @@ import polars as pl
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Sign convention applied consistently across all scenarios.
-# delta = alternative_rate_bill - flat_rate_bill
-# Positive (+) = customer pays MORE under alternative rate (costs more)
-# Negative (-) = customer SAVES under alternative rate (savings)
-SIGN_CONVENTION = (
-    "delta = alternative_rate_bill - flat_rate_bill (positive = higher bill under alt rate; negative = savings)"
-)
+# delta = flat_rate_bill - alternative_rate_bill
+# Positive (+) = customer SAVES under alternative rate (savings)
+# Negative (-) = customer pays MORE under alternative rate (costs more)
+SIGN_CONVENTION = "delta = flat_rate_bill - alternative_rate_bill (positive = savings under alt rate; negative = higher bill under alt rate)"
 
 
 @dataclass
@@ -93,12 +91,12 @@ def _choose_delta(cols: list[str]) -> pl.Expr:
 
     Preference order:
       1. bill_b_dollars - bill_a_dollars  (explicit; matches sign convention by construction)
-      2. net_bill_diff_dollars            (fallback; semantics assumed to be alt - flat)
+      2. net_bill_diff_dollars            (fallback; semantics assumed to be flat - alt)
       3. bill_diff_dollars                (last resort; semantics may vary — Pass 1 consistency
                                            check will warn if sign is flipped)
 
-    Sign convention: delta = alternative_rate_bill - flat_rate_bill.
-    Positive = costs more under alt rate; negative = savings.
+    Sign convention: delta = flat_rate_bill - alternative_rate_bill.
+    Positive = savings under alt rate; negative = costs more under alt rate.
     """
     if "bill_b_dollars" in cols and "bill_a_dollars" in cols:
         return pl.col("bill_b_dollars") - pl.col("bill_a_dollars")
