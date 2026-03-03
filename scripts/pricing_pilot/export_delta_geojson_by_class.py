@@ -14,6 +14,10 @@ Sign convention: delta = alternative_rate_bill - flat_rate_bill
   - positive (+) means customer pays MORE under the alternative rate
   - negative (-) means customer SAVES under the alternative rate
 
+BG universe: by default, all block groups in the shapefile (Illinois statewide).
+When --zip-file is provided, the universe is narrowed to block groups reachable
+from those ZIPs via the crosswalk (e.g. Chicago-only analysis).
+
 Produces 16 GeoJSON files (2 months x 2 rate comparisons x 4 delivery classes).
 
 Each GeoJSON contains:
@@ -21,9 +25,13 @@ Each GeoJSON contains:
   - mean_delta: float, mean monthly bill change ($); null for BGs with no data
   - n_households: int, count of simulated households; null for BGs with no data
   - mean_delta_cap_global_sym: float, mean_delta clamped to [-X, +X] where X is
-      the p95 of |mean_delta| across ALL scenarios; null where mean_delta is null.
+      the p80 of |mean_delta| across ALL scenarios; null where mean_delta is null.
       Use this field for Felt choropleth with a consistent legend range.
   - geometry: polygon, Census BG boundary
+
+Domain anchors: two synthetic features (__DOMAIN_ANCHOR_MIN__, __DOMAIN_ANCHOR_MAX__)
+are injected by default to force Felt to use the full symmetric color domain across
+maps. Disable with --no-domain-anchors.
 
 Output files: {output_dir}/{yyyymm}_{dtou|stou}_{delivery_class}.geojson
 e.g. 202301_dtou_sf_no_esh.geojson, 202307_stou_mf_esh.geojson
@@ -35,7 +43,12 @@ exits with error; provide a path via --shapefile.
 
 Usage::
 
+  # Statewide (default): all BGs in the shapefile
   uv run python scripts/pricing_pilot/export_delta_geojson_by_class.py
+
+  # Chicago-filtered: restrict to BGs reachable from Chicago ZIPs
+  uv run python scripts/pricing_pilot/export_delta_geojson_by_class.py \\
+    --zip-file data/reference/geography/chicago_zip_codes.csv
 
   # Override paths:
   uv run python scripts/pricing_pilot/export_delta_geojson_by_class.py \\
@@ -64,6 +77,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -158,6 +172,22 @@ def main() -> int:
         help="Block group shapefile (default: repo data/shapefiles/...). If missing, script exits; provide path or add shapefile.",
     )
     parser.add_argument(
+        "--zip-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CSV with a zip5 column to restrict the BG universe to block groups "
+            "reachable from those ZIPs via the crosswalk. When omitted, all BGs in the "
+            "shapefile are included. Example: data/reference/geography/chicago_zip_codes.csv"
+        ),
+    )
+    parser.add_argument(
+        "--crosswalk",
+        type=Path,
+        default=REPO_ROOT / "data/reference/comed_bg_zip4_crosswalk.txt",
+        help="ZIP+4→BG crosswalk TSV. Required when --zip-file is used.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=default_out,
@@ -173,9 +203,16 @@ def main() -> int:
     parser.add_argument(
         "--global-range-quantile",
         type=float,
-        default=0.95,
+        default=0.80,
         metavar="Q",
-        help="Quantile of |mean_delta| used for global symmetric bound X (default: 0.95 = p95).",
+        help="Quantile of |mean_delta| used for global symmetric bound X (default: 0.80 = p80).",
+    )
+    parser.add_argument(
+        "--no-domain-anchors",
+        dest="domain_anchors",
+        action="store_false",
+        default=True,
+        help="Disable domain anchor injection (two synthetic features that force Felt to use the full symmetric color domain).",
     )
     parser.add_argument(
         "--expected-bg-count",
@@ -213,32 +250,42 @@ def main() -> int:
     g["GEOID"] = g["GEOID"].astype(str).str.strip()
 
     # =========================================================================
-    # Build Chicago BG universe from ZIP-based sample frame.
-    # Universe = all BG GEOIDs reachable from Chicago ZIP5s via the ZIP+4 crosswalk.
-    # BGs outside this universe are excluded entirely; BGs inside with no billing
+    # Build BG universe.
+    # When --zip-file is provided, universe = BG GEOIDs reachable from those
+    # ZIP5s via the crosswalk. Otherwise, all BGs in the shapefile are included.
+    # BGs outside the universe are excluded entirely; BGs inside with no billing
     # data are kept as gray "no-data" polygons (n_households=0, metric null).
     # =========================================================================
-    _chi_zip_csv = REPO_ROOT / "data/reference/geography/chicago_zip_codes.csv"
-    _chi_xwalk = REPO_ROOT / "data/reference/comed_bg_zip4_crosswalk.txt"
-    if not _chi_zip_csv.exists() or not _chi_xwalk.exists():
-        print("ERROR: Chicago reference files not found:", file=sys.stderr)
-        print(f"  {_chi_zip_csv}", file=sys.stderr)
-        print(f"  {_chi_xwalk}", file=sys.stderr)
-        return 1
-    _zip5_raw = pl.read_csv(_chi_zip_csv, infer_schema_length=0)
-    _chi_zip5s = set(_zip5_raw["zip5"].str.strip_chars().str.zfill(5).to_list())
-    _xw = pl.read_csv(_chi_xwalk, separator="\t", infer_schema_length=0)
-    _xw_chi = _xw.filter(pl.col("Zip").str.strip_chars().str.zfill(5).is_in(_chi_zip5s))
-    _bg_universe_geoids = frozenset(_xw_chi["CensusKey2023"].str.strip_chars().str.slice(0, 12).unique().to_list())
-    g_universe = g[g["GEOID"].isin(_bg_universe_geoids)].copy()
-    if len(g_universe) == 0:
-        print(
-            "ERROR: Chicago ZIP-based BG universe produced 0 geometry features."
-            " Check reference files and shapefile GEOID format.",
-            file=sys.stderr,
+    if args.zip_file is not None:
+        # Sub-geography mode: build BG universe from ZIP filter via crosswalk
+        if not args.zip_file.exists():
+            print(f"--zip-file not found: {args.zip_file}", file=sys.stderr)
+            return 1
+        if not args.crosswalk.exists():
+            print(f"--crosswalk not found: {args.crosswalk}", file=sys.stderr)
+            return 1
+        _zip5_raw = pl.read_csv(args.zip_file, infer_schema_length=0)
+        _zip5s = set(_zip5_raw["zip5"].str.strip_chars().str.zfill(5).to_list())
+        _xw = pl.read_csv(args.crosswalk, separator="\t", infer_schema_length=0)
+        _xw_filtered = _xw.filter(pl.col("Zip").str.strip_chars().str.zfill(5).is_in(_zip5s))
+        _bg_universe_geoids = frozenset(
+            _xw_filtered["CensusKey2023"].str.strip_chars().str.zfill(15).str.slice(0, 12).unique().to_list()
         )
-        return 1
-    print(f"[geo] BG universe (ZIP-based): kept {len(g_universe)}/{len(g)} features")
+        g_universe = g[g["GEOID"].isin(_bg_universe_geoids)].copy()
+        if len(g_universe) == 0:
+            print(
+                "ERROR: ZIP-based BG universe produced 0 geometry features."
+                " Check --zip-file, --crosswalk, and shapefile GEOID format.",
+                file=sys.stderr,
+            )
+            return 1
+        geo_scope = f"zip_filter:{args.zip_file.name}"
+        print(f"[geo] BG universe (ZIP-filtered): kept {len(g_universe)}/{len(g)} features")
+    else:
+        # Statewide mode: all BGs in shapefile
+        g_universe = g.copy()
+        geo_scope = "statewide"
+        print(f"[geo] BG universe (statewide): all {len(g_universe)} features from shapefile")
 
     # =========================================================================
     # PASS 1: load all scenarios and aggregate to BG level.
@@ -373,7 +420,7 @@ def main() -> int:
     expected_bg_count: int | None = args.expected_bg_count  # None until first file sets it
 
     for s in scenarios:
-        # Scope geometry to Chicago BG universe (ZIP-based sample frame).
+        # Scope geometry to BG universe (statewide or ZIP-filtered).
         # g_universe is fixed across all scenarios; computed once before Pass 1.
         g_counties = g_universe
 
@@ -381,7 +428,7 @@ def main() -> int:
         merged = g_counties.merge(s.bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
         # Fill geoid_bg from GEOID for rows with no matching household data.
         merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
-        # Fill n_households to 0 for Chicago BGs with no modeled households.
+        # Fill n_households to 0 for BGs with no modeled households.
         merged["n_households"] = merged["n_households"].fillna(0).astype("int64")
 
         # ---- Fail-loud validation ----------------------------------------
@@ -428,6 +475,37 @@ def main() -> int:
         out_gdf = merged[out_cols].copy()
         out_gdf = gpd.GeoDataFrame(out_gdf, geometry="geometry")
 
+        # ---- Domain anchor injection -------------------------------------
+        # Two synthetic features that pin the color domain to [-bound_sym, +bound_sym]
+        # so Felt uses the full symmetric range across all maps.
+        if bound_sym is not None and args.domain_anchors:
+            # Fail-loud: no real BG (n_households > 0) should have null capped delta
+            real_with_null_cap = out_gdf[(out_gdf["n_households"] > 0) & (out_gdf["mean_delta_cap_global_sym"].isna())]
+            if len(real_with_null_cap) > 0:
+                print(
+                    f"ERROR: {len(real_with_null_cap)} BG(s) with households have null "
+                    f"mean_delta_cap_global_sym in {s.bill_path.name}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            anchor_min = {
+                "geoid_bg": "__DOMAIN_ANCHOR_MIN__",
+                "mean_delta": None,
+                "n_households": 0,
+                "mean_delta_cap_global_sym": -bound_sym,
+                "geometry": None,
+            }
+            anchor_max = {
+                "geoid_bg": "__DOMAIN_ANCHOR_MAX__",
+                "mean_delta": None,
+                "n_households": 0,
+                "mean_delta_cap_global_sym": bound_sym,
+                "geometry": None,
+            }
+            anchors_gdf = gpd.GeoDataFrame([anchor_min, anchor_max], geometry="geometry", crs=out_gdf.crs)
+            out_gdf = gpd.GeoDataFrame(pd.concat([out_gdf, anchors_gdf], ignore_index=True), geometry="geometry")
+
         out_path = args.output_dir / f"{s.month}_{s.rate}_{s.delivery_class}.geojson"
         out_gdf.to_file(out_path, driver="GeoJSON")
 
@@ -461,6 +539,8 @@ def main() -> int:
             "bound_sym": bound_sym,
             "method": f"p{int(q * 100)}_abs_over_all_scenarios",
             "global_range_quantile": q,
+            "geo_scope": geo_scope,
+            "domain_anchors": args.domain_anchors,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "sign_convention": SIGN_CONVENTION,
             "n_scenarios": len(scenarios),
