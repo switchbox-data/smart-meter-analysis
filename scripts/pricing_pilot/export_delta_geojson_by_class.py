@@ -83,10 +83,10 @@ import polars as pl
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Sign convention applied consistently across all scenarios.
-# delta = flat_rate_bill - alternative_rate_bill
-# Positive (+) = customer SAVES under alternative rate (savings)
-# Negative (-) = customer pays MORE under alternative rate (costs more)
-SIGN_CONVENTION = "delta = flat_rate_bill - alternative_rate_bill (positive = savings under alt rate; negative = higher bill under alt rate)"
+# delta = alternative_rate_bill - flat_rate_bill
+# Positive (+) = customer pays MORE under alternative rate
+# Negative (-) = customer SAVES under alternative rate
+SIGN_CONVENTION = "delta = alternative_rate_bill - flat_rate_bill (positive = customer pays more under alt rate; negative = customer saves under alt rate)"
 
 
 @dataclass
@@ -105,12 +105,12 @@ def _choose_delta(cols: list[str]) -> pl.Expr:
 
     Preference order:
       1. bill_b_dollars - bill_a_dollars  (explicit; matches sign convention by construction)
-      2. net_bill_diff_dollars            (fallback; semantics assumed to be flat - alt)
+      2. net_bill_diff_dollars            (fallback; semantics assumed to be alt - flat)
       3. bill_diff_dollars                (last resort; semantics may vary — Pass 1 consistency
                                            check will warn if sign is flipped)
 
-    Sign convention: delta = flat_rate_bill - alternative_rate_bill.
-    Positive = savings under alt rate; negative = costs more under alt rate.
+    Sign convention: delta = alternative_rate_bill - flat_rate_bill.
+    Positive = customer pays more under alt rate; negative = customer saves under alt rate.
     """
     if "bill_b_dollars" in cols and "bill_a_dollars" in cols:
         return pl.col("bill_b_dollars") - pl.col("bill_a_dollars")
@@ -308,8 +308,15 @@ def main() -> int:
             print(f"  Account-BG map not found for {month}: {map_path}", file=sys.stderr)
             continue
 
-        df = pl.read_parquet(bill_path)
-        cols = df.columns
+        lf = pl.scan_parquet(bill_path)
+        cols = lf.collect_schema().names()
+        # Only read columns needed for delta computation and join.
+        _needed = {"account_identifier"} & set(cols)
+        for c in ("bill_a_dollars", "bill_b_dollars", "bill_diff_dollars", "net_bill_diff_dollars"):
+            if c in cols:
+                _needed.add(c)
+        _needed.add("account_identifier")
+        df = lf.select(sorted(_needed)).collect()
         if "account_identifier" not in cols:
             print(f"  Bills missing account_identifier: {bill_path}", file=sys.stderr)
             continue
@@ -422,10 +429,10 @@ def main() -> int:
     for s in scenarios:
         # Scope geometry to BG universe (statewide or ZIP-filtered).
         # g_universe is fixed across all scenarios; computed once before Pass 1.
-        g_counties = g_universe
+        g_bg_universe = g_universe
 
         # Left join: every BG in the universe appears; null for BGs with no household data.
-        merged = g_counties.merge(s.bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
+        merged = g_bg_universe.merge(s.bg_pd, left_on="GEOID", right_on="geoid_bg", how="left")
         # Fill geoid_bg from GEOID for rows with no matching household data.
         merged["geoid_bg"] = merged["geoid_bg"].fillna(merged["GEOID"])
         # Fill n_households to 0 for BGs with no modeled households.
@@ -454,7 +461,7 @@ def main() -> int:
             return 1
 
         # 3. Warn if any BGs with data had no matching geometry (data is lost).
-        n_unmatched = int((~s.bg_pd["geoid_bg"].isin(g_counties["GEOID"])).sum())
+        n_unmatched = int((~s.bg_pd["geoid_bg"].isin(g_bg_universe["GEOID"])).sum())
         if n_unmatched > 0:
             print(
                 f"  WARNING: {n_unmatched}/{len(s.bg_pd)} BG(s) with data in {s.bill_path.name}"
