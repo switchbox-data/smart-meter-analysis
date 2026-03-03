@@ -75,7 +75,6 @@ def stage1_raw_counts(data_root: Path) -> dict[tuple[str, str], int]:
         counts = (
             pl.scan_parquet(parts)
             .select(pl.col(account_col), pl.col(class_col))
-            .unique()
             .group_by(class_col)
             .agg(pl.col(account_col).n_unique().alias("n"))
             .collect()
