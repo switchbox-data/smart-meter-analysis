@@ -6,7 +6,7 @@ For each of the four delivery classes (C23=sf_no_esh, C24=mf_no_esh, C26=sf_esh,
 compare distinct account counts at each pipeline stage for January and July 2023.
 
 Stages:
-  1) Raw interval data: ~/pricing_pilot/chicago_only/year=2023/month=01|07/
+  1) Raw interval data: ~/pricing_pilot/interval_data/year=2023/month=01|07/
   2) Bill files: ~/pricing_pilot/bills_unscaled/ (DTOU and STOU per class; flag if counts differ)
   3) Account-BG map: join bills to ~/pricing_pilot/account_bg_map_{yyyymm}.parquet
 
@@ -14,7 +14,7 @@ Output: Summary table + sample dropped account IDs when counts drop between stag
 
 Usage:
   uv run python scripts/pricing_pilot/account_count_chain_of_custody.py
-  uv run python scripts/pricing_pilot/account_count_chain_of_custody.py --chicago-root ~/pricing_pilot/chicago_only --bills-dir ~/pricing_pilot/bills_unscaled
+  uv run python scripts/pricing_pilot/account_count_chain_of_custody.py --data-root ~/pricing_pilot/interval_data --bills-dir ~/pricing_pilot/bills_unscaled
 """
 
 from __future__ import annotations
@@ -43,14 +43,14 @@ def _filter_valid_parquet(paths: list[Path], min_bytes: int) -> list[Path]:
     return [p for p in paths if p.stat().st_size >= min_bytes]
 
 
-def stage1_raw_counts(chicago_root: Path) -> dict[tuple[str, str], int]:
+def stage1_raw_counts(data_root: Path) -> dict[tuple[str, str], int]:
     """Stage 1: distinct accounts per (month_yyyymm, delivery_class) from raw interval parquets."""
     class_col = "delivery_service_class"
     account_col = "account_identifier"
     out: dict[tuple[str, str], int] = {}
 
     for year, month, yyyymm in MONTHS:
-        dir_path = chicago_root / f"year={year}" / f"month={month}"
+        dir_path = data_root / f"year={year}" / f"month={month}"
         if not dir_path.exists():
             print(f"[Stage 1] Directory not found: {dir_path}", file=sys.stderr)
             for dc in DELIVERY_CLASSES:
@@ -70,13 +70,16 @@ def stage1_raw_counts(chicago_root: Path) -> dict[tuple[str, str], int]:
         if class_col not in schema_names:
             print(f"[Stage 1] WARNING: column '{class_col}' not in schema for {yyyymm}", file=sys.stderr)
 
-        # Per-part distinct (account, class) then concat and count distinct per class
+        # Single lazy scan across all parts — Polars pushes unique + group_by down
         print(f"[Stage 1] Counting distinct accounts for {yyyymm} ({len(parts)} parts)...", flush=True)
-        part_dfs = []
-        for p in parts:
-            part_dfs.append(pl.scan_parquet(p).select(pl.col(account_col), pl.col(class_col)).unique().collect())
-        combined = pl.concat(part_dfs).unique()
-        counts = combined.group_by(class_col).agg(pl.col(account_col).n_unique().alias("n"))
+        counts = (
+            pl.scan_parquet(parts)
+            .select(pl.col(account_col), pl.col(class_col))
+            .unique()
+            .group_by(class_col)
+            .agg(pl.col(account_col).n_unique().alias("n"))
+            .collect()
+        )
         for row in counts.iter_rows(named=True):
             dc = str(row[class_col]).strip()
             if dc in DELIVERY_CLASSES:
@@ -116,8 +119,7 @@ def stage2_bill_counts(bills_dir: Path) -> tuple[dict[tuple[str, str], int], dic
             continue
         yyyymm, rate, suffix = parsed
         dc = SUFFIX_TO_CODE[suffix]
-        df = pl.read_parquet(path)
-        n = df.select(pl.col(account_col).n_unique()).item()
+        n = pl.scan_parquet(path).select(pl.col(account_col).n_unique()).collect().item()
         if rate == "dtou":
             dtou_counts[(yyyymm, dc)] = n
         else:
@@ -155,8 +157,8 @@ def stage3_bg_join_counts(
             with_bg[(yyyymm, dc)] = 0
             without_bg[(yyyymm, dc)] = 0
             continue
-        bills = pl.read_parquet(path).select(pl.col(account_col).unique())
-        amap = pl.read_parquet(map_path)
+        bills = pl.scan_parquet(path).select(account_col).unique().collect()
+        amap = pl.read_parquet(map_path, columns=[account_col, "geoid_bg"])
         joined = bills.join(amap, on=account_col, how="left")
         n_with = joined.filter(pl.col("geoid_bg").is_not_null()).height
         n_without = joined.filter(pl.col("geoid_bg").is_null()).height
@@ -177,13 +179,16 @@ def sample_missing(
 
 
 def main() -> int:
-    default_root = Path.home() / "pricing_pilot" / "chicago_only"
+    default_root = Path.home() / "pricing_pilot" / "interval_data"
     default_bills = Path.home() / "pricing_pilot" / "bills_unscaled"
     default_map = str(Path.home() / "pricing_pilot" / "account_bg_map_{yyyymm}.parquet")
 
     parser = argparse.ArgumentParser(description="Account count chain-of-custody across delivery classes.")
     parser.add_argument(
-        "--chicago-root", type=Path, default=default_root, help="Root for chicago_only/year=.../month=..."
+        "--data-root",
+        type=Path,
+        default=default_root,
+        help="Root of Hive-partitioned interval parquets (default: ~/pricing_pilot/interval_data). Layout: <root>/year=YYYY/month=MM/*.parquet",
     )
     parser.add_argument("--bills-dir", type=Path, default=default_bills, help="Directory of bill parquets")
     parser.add_argument(
@@ -191,7 +196,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    chicago_root = args.chicago_root
+    data_root = args.data_root
     bills_dir = args.bills_dir
     map_pattern = args.account_bg_map_pattern
 
@@ -200,7 +205,7 @@ def main() -> int:
         return 1
 
     print("=== Stage 1: Raw interval data (distinct accounts per delivery class) ===")
-    raw = stage1_raw_counts(chicago_root)
+    raw = stage1_raw_counts(data_root)
 
     print("\n=== Stage 2: Bill files (DTOU and STOU distinct accounts per class) ===")
     dtou, stou, flags = stage2_bill_counts(bills_dir)
@@ -236,7 +241,9 @@ def main() -> int:
     for yyyymm in ["202301", "202307"]:
         map_path = Path(map_pattern.replace("{yyyymm}", yyyymm))
         amap = (
-            pl.read_parquet(map_path) if map_path.exists() else pl.DataFrame({"account_identifier": [], "geoid_bg": []})
+            pl.read_parquet(map_path, columns=["account_identifier", "geoid_bg"])
+            if map_path.exists()
+            else pl.DataFrame({"account_identifier": [], "geoid_bg": []})
         )
 
         for dc in DELIVERY_CLASSES:
@@ -250,7 +257,7 @@ def main() -> int:
             if raw_n > 0 and bill_d < raw_n:
                 any_drops = True
                 year, month = yyyymm[:4], yyyymm[4:6]
-                dir_path = chicago_root / f"year={year}" / f"month={month}"
+                dir_path = data_root / f"year={year}" / f"month={month}"
                 parts = (
                     _filter_valid_parquet(sorted(dir_path.glob("*.parquet")), MIN_PART_BYTES)
                     if dir_path.exists()
@@ -269,7 +276,14 @@ def main() -> int:
                 bill_path = bills_dir / f"{yyyymm}_flat_vs_dtou_{CODE_TO_SUFFIX[dc]}.parquet"
                 bill_accounts = set()
                 if bill_path.exists():
-                    bill_accounts = set(pl.read_parquet(bill_path)["account_identifier"].cast(pl.Utf8).to_list())
+                    bill_accounts = set(
+                        pl.scan_parquet(bill_path)
+                        .select(pl.col("account_identifier").cast(pl.Utf8))
+                        .unique()
+                        .collect()
+                        .to_series()
+                        .to_list()
+                    )
                 samples = sample_missing(raw_accounts, bill_accounts, 5)
                 print(
                     f"  {yyyymm} {dc}: raw ({raw_n}) -> bill ({bill_d}); sample accounts in raw but not in bills: {samples}"
@@ -280,7 +294,7 @@ def main() -> int:
                 any_drops = True
                 bill_path = bills_dir / f"{yyyymm}_flat_vs_dtou_{CODE_TO_SUFFIX[dc]}.parquet"
                 if bill_path.exists():
-                    bills_df = pl.read_parquet(bill_path).select("account_identifier")
+                    bills_df = pl.scan_parquet(bill_path).select("account_identifier").collect()
                     joined = bills_df.join(amap, on="account_identifier", how="left")
                     no_bg = (
                         joined.filter(pl.col("geoid_bg").is_null())
