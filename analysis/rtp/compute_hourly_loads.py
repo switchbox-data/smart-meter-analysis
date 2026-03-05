@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
 _BATCH_SIZE = 5_000_000
+_MERGE_FAN_IN = 64  # max intermediate files per re-aggregation pass
 
 
 def _resolve_parquet_paths(input_path: Path) -> list[str]:
@@ -108,6 +109,65 @@ def _aggregate_file_chunked(
     return n_written
 
 
+def _merge_aggregate(
+    tmp_dir: Path,
+    output_path: Path,
+    *,
+    sort_output: bool,
+    fan_in: int = _MERGE_FAN_IN,
+) -> None:
+    """Re-aggregate intermediate parquets in bounded passes.
+
+    Each pass groups at most ``fan_in`` files, collects, re-aggregates, and
+    writes a merged file.  Repeats until the file count is small enough for a
+    single final pass that writes ``output_path``.
+    """
+    current_dir = tmp_dir
+    paths = sorted(str(p) for p in current_dir.glob("*.parquet"))
+
+    if not paths:
+        logger.warning("No data survived filtering; writing empty output.")
+        pl.DataFrame(
+            schema={
+                "account_identifier": pl.Utf8,
+                "zip_code": pl.Utf8,
+                "hour_chicago": pl.Datetime("us"),
+                "kwh_hour": pl.Float64,
+            }
+        ).write_parquet(output_path)
+        return
+
+    pass_num = 0
+    while len(paths) > fan_in:
+        pass_num += 1
+        next_dir = tmp_dir / f"pass{pass_num}"
+        next_dir.mkdir()
+        n_groups = (len(paths) + fan_in - 1) // fan_in
+        logger.info(
+            "Merge pass %d: %d files -> %d groups of <=%d",
+            pass_num,
+            len(paths),
+            n_groups,
+            fan_in,
+        )
+        for g in range(n_groups):
+            group = paths[g * fan_in : (g + 1) * fan_in]
+            merged = pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).collect()
+            merged.write_parquet(next_dir / f"merged_{g:04d}.parquet")
+
+        # Free previous tier (but not the top-level tmp_dir — caller owns that)
+        if current_dir != tmp_dir:
+            shutil.rmtree(current_dir, ignore_errors=True)
+        current_dir = next_dir
+        paths = sorted(str(p) for p in current_dir.glob("*.parquet"))
+
+    logger.info("Final merge of %d files", len(paths))
+    lf = pl.scan_parquet(paths).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
+    if sort_output:
+        lf = lf.sort(_GROUP_KEYS)
+    lf.collect().write_parquet(output_path)
+
+
 def compute_hourly_loads(
     input_path: Path,
     assignments_path: Path | None,
@@ -141,26 +201,7 @@ def compute_hourly_loads(
             logger.info("  -> wrote %d intermediate chunks", n)
             chunk_offset += n
 
-        intermediate_paths = sorted(str(p) for p in tmp_dir.glob("*.parquet"))
-        if not intermediate_paths:
-            logger.warning("No data survived filtering; writing empty output.")
-            pl.DataFrame(
-                schema={
-                    "account_identifier": pl.Utf8,
-                    "zip_code": pl.Utf8,
-                    "hour_chicago": pl.Datetime("us"),
-                    "kwh_hour": pl.Float64,
-                }
-            ).write_parquet(output_path)
-            return
-
-        logger.info("Re-aggregating %d intermediate chunks", len(intermediate_paths))
-        lf_merged = pl.scan_parquet(intermediate_paths).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
-
-        if sort_output:
-            lf_merged = lf_merged.sort(_GROUP_KEYS)
-
-        lf_merged.sink_parquet(output_path)
+        _merge_aggregate(tmp_dir, output_path, sort_output=sort_output)
         logger.info("Wrote hourly loads to %s", output_path)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
