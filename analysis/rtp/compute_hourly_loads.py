@@ -6,7 +6,10 @@ Takes interval-level ComEd smart meter data (30-minute intervals in this pipelin
 and aggregates to hourly kWh per household.
 
 If --cluster-assignments is provided, restrict to households that appear
-in the clustering assignments using a lazy semi-join (memory-safe).
+in the clustering assignments.
+
+Large files are processed in sub-file row batches via PyArrow's
+iter_batches() so peak memory is O(batch_size), not O(file).
 
 Expected input columns (from processed interval parquet):
   - account_identifier
@@ -31,11 +34,13 @@ import tempfile
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
+_BATCH_SIZE = 5_000_000
 
 
 def _resolve_parquet_paths(input_path: Path) -> list[str]:
@@ -64,29 +69,43 @@ def _validate_schema(lf: pl.LazyFrame) -> None:
         raise ValueError(f"Input file missing required columns: {sorted(missing)}")
 
 
-def _prepare_assignments_lf(assignments_path: Path) -> pl.LazyFrame:
-    """Load and validate cluster assignments, returning a unique-account LazyFrame."""
+def _prepare_account_filter(assignments_path: Path) -> set[str]:
+    """Load cluster assignments and return the set of account identifiers."""
     if not assignments_path.exists():
         raise FileNotFoundError(f"Cluster assignments not found: {assignments_path}")
     lf_assign = pl.scan_parquet(assignments_path)
     if "account_identifier" not in lf_assign.collect_schema().names():
         raise ValueError("Cluster assignments file has no 'account_identifier' column")
-    return lf_assign.select(pl.col("account_identifier")).unique()
+    return set(lf_assign.select(pl.col("account_identifier")).unique().collect().to_series().to_list())
 
 
-def _aggregate_one_file(
+def _aggregate_file_chunked(
     path: str,
-    lf_assign: pl.LazyFrame | None,
-) -> pl.LazyFrame:
-    """Scan a single parquet file, apply optional semi-join, and aggregate to hourly."""
-    lf = pl.scan_parquet(path)
-    if lf_assign is not None:
-        lf = lf.join(lf_assign, on="account_identifier", how="semi")
-    return (
-        lf.with_columns(pl.col("datetime").dt.truncate("1h").alias("hour_chicago"))
-        .group_by(_GROUP_KEYS)
-        .agg(pl.col("energy_kwh").sum().alias("kwh_hour"))
-    )
+    account_filter: set[str] | None,
+    tmp_dir: Path,
+    chunk_offset: int,
+    batch_size: int = _BATCH_SIZE,
+) -> int:
+    """Read a parquet file in row batches, aggregate each, write intermediates.
+
+    Returns the number of intermediate chunks written.
+    """
+    pf = pq.ParquetFile(path)
+    n_written = 0
+    for batch in pf.iter_batches(batch_size=batch_size):
+        df = pl.from_arrow(batch)
+        if account_filter is not None:
+            df = df.filter(pl.col("account_identifier").is_in(account_filter))
+        if df.is_empty():
+            continue
+        agg = (
+            df.with_columns(pl.col("datetime").dt.truncate("1h").alias("hour_chicago"))
+            .group_by(_GROUP_KEYS)
+            .agg(pl.col("energy_kwh").sum().alias("kwh_hour"))
+        )
+        agg.write_parquet(tmp_dir / f"chunk_{chunk_offset + n_written:04d}.parquet")
+        n_written += 1
+    return n_written
 
 
 def compute_hourly_loads(
@@ -102,34 +121,40 @@ def compute_hourly_loads(
     # Validate schema from the first file
     _validate_schema(pl.scan_parquet(scan_paths[0]))
 
-    lf_assign: pl.LazyFrame | None = None
+    account_filter: set[str] | None = None
     if assignments_path is not None:
-        lf_assign = _prepare_assignments_lf(assignments_path)
-        logger.info("Restricting to accounts in cluster assignments via semi-join: %s", assignments_path)
+        account_filter = _prepare_account_filter(assignments_path)
+        logger.info(
+            "Restricting to %d accounts from cluster assignments: %s",
+            len(account_filter),
+            assignments_path,
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Fast path: single file — no temp dir needed
-    if len(scan_paths) == 1:
-        logger.info("Aggregating hourly loads (single file)")
-        lf_hourly = _aggregate_one_file(scan_paths[0], lf_assign)
-        if sort_output:
-            lf_hourly = lf_hourly.sort(_GROUP_KEYS)
-        lf_hourly.sink_parquet(output_path)
-        logger.info("Wrote hourly loads to %s", output_path)
-        return
-
-    # Chunked path: aggregate each file independently, then re-aggregate
     tmp_dir = Path(tempfile.mkdtemp(prefix="hourly_loads_"))
     try:
+        chunk_offset = 0
         for i, path in enumerate(scan_paths):
-            logger.info("Aggregating file %d/%d: %s", i + 1, len(scan_paths), path)
-            lf_chunk = _aggregate_one_file(path, lf_assign)
-            lf_chunk.sink_parquet(tmp_dir / f"chunk_{i:04d}.parquet")
+            logger.info("Aggregating file %d/%d in batches: %s", i + 1, len(scan_paths), path)
+            n = _aggregate_file_chunked(path, account_filter, tmp_dir, chunk_offset)
+            logger.info("  -> wrote %d intermediate chunks", n)
+            chunk_offset += n
 
-        # Re-aggregate: same key may span multiple input files
-        logger.info("Re-aggregating %d intermediate chunks", len(scan_paths))
         intermediate_paths = sorted(str(p) for p in tmp_dir.glob("*.parquet"))
+        if not intermediate_paths:
+            logger.warning("No data survived filtering; writing empty output.")
+            pl.DataFrame(
+                schema={
+                    "account_identifier": pl.Utf8,
+                    "zip_code": pl.Utf8,
+                    "hour_chicago": pl.Datetime("us"),
+                    "kwh_hour": pl.Float64,
+                }
+            ).write_parquet(output_path)
+            return
+
+        logger.info("Re-aggregating %d intermediate chunks", len(intermediate_paths))
         lf_merged = pl.scan_parquet(intermediate_paths).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
 
         if sort_output:
