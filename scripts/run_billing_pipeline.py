@@ -47,6 +47,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -100,8 +101,11 @@ def _run_subprocess(cmd: list[str], *, label: str) -> None:
     # Each pipeline step runs as a subprocess so that (a) memory is fully
     # released between steps (Polars/Arrow can be hungry), and (b) a step
     # crash produces a clean exit code without taking down the orchestrator.
+    # Polars must be single-threaded: set POLARS_MAX_THREADS in the subprocess
+    # env so the Rayon thread pool is constrained before any import.
+    env = {**os.environ, "POLARS_MAX_THREADS": "1"}
     logger.info("[%s] Running: %s", label, " ".join(cmd))
-    r = subprocess.run(cmd, check=False)
+    r = subprocess.run(cmd, env=env, check=False)
     if r.returncode != 0:
         raise RuntimeError(f"[{label}] Command failed (exit {r.returncode}): {' '.join(cmd)}")
 

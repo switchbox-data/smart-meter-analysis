@@ -45,6 +45,7 @@ import pyarrow.parquet as pq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+logger.info("Polars thread_pool_size = %d", pl.thread_pool_size())
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
 _INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
@@ -176,9 +177,8 @@ def _merge_aggregate(
         )
         for g in range(n_groups):
             group = paths[g * fan_in : (g + 1) * fan_in]
-            merged = pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).collect()
-            merged.write_parquet(next_dir / f"merged_{g:04d}.parquet")
-            del merged
+            dest = next_dir / f"merged_{g:04d}.parquet"
+            pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).sink_parquet(dest)
             gc.collect()
 
         # Free previous tier (but not the top-level tmp_dir — caller owns that)
@@ -191,7 +191,7 @@ def _merge_aggregate(
     lf = pl.scan_parquet(paths).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
     if sort_output:
         lf = lf.sort(_GROUP_KEYS)
-    lf.collect().write_parquet(output_path)
+    lf.sink_parquet(output_path)
 
 
 def compute_hourly_loads(
