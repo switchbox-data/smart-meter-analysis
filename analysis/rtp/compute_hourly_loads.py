@@ -26,6 +26,13 @@ Output columns:
 
 from __future__ import annotations
 
+import gc
+import os
+
+# Constrain Polars to a single thread so parallel workers don't each
+# allocate full-dataset copies.  Must be set before polars is imported.
+os.environ["POLARS_MAX_THREADS"] = "1"
+
 import argparse
 import glob as _glob
 import logging
@@ -40,7 +47,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
-_BATCH_SIZE = 1_000_000
+_INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
+_BATCH_SIZE = 500_000
 _MERGE_FAN_IN = 16  # max intermediate files per re-aggregation pass
 
 
@@ -70,41 +78,57 @@ def _validate_schema(lf: pl.LazyFrame) -> None:
         raise ValueError(f"Input file missing required columns: {sorted(missing)}")
 
 
-def _prepare_account_filter(assignments_path: Path) -> set[str]:
-    """Load cluster assignments and return the set of account identifiers."""
+def _prepare_account_filter(assignments_path: Path) -> pl.Series:
+    """Load cluster assignments and return account identifiers as a Series.
+
+    Returning a pl.Series (rather than a Python set) lets Polars perform
+    ``is_in`` filtering natively without repeated Python→Rust conversion.
+    """
     if not assignments_path.exists():
         raise FileNotFoundError(f"Cluster assignments not found: {assignments_path}")
     lf_assign = pl.scan_parquet(assignments_path)
     if "account_identifier" not in lf_assign.collect_schema().names():
         raise ValueError("Cluster assignments file has no 'account_identifier' column")
-    return set(lf_assign.select(pl.col("account_identifier")).unique().collect().to_series().to_list())
+    return lf_assign.select(pl.col("account_identifier")).unique().collect().to_series()
 
 
 def _aggregate_file_chunked(
     path: str,
-    account_filter: set[str] | None,
+    account_filter: pl.Series | None,
     tmp_dir: Path,
     chunk_offset: int,
     batch_size: int = _BATCH_SIZE,
 ) -> int:
     """Read a parquet file in row batches, aggregate each, write intermediates.
 
+    Only the four required columns are read from disk (_INPUT_COLS) so extra
+    columns in the source file never touch memory.
+
     Returns the number of intermediate chunks written.
     """
     pf = pq.ParquetFile(path)
     n_written = 0
-    for batch in pf.iter_batches(batch_size=batch_size):
+    for batch in pf.iter_batches(batch_size=batch_size, columns=_INPUT_COLS):
         df = pl.from_arrow(batch)
         if account_filter is not None:
-            df = df.filter(pl.col("account_identifier").is_in(account_filter))
+            df = df.filter(pl.col("account_identifier").is_in(account_filter.implode()))
         if df.is_empty():
+            del df
             continue
         agg = (
-            df.with_columns(pl.col("datetime").dt.truncate("1h").alias("hour_chicago"))
+            df.select(
+                pl.col("account_identifier"),
+                pl.col("zip_code"),
+                pl.col("datetime").dt.truncate("1h").alias("hour_chicago"),
+                pl.col("energy_kwh"),
+            )
             .group_by(_GROUP_KEYS)
             .agg(pl.col("energy_kwh").sum().alias("kwh_hour"))
         )
+        del df
         agg.write_parquet(tmp_dir / f"chunk_{chunk_offset + n_written:04d}.parquet")
+        del agg
+        gc.collect()
         n_written += 1
     return n_written
 
@@ -154,6 +178,8 @@ def _merge_aggregate(
             group = paths[g * fan_in : (g + 1) * fan_in]
             merged = pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).collect()
             merged.write_parquet(next_dir / f"merged_{g:04d}.parquet")
+            del merged
+            gc.collect()
 
         # Free previous tier (but not the top-level tmp_dir — caller owns that)
         if current_dir != tmp_dir:
@@ -181,7 +207,7 @@ def compute_hourly_loads(
     # Validate schema from the first file
     _validate_schema(pl.scan_parquet(scan_paths[0]))
 
-    account_filter: set[str] | None = None
+    account_filter: pl.Series | None = None
     if assignments_path is not None:
         account_filter = _prepare_account_filter(assignments_path)
         logger.info(
