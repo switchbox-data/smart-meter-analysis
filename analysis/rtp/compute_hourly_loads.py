@@ -49,8 +49,8 @@ logger.info("Polars thread_pool_size = %d", pl.thread_pool_size())
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
 _INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
-_BATCH_SIZE = 500_000
-_MERGE_FAN_IN = 16  # max intermediate files per re-aggregation pass
+_BATCH_SIZE = 100_000
+_MERGE_FAN_IN = 8  # max intermediate files per re-aggregation pass
 
 
 def _resolve_parquet_paths(input_path: Path) -> list[str]:
