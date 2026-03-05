@@ -40,8 +40,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
-_BATCH_SIZE = 5_000_000
-_MERGE_FAN_IN = 64  # max intermediate files per re-aggregation pass
+_BATCH_SIZE = 1_000_000
+_MERGE_FAN_IN = 16  # max intermediate files per re-aggregation pass
 
 
 def _resolve_parquet_paths(input_path: Path) -> list[str]:
