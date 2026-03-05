@@ -411,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
 
         # Resolve input path
         input_path = resolve_path(args.interval_pattern, ym)
-        if not input_path.exists():
+        input_str = str(input_path)
+        is_glob = any(ch in input_str for ch in ["*", "?", "["])
+        if not is_glob and not input_path.exists():
             logger.error("Interval data not found for %s: %s", ym, input_path)
             return 1
 
