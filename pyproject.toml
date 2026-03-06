@@ -46,6 +46,7 @@ Documentation = "https://switchbox-data.github.io/smart-meter-analysis/"
 exclude = ["archive", ".venv", "tests"]
 
 [tool.deptry.per_rule_ignores]
+DEP001 = ["compact_month_output", "build_tariff_hourly_prices"]
 DEP002 = [
   "ipykernel",
   "cenpy",
@@ -58,8 +59,9 @@ DEP002 = [
   "memory-profiler",
   "snakeviz",
   "tslearn",
+  "selenium",
 ]
-DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy"]
+DEP003 = ["botocore", "analysis", "smart_meter_analysis", "pandas", "scipy", "geopandas"]
 DEP004 = ["botocore"]
 
 [dependency-groups]

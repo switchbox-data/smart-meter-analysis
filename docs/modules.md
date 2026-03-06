@@ -1,1 +1,1 @@
-::: smart_meter_analysis.foo
+::: smart_meter_analysis
