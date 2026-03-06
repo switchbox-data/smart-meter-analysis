@@ -168,28 +168,12 @@ def _scatter_to_shards(
 
 
 def _aggregate_shard(shard_path: Path, agg_path: Path) -> int:
-    """Dict-aggregate a single shard file and write the result. Returns key count."""
-    from collections import defaultdict
-
-    accum: dict[tuple, float] = defaultdict(float)
-    for batch in pq.ParquetFile(str(shard_path)).iter_batches(batch_size=50_000):
-        a = batch.column("account_identifier").to_pylist()
-        z = batch.column("zip_code").to_pylist()
-        h = batch.column("hour_chicago").to_pylist()
-        v = batch.column("kwh_hour").to_pylist()
-        for i in range(len(a)):
-            accum[(a[i], z[i], h[i])] += v[i]
-
-    keys = list(accum.keys())
-    out_tbl = pa.table({
-        "account_identifier": pa.array([k[0] for k in keys], type=pa.string()),
-        "zip_code": pa.array([k[1] for k in keys], type=pa.string()),
-        "hour_chicago": pa.array([k[2] for k in keys], type=pa.timestamp("us")),
-        "kwh_hour": pa.array([accum[k] for k in keys], type=pa.float64()),
-    })
-    pq.write_table(out_tbl, agg_path)
-    n_keys = len(keys)
-    del accum, keys, out_tbl
+    """Aggregate a single shard file via Polars group_by. Returns unique key count."""
+    df = pl.read_parquet(shard_path)
+    agg = df.group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
+    agg.write_parquet(agg_path)
+    n_keys = agg.height
+    del df, agg
     gc.collect()
     return n_keys
 

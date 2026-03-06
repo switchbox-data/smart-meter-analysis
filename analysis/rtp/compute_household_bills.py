@@ -50,10 +50,14 @@ Output schema per household:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
+import shutil
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logging.basicConfig(
     level=logging.INFO,
@@ -290,6 +294,38 @@ def summarize_results(df: pl.DataFrame) -> None:
     print("=" * 70)
 
 
+_BILL_SHARDS = 16
+
+
+def _scatter_loads_to_shards(
+    loads_path: Path,
+    shard_dir: Path,
+    n_shards: int,
+) -> list[Path]:
+    """Hash-partition hourly loads by account_identifier into shard files."""
+    from collections import defaultdict
+
+    writers: dict[int, pq.ParquetWriter] = {}
+    pf = pq.ParquetFile(str(loads_path))
+    for batch in pf.iter_batches(batch_size=50_000):
+        tbl = pa.Table.from_batches([batch])
+        accts = tbl.column("account_identifier").to_pylist()
+        buckets: dict[int, list[int]] = defaultdict(list)
+        for i, a in enumerate(accts):
+            buckets[hash(a) % n_shards].append(i)
+        for sid, indices in buckets.items():
+            sub = tbl.take(indices)
+            if sid not in writers:
+                writers[sid] = pq.ParquetWriter(
+                    str(shard_dir / f"shard_{sid:03d}.parquet"),
+                    sub.schema,
+                )
+            writers[sid].write_table(sub)
+    for w in writers.values():
+        w.close()
+    return sorted(shard_dir / f"shard_{sid:03d}.parquet" for sid in writers)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compute monthly household bills comparing two hourly tariffs.",
@@ -335,24 +371,61 @@ def main() -> int:
 
     logger.info("Starting household bill computation...")
 
-    hourly_loads = load_hourly_loads(args.hourly_loads)
+    if not args.hourly_loads.exists():
+        raise FileNotFoundError(f"Hourly loads file not found: {args.hourly_loads}")
+
+    # Validate schema without loading data into memory
+    schema = pq.read_schema(str(args.hourly_loads))
+    required = {"account_identifier", "hour_chicago", "kwh_hour"}
+    missing = required - set(schema.names)
+    if missing:
+        raise ValueError(f"Hourly loads missing required columns: {sorted(missing)}")
+
     prices_a = load_tariff_prices(args.tariff_prices_a, "A")
     prices_b = load_tariff_prices(args.tariff_prices_b, "B")
 
-    bills = compute_household_bills(
-        hourly_loads,
-        prices_a,
-        prices_b,
-        capacity_rate_dollars_per_kw_month=args.capacity_rate_dollars_per_kw_month,
-        admin_fee_dollars=args.admin_fee_dollars,
-    )
-
-    summarize_results(bills)
-
-    # Save output
+    # Shard hourly loads by account hash so the full file is never in memory
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    bills.write_parquet(args.output)
-    logger.info(f"Wrote household bills to {args.output}")
+    shard_dir = args.output.parent / "_shards"
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+    shard_dir.mkdir(parents=True)
+
+    try:
+        logger.info("Scattering hourly loads into %d shards...", _BILL_SHARDS)
+        shard_paths = _scatter_loads_to_shards(args.hourly_loads, shard_dir, _BILL_SHARDS)
+        logger.info("Scattered into %d shard files", len(shard_paths))
+
+        bill_parts: list[Path] = []
+        for i, sp in enumerate(shard_paths):
+            logger.info("Computing bills for shard %d/%d: %s", i + 1, len(shard_paths), sp.name)
+            shard_loads = pl.read_parquet(sp)
+
+            shard_bills = compute_household_bills(
+                shard_loads,
+                prices_a,
+                prices_b,
+                capacity_rate_dollars_per_kw_month=args.capacity_rate_dollars_per_kw_month,
+                admin_fee_dollars=args.admin_fee_dollars,
+            )
+
+            part_path = shard_dir / f"bills_{i:03d}.parquet"
+            shard_bills.write_parquet(part_path)
+            bill_parts.append(part_path)
+            logger.info("  shard %d: %d households", i + 1, shard_bills.height)
+            del shard_loads, shard_bills
+            gc.collect()
+
+        # Concat shard results (small: one row per household)
+        logger.info("Concatenating %d shard bill files...", len(bill_parts))
+        bills = pl.concat([pl.read_parquet(p) for p in bill_parts], how="vertical")
+
+        summarize_results(bills)
+
+        bills.write_parquet(args.output)
+        logger.info(f"Wrote household bills to {args.output}")
+    finally:
+        shutil.rmtree(shard_dir, ignore_errors=True)
 
     return 0
 
