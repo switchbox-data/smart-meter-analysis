@@ -20,7 +20,7 @@ seasons:
       - period: midday_peak
         start_hour: 13
         end_hour: 19
-        price: 18.219
+        price: 4.787
       - period: evening
         start_hour: 19
         end_hour: 21
@@ -43,7 +43,7 @@ seasons:
       - period: midday_peak
         start_hour: 13
         end_hour: 19
-        price: 16.814
+        price: 3.383
       - period: evening
         start_hour: 19
         end_hour: 21

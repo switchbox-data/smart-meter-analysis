@@ -14,12 +14,14 @@ iter_batches() so peak memory is O(batch_size), not O(file).
 Expected input columns (from processed interval parquet):
   - account_identifier
   - zip_code
+  - delivery_service_class
   - datetime       (naive local time, Datetime[us], tz=None)
   - energy_kwh
 
 Output columns:
   - account_identifier
   - zip_code
+  - delivery_service_class
   - hour_chicago   (datetime truncated to hour)
   - kwh_hour       (sum of energy_kwh within that hour)
 """
@@ -48,8 +50,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.info("Polars thread_pool_size = %d", pl.thread_pool_size())
 
-_GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
-_INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
+_GROUP_KEYS = ["account_identifier", "zip_code", "delivery_service_class", "hour_chicago"]
+_INPUT_COLS = ["account_identifier", "zip_code", "delivery_service_class", "datetime", "energy_kwh"]
 _BATCH_SIZE = 100_000
 _MERGE_FAN_IN = 8  # max intermediate files per re-aggregation pass
 _MERGE_SHARDS = 16  # hash partitions for final dict merge
@@ -75,7 +77,7 @@ def _resolve_parquet_paths(input_path: Path) -> list[str]:
 
 def _validate_schema(lf: pl.LazyFrame) -> None:
     """Raise ValueError if required columns are missing."""
-    required = {"account_identifier", "zip_code", "datetime", "energy_kwh"}
+    required = {"account_identifier", "zip_code", "delivery_service_class", "datetime", "energy_kwh"}
     missing = required - set(lf.collect_schema().names())
     if missing:
         raise ValueError(f"Input file missing required columns: {sorted(missing)}")
@@ -122,6 +124,7 @@ def _aggregate_file_chunked(
             df.select(
                 pl.col("account_identifier"),
                 pl.col("zip_code"),
+                pl.col("delivery_service_class"),
                 pl.col("datetime").dt.truncate("1h").alias("hour_chicago"),
                 pl.col("energy_kwh"),
             )
@@ -250,6 +253,7 @@ def _merge_aggregate(
             schema={
                 "account_identifier": pl.Utf8,
                 "zip_code": pl.Utf8,
+                "delivery_service_class": pl.Utf8,
                 "hour_chicago": pl.Datetime("us"),
                 "kwh_hour": pl.Float64,
             }
