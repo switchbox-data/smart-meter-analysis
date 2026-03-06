@@ -4,6 +4,7 @@ import datetime as dt
 
 import polars as pl
 import pytest
+
 from smart_meter_analysis.wide_to_long import transform_wide_to_long_lf
 
 

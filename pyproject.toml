@@ -143,11 +143,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "smart_meter_analysis/census.py" = ["C901"]
 "tests/test_aws_transform.py" = ["E402"]
 "tests/test_census.py" = ["E402"]
-"scripts/data_collection/*" = ["C901"]
-"analysis/clustering/clustering_validation.py" = ["C901", "F841", "RUF015"]
 "analysis/clustering/stage2_logratio_regression.py" = ["C901"]
-"analysis/clustering/stage2_multinomial.py" = ["C901"]
-"tests/validate_total_comed_pipeline.py" = ["C901", "S603", "RUF001"]
 "scripts/testing/generate_sample_data.py" = ["UP035", "UP006", "UP007", "S311"]
 # S603/S607: subprocess calls with variable args are inherent to the
 # orchestrator design (each pipeline step runs as a child process).
@@ -156,7 +152,6 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "scripts/csv_to_parquet/migrate_month_runner.py" = ["C901"]
 "scripts/csv_to_parquet/compact_month_output.py" = ["C901", "S603", "S607"]
 "scripts/csv_to_parquet/restructure_for_export.py" = ["C901", "S603", "S607"]
-"scripts/validate_wide_to_long_batched.py" = []
 "tests/*" = ["S101", "S603", "RUF001"]
 
 
