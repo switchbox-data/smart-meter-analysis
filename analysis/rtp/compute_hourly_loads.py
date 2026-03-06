@@ -52,6 +52,7 @@ _GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
 _INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
 _BATCH_SIZE = 100_000
 _MERGE_FAN_IN = 8  # max intermediate files per re-aggregation pass
+_MERGE_SHARDS = 16  # hash partitions for final dict merge
 
 
 def _resolve_parquet_paths(input_path: Path) -> list[str]:
@@ -135,6 +136,114 @@ def _aggregate_file_chunked(
     return n_written
 
 
+def _scatter_to_shards(
+    paths: list[str],
+    shard_dir: Path,
+    n_shards: int,
+) -> dict[int, pq.ParquetWriter]:
+    """Read input files and partition rows into per-shard parquet files."""
+    from collections import defaultdict
+
+    cols = [*_GROUP_KEYS, "kwh_hour"]
+    writers: dict[int, pq.ParquetWriter] = {}
+    for p in paths:
+        pf = pq.ParquetFile(p)
+        for batch in pf.iter_batches(batch_size=50_000, columns=cols):
+            tbl = pa.Table.from_batches([batch])
+            accts = tbl.column("account_identifier").to_pylist()
+            buckets: dict[int, list[int]] = defaultdict(list)
+            for i, a in enumerate(accts):
+                buckets[hash(a) % n_shards].append(i)
+            for sid, indices in buckets.items():
+                sub = tbl.take(indices)
+                if sid not in writers:
+                    writers[sid] = pq.ParquetWriter(
+                        str(shard_dir / f"shard_{sid:03d}.parquet"),
+                        sub.schema,
+                    )
+                writers[sid].write_table(sub)
+    for w in writers.values():
+        w.close()
+    return writers
+
+
+def _aggregate_shard(shard_path: Path, agg_path: Path) -> int:
+    """Dict-aggregate a single shard file and write the result. Returns key count."""
+    from collections import defaultdict
+
+    accum: dict[tuple, float] = defaultdict(float)
+    for batch in pq.ParquetFile(str(shard_path)).iter_batches(batch_size=50_000):
+        a = batch.column("account_identifier").to_pylist()
+        z = batch.column("zip_code").to_pylist()
+        h = batch.column("hour_chicago").to_pylist()
+        v = batch.column("kwh_hour").to_pylist()
+        for i in range(len(a)):
+            accum[(a[i], z[i], h[i])] += v[i]
+
+    keys = list(accum.keys())
+    out_tbl = pa.table({
+        "account_identifier": pa.array([k[0] for k in keys], type=pa.string()),
+        "zip_code": pa.array([k[1] for k in keys], type=pa.string()),
+        "hour_chicago": pa.array([k[2] for k in keys], type=pa.timestamp("us")),
+        "kwh_hour": pa.array([accum[k] for k in keys], type=pa.float64()),
+    })
+    pq.write_table(out_tbl, agg_path)
+    n_keys = len(keys)
+    del accum, keys, out_tbl
+    gc.collect()
+    return n_keys
+
+
+def _dict_merge_sharded(
+    paths: list[str],
+    output_path: Path,
+    *,
+    sort_output: bool,
+    n_shards: int = _MERGE_SHARDS,
+) -> None:
+    """Merge intermediate parquets via sharded dict accumulation.
+
+    Partitions rows by ``hash(account_identifier) % n_shards`` into temp
+    shard files, then dict-aggregates each shard independently.  Peak memory
+    is ``O(unique_keys / n_shards)`` instead of ``O(unique_keys)``.
+    """
+    shard_dir = Path(tempfile.mkdtemp(prefix="merge_shards_"))
+
+    try:
+        logger.info(
+            "Sharded dict merge: scattering %d files into %d shards",
+            len(paths),
+            n_shards,
+        )
+        writers = _scatter_to_shards(paths, shard_dir, n_shards)
+
+        agg_parts: list[str] = []
+        for sid in sorted(writers):
+            shard_path = shard_dir / f"shard_{sid:03d}.parquet"
+            agg_path = shard_dir / f"agg_{sid:03d}.parquet"
+            n_keys = _aggregate_shard(shard_path, agg_path)
+            agg_parts.append(str(agg_path))
+            logger.info("  shard %d: %d unique keys", sid, n_keys)
+
+        if not agg_parts:
+            pl.DataFrame(
+                schema={
+                    "account_identifier": pl.Utf8,
+                    "zip_code": pl.Utf8,
+                    "hour_chicago": pl.Datetime("us"),
+                    "kwh_hour": pl.Float64,
+                }
+            ).write_parquet(output_path)
+            return
+
+        lf = pl.scan_parquet(agg_parts)
+        if sort_output:
+            lf = lf.sort(_GROUP_KEYS)
+        lf.sink_parquet(output_path)
+    finally:
+        shutil.rmtree(shard_dir, ignore_errors=True)
+
+
 def _merge_aggregate(
     tmp_dir: Path,
     output_path: Path,
@@ -188,38 +297,11 @@ def _merge_aggregate(
         current_dir = next_dir
         paths = sorted(str(p) for p in current_dir.glob("*.parquet"))
 
-    # Dict-based merge avoids Polars OOM on the final pass: PyArrow
-    # iter_batches feeds a plain defaultdict(float), keeping peak memory
-    # proportional to the number of unique keys rather than Polars' internal
-    # hash-table overhead.
-    logger.info("Using dict-based merge for final pass (%d files)", len(paths))
-    from collections import defaultdict
-
-    accum: dict[tuple, float] = defaultdict(float)
-    for p in paths:
-        pf = pq.ParquetFile(p)
-        for batch in pf.iter_batches(batch_size=50_000, columns=[*_GROUP_KEYS, "kwh_hour"]):
-            acct = batch.column("account_identifier").to_pylist()
-            zips = batch.column("zip_code").to_pylist()
-            hours = batch.column("hour_chicago").to_pylist()
-            kwh = batch.column("kwh_hour").to_pylist()
-            for i in range(len(acct)):
-                accum[(acct[i], zips[i], hours[i])] += kwh[i]
-
-    keys = list(accum.keys())
-    table = pa.table({
-        "account_identifier": pa.array([k[0] for k in keys], type=pa.string()),
-        "zip_code": pa.array([k[1] for k in keys], type=pa.string()),
-        "hour_chicago": pa.array([k[2] for k in keys], type=pa.timestamp("us")),
-        "kwh_hour": pa.array([accum[k] for k in keys], type=pa.float64()),
-    })
-    if sort_output:
-        table = table.sort_by([
-            ("account_identifier", "ascending"),
-            ("zip_code", "ascending"),
-            ("hour_chicago", "ascending"),
-        ])
-    pq.write_table(table, output_path)
+    # Sharded dict merge: partition rows by hash(account_identifier) into
+    # N shards, then dict-aggregate each shard independently.  Peak memory
+    # is O(unique_keys / N) instead of O(unique_keys), which avoids OOM
+    # when the hourly-grain key space is large (e.g. 328K accounts x 720h).
+    _dict_merge_sharded(paths, output_path, sort_output=sort_output)
 
 
 def compute_hourly_loads(
