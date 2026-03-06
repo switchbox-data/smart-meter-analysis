@@ -172,7 +172,7 @@ def _scatter_to_shards(
 
 def _aggregate_shard(shard_path: Path, agg_path: Path) -> int:
     """Aggregate a single shard file via Polars group_by. Returns unique key count."""
-    df = pl.read_parquet(shard_path)
+    df = pl.read_parquet(shard_path).cast({"delivery_service_class": pl.Categorical})
     agg = df.group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
     agg.write_parquet(agg_path)
     n_keys = agg.height
@@ -217,13 +217,14 @@ def _dict_merge_sharded(
                 schema={
                     "account_identifier": pl.Utf8,
                     "zip_code": pl.Utf8,
+                    "delivery_service_class": pl.Categorical,
                     "hour_chicago": pl.Datetime("us"),
                     "kwh_hour": pl.Float64,
                 }
             ).write_parquet(output_path)
             return
 
-        lf = pl.scan_parquet(agg_parts)
+        lf = pl.scan_parquet(agg_parts).cast({"delivery_service_class": pl.Categorical})
         if sort_output:
             lf = lf.sort(_GROUP_KEYS)
         lf.sink_parquet(output_path)
@@ -253,7 +254,7 @@ def _merge_aggregate(
             schema={
                 "account_identifier": pl.Utf8,
                 "zip_code": pl.Utf8,
-                "delivery_service_class": pl.Utf8,
+                "delivery_service_class": pl.Categorical,
                 "hour_chicago": pl.Datetime("us"),
                 "kwh_hour": pl.Float64,
             }
@@ -276,7 +277,9 @@ def _merge_aggregate(
         for g in range(n_groups):
             group = paths[g * fan_in : (g + 1) * fan_in]
             dest = next_dir / f"merged_{g:04d}.parquet"
-            pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).sink_parquet(dest)
+            pl.scan_parquet(group).cast({"delivery_service_class": pl.Categorical}).group_by(_GROUP_KEYS).agg(
+                pl.col("kwh_hour").sum()
+            ).sink_parquet(dest)
             gc.collect()
 
         # Free previous tier (but not the top-level tmp_dir — caller owns that)
