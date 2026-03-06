@@ -33,7 +33,6 @@ def _make_loads(
     hours: list[dt.datetime],
     kwh_per_hour: float = 1.0,
     zip_code: str = "60601-1234",
-    delivery_service_class: str = "RESIDENTIAL",
 ) -> pl.DataFrame:
     """Build a minimal hourly loads DataFrame."""
     rows = []
@@ -42,7 +41,6 @@ def _make_loads(
             rows.append({
                 "account_identifier": acct,
                 "zip_code": zip_code,
-                "delivery_service_class": delivery_service_class,
                 "hour_chicago": h,
                 "kwh_hour": kwh_per_hour,
             })
@@ -140,21 +138,18 @@ class TestBillArithmetic:
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[0],
                 "kwh_hour": 1.0,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[1],
                 "kwh_hour": 5.0,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[2],
                 "kwh_hour": 2.0,
             },
@@ -241,21 +236,18 @@ class TestCapacityAndAdminFee:
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[0],
                 "kwh_hour": 5.0,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[1],
                 "kwh_hour": 2.0,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": hrs[2],
                 "kwh_hour": 1.0,
             },
@@ -334,7 +326,6 @@ class TestMultipleAccounts:
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": h,
                 "kwh_hour": 1.0,
             }
@@ -344,7 +335,6 @@ class TestMultipleAccounts:
             {
                 "account_identifier": "A002",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "hour_chicago": h,
                 "kwh_hour": 3.0,
             }
@@ -423,7 +413,6 @@ class TestOutputSchema:
     REQUIRED_COLS: ClassVar[set[str]] = {
         "account_identifier",
         "zip_code",
-        "delivery_service_class",
         "total_kwh",
         "bill_a_dollars",
         "bill_b_dollars",

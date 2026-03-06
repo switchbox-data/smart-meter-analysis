@@ -25,7 +25,6 @@ def _make_interval_df(
     *,
     kwh_per_interval: float = 0.5,
     zip_code: str = "60601-1234",
-    delivery_service_class: str = "RESIDENTIAL",
 ) -> pl.DataFrame:
     """Build a minimal 30-minute interval DataFrame for testing."""
     rows = []
@@ -35,7 +34,6 @@ def _make_interval_df(
             rows.append({
                 "account_identifier": acct,
                 "zip_code": zip_code,
-                "delivery_service_class": delivery_service_class,
                 "datetime": ts,
                 "energy_kwh": kwh_per_interval,
             })
@@ -197,28 +195,24 @@ class TestDSTFallback:
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "datetime": ts_01_00,
                 "energy_kwh": 0.5,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "datetime": ts_01_30,
                 "energy_kwh": 0.5,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "datetime": ts_01_00,
                 "energy_kwh": 0.5,
             },
             {
                 "account_identifier": "A001",
                 "zip_code": "60601-0001",
-                "delivery_service_class": "RESIDENTIAL",
                 "datetime": ts_01_30,
                 "energy_kwh": 0.5,
             },
@@ -302,7 +296,6 @@ class TestChunkedMultiFile:
         row_a = {
             "account_identifier": "A001",
             "zip_code": "60601-1234",
-            "delivery_service_class": "RESIDENTIAL",
             "datetime": ts,
             "energy_kwh": 0.3,
         }

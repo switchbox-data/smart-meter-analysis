@@ -34,7 +34,6 @@ This script:
 Output schema per household:
   - account_identifier      (str)
   - zip_code                (str, if present in loads)
-  - delivery_service_class  (str, if present in loads)
   - total_kwh               (float)
   - bill_a_dollars          (float, baseline tariff energy cost)
   - bill_b_dollars          (float, alternative tariff energy cost)
@@ -190,12 +189,10 @@ def compute_household_bills(
         (pl.col("bill_a_cents") - pl.col("bill_b_cents")).alias("bill_diff_cents"),
     )
 
-    # Grouping keys: always by account, include zip_code and delivery_service_class if present
+    # Grouping keys: always by account, include zip_code if present
     group_cols: list[str] = ["account_identifier"]
     if "zip_code" in joined.columns:
         group_cols.append("zip_code")
-    if "delivery_service_class" in joined.columns:
-        group_cols.append("delivery_service_class")
 
     logger.info("Aggregating to monthly bills per household...")
 

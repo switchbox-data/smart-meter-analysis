@@ -14,14 +14,12 @@ iter_batches() so peak memory is O(batch_size), not O(file).
 Expected input columns (from processed interval parquet):
   - account_identifier
   - zip_code
-  - delivery_service_class
   - datetime       (naive local time, Datetime[us], tz=None)
   - energy_kwh
 
 Output columns:
   - account_identifier
   - zip_code
-  - delivery_service_class
   - hour_chicago   (datetime truncated to hour)
   - kwh_hour       (sum of energy_kwh within that hour)
 """
@@ -50,8 +48,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.info("Polars thread_pool_size = %d", pl.thread_pool_size())
 
-_GROUP_KEYS = ["account_identifier", "zip_code", "delivery_service_class", "hour_chicago"]
-_INPUT_COLS = ["account_identifier", "zip_code", "delivery_service_class", "datetime", "energy_kwh"]
+_GROUP_KEYS = ["account_identifier", "zip_code", "hour_chicago"]
+_INPUT_COLS = ["account_identifier", "zip_code", "datetime", "energy_kwh"]
 _BATCH_SIZE = 100_000
 _MERGE_FAN_IN = 8  # max intermediate files per re-aggregation pass
 _MERGE_SHARDS = 16  # hash partitions for final dict merge
@@ -77,7 +75,7 @@ def _resolve_parquet_paths(input_path: Path) -> list[str]:
 
 def _validate_schema(lf: pl.LazyFrame) -> None:
     """Raise ValueError if required columns are missing."""
-    required = {"account_identifier", "zip_code", "delivery_service_class", "datetime", "energy_kwh"}
+    required = {"account_identifier", "zip_code", "datetime", "energy_kwh"}
     missing = required - set(lf.collect_schema().names())
     if missing:
         raise ValueError(f"Input file missing required columns: {sorted(missing)}")
@@ -124,7 +122,6 @@ def _aggregate_file_chunked(
             df.select(
                 pl.col("account_identifier"),
                 pl.col("zip_code"),
-                pl.col("delivery_service_class"),
                 pl.col("datetime").dt.truncate("1h").alias("hour_chicago"),
                 pl.col("energy_kwh"),
             )
@@ -172,7 +169,7 @@ def _scatter_to_shards(
 
 def _aggregate_shard(shard_path: Path, agg_path: Path) -> int:
     """Aggregate a single shard file via Polars group_by. Returns unique key count."""
-    df = pl.read_parquet(shard_path).cast({"delivery_service_class": pl.Categorical})
+    df = pl.read_parquet(shard_path)
     agg = df.group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
     agg.write_parquet(agg_path)
     n_keys = agg.height
@@ -217,14 +214,13 @@ def _dict_merge_sharded(
                 schema={
                     "account_identifier": pl.Utf8,
                     "zip_code": pl.Utf8,
-                    "delivery_service_class": pl.Categorical,
                     "hour_chicago": pl.Datetime("us"),
                     "kwh_hour": pl.Float64,
                 }
             ).write_parquet(output_path)
             return
 
-        lf = pl.scan_parquet(agg_parts).cast({"delivery_service_class": pl.Categorical})
+        lf = pl.scan_parquet(agg_parts)
         if sort_output:
             lf = lf.sort(_GROUP_KEYS)
         lf.sink_parquet(output_path)
@@ -254,7 +250,6 @@ def _merge_aggregate(
             schema={
                 "account_identifier": pl.Utf8,
                 "zip_code": pl.Utf8,
-                "delivery_service_class": pl.Categorical,
                 "hour_chicago": pl.Datetime("us"),
                 "kwh_hour": pl.Float64,
             }
@@ -277,9 +272,7 @@ def _merge_aggregate(
         for g in range(n_groups):
             group = paths[g * fan_in : (g + 1) * fan_in]
             dest = next_dir / f"merged_{g:04d}.parquet"
-            pl.scan_parquet(group).cast({"delivery_service_class": pl.Categorical}).group_by(_GROUP_KEYS).agg(
-                pl.col("kwh_hour").sum()
-            ).sink_parquet(dest)
+            pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).sink_parquet(dest)
             gc.collect()
 
         # Free previous tier (but not the top-level tmp_dir — caller owns that)
