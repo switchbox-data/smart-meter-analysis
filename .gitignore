@@ -170,6 +170,7 @@ archive/
 
 # generated artifacts
 out/
+output/
 results/
 
 # benchmark artificats
