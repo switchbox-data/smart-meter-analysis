@@ -1,0 +1,388 @@
+---
+title: "Do time-of-use electric rates help or hurt Chicago households?"
+subtitle: "A pricing simulation of ComEd's time-of-use rate structures"
+date: 2026-XX-XX
+author:
+  - name: Switchbox
+    email: info@switch.box
+    affiliations:
+      - Switchbox
+
+keywords: [time-of-use rates, ComEd, rate equity, smart meter data, DTOU, Rate BEST]
+
+bibliography: ../references.bib
+license: "CC BY-NC"
+
+toc: true
+notebook-links: false
+reference-location: margin
+fig-cap: true
+fig-cap-location: margin
+tbl-cap-location: margin
+
+appendix-style: default
+citation-location: document
+citation:
+  container-title: Switchbox
+
+# Uncomment when PDF is ready:
+#other-links:
+#  - text: PDF
+#    icon: file-earmark-pdf
+#    href: switchbox_comed_tou.pdf
+---
+
+```{r}
+#| echo: false
+#| message: false
+
+load(file = "cache/report_variables.RData")
+```
+
+<!-- ============================================================
+     WRITER NOTES
+     - All statistics MUST use inline R code: `r var |> scales::dollar()` etc.
+     - Never hardcode a number in prose.
+     - Use "would" for all modeled outcomes. Never "will."
+     - State the finding BEFORE pointing to the figure.
+     - Place footnote definitions immediately after the paragraph
+       where they are first invoked.
+     - Use :::{.column-page-inset-right} for all embedded figures.
+     - Use :::{.column-margin} for key term definitions.
+     - Bold key statistics in findings.
+     - Use @citation_key for all references (rendered in margin).
+     ============================================================ -->
+
+
+## Introduction
+
+<!-- WRITER: 1–2 short paragraphs. Frame the policy context:
+     - ComEd serves ~3.5M customers in northern Illinois.
+     - TOU rates are part of the regulatory conversation.
+     - The equity question is central: who wins, who loses?
+     - State what this memo does: uses smart meter data from ~328K ComEd
+       households to simulate bill impacts under alternative rate structures
+       in January and July 2023.
+     - End with the questions this memo answers.
+
+     Suggested framing sentence:
+     "This memo examines whether moving ComEd households to time-of-use
+      electric rates would help or hurt lower-income communities."
+
+     Questions to answer:
+     1. How would households' bills change under time-of-use rates?
+     2. Would lower-income households bear a disproportionate burden?
+     3. Does the answer depend on the season — or on the rate design itself?
+-->
+
+
+## Executive Summary
+
+<!-- WRITER: One framing sentence, then bulleted findings.
+     Bold-stat-first pattern. Each bullet must be specific and quantified.
+
+     Suggested structure (populate with inline R vars once analysis is final):
+-->
+
+<!-- WRITER: Framing sentence here, referencing the policy context. -->
+
+- <!-- DTOU headline: e.g. "Under DTOU, the median household would see
+     a bill change of **`r dtou_median_pct_change`%** — [interpretation]." -->
+
+- <!-- Rate BEST winter headline: e.g. "Under Rate BEST in January,
+     **`r best_jan_pct_save`%** of households would see lower bills..." -->
+
+- <!-- Rate BEST summer headline -->
+
+- <!-- Equity headline: e.g. "Rate BEST savings in winter tilt toward
+     higher-income areas..." -->
+
+- <!-- Overall takeaway -->
+
+<!-- [PLACEHOLDER: CUB proposal bullet — TBD] -->
+
+
+## Background: How electricity bills work
+
+<!-- WRITER: This section does the heavy lifting for the non-expert reader.
+     ~1 page. Walk through each concept below. Use Switchbox conventions:
+     - "poles and wires" for T&D infrastructure
+     - "In other words" restatements after technical points
+     - Margin definitions for key terms
+     - Footnotes for technical depth (e.g., ICC docket numbers)
+-->
+
+<!-- CONCEPT 1: The two-part bill -->
+
+:::{.column-margin}
+**Supply** is the cost of the electricity itself — the cost of generating power. **Delivery** is the cost of the "poles and wires" that transport that electricity to your home.
+:::
+
+<!-- WRITER: Explain that an electricity bill has two main components:
+     supply (generation) and delivery (transmission + distribution).
+     Use the "poles and wires" plain-English convention.
+     "In other words, you pay for the electricity itself,
+      and you pay separately to have it delivered to your home." -->
+
+
+<!-- CONCEPT 2: What a flat rate means -->
+
+<!-- WRITER: Same price per kWh regardless of when you use electricity.
+     Currently the default for most ComEd residential customers.
+     Simple, predictable — but it doesn't reflect the fact that
+     electricity costs more to generate and deliver at certain times. -->
+
+
+<!-- CONCEPT 3: What DTOU does -->
+
+:::{.column-margin}
+**DTOU** stands for Delivery Time-of-Use. It varies only the delivery charge by time of day. The supply charge stays flat.
+:::
+
+<!-- WRITER: Explain DTOU. Only the delivery side of the bill changes.
+     Supply stays flat. Describe the time periods.
+     Key point: this is a modest change — it only touches one piece of the bill.
+     Use the rhetorical question device: "Why does this matter?
+     Because delivery is only one component of your bill." -->
+
+
+<!-- CONCEPT 4: What Rate BEST does -->
+
+:::{.column-margin}
+**Rate BEST** is a bundled time-of-use structure filed under ICC Docket P2024-0378. It varies both supply and delivery charges by time of day and season.
+:::
+
+<!-- WRITER: Explain Rate BEST. Both supply AND delivery vary.
+     Supply charges (BESTECs) are seasonal and time-varying.
+     Delivery follows the DTOU structure. Plus a flat transmission adder.
+     Four daily periods, seasonal supply differentiation.
+     Key point: this reshapes more of the bill, so when you use
+     electricity matters much more. -->
+
+[^fn-rate-best]: Rate BEST was proposed in ICC Docket P2024-0378. The structure includes time-varying Basic Electric Service Transmission and Energy Charges (BESTECs), a flat transmission adder, and mandatory DTOU delivery rates.
+
+
+<!-- CONCEPT 5: Why the distinction matters -->
+
+<!-- WRITER: "The more components of the bill that vary by time of day,
+     the more a household's usage pattern — when they use electricity,
+     not just how much — determines their bill. In other words, under
+     Rate BEST, the timing of your electricity use matters far more
+     than under DTOU." -->
+
+
+<!-- FIGURE: Rate structure comparison diagram -->
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-rate-structures >}}
+:::
+
+<!-- WRITER: Introduce the figure BEFORE the embed:
+     "To make these differences concrete, [figure reference] compares
+      the three rate structures side by side." -->
+
+
+## Scope and approach
+
+<!-- WRITER: Short prose paragraph(s) setting up the simulation,
+     then bolded key assumptions. Hybrid style per outline. -->
+
+<!-- WRITER: Prose paragraph covering:
+     - Data: ComEd smart meter data, ~328K households, full service territory
+     - Time period: January 2023 (winter peak) and July 2023 (summer peak)
+     - Why these months: seasonal extremes, where TOU impacts diverge most
+     - What we measure: percentage change in monthly bills vs. flat rate baseline
+     - Why percentage changes: JPV insight — bill size scales with income.
+       A $10 change means something very different to a household paying $80/month
+       vs. $300/month. Percentages put all households on comparable footing.
+     - Geographic granularity: Census block groups, mapped to income data
+-->
+
+<!-- WRITER: Bolded key assumptions, bulleted: -->
+
+- We simulate bill impacts **under current consumption patterns** — households do not shift their usage in response to the new rate.
+
+::: {.callout-note}
+In reality, time-of-use rates are designed to encourage households to shift electricity use away from peak hours. Our estimates represent the impact _before_ any behavioral response — a conservative baseline for evaluating equity impacts.
+:::
+
+- **Rate BEST** is constructed as specified in ICC Docket P2024-0378: time-varying BESTECs, a flat transmission adder, and mandatory DTOU delivery, with four daily periods and seasonal supply differentiation.
+- Income is proxied at the **Census block group level** using American Community Survey median household income, not individual household income.
+- <!-- WRITER: Add other key assumptions as needed (e.g., revenue neutrality removed per client direction) -->
+
+
+## Findings
+
+### How would bills change under DTOU?
+
+<!-- WRITER: Progressive revelation within this subsection:
+     1. The median household: what happens to a typical bill?
+     2. Zoom out: geographic distribution across the service territory (map).
+     3. Slice by income: is there an equity concern?
+
+     Lead with the headline finding.
+     Use rhetorical question device: "Why such a small impact?
+     Because DTOU only changes the delivery component..."
+-->
+
+<!-- WRITER: Headline finding paragraph. Example shape:
+     "Under DTOU, the median ComEd household would see a bill change of
+     **`r dtou_median_pct`%** in January and **`r dtou_median_pct_jul`%**
+     in July. [Interpretation — small, broadly shared.]" -->
+
+<!-- WRITER: Introduce the map BEFORE embedding it:
+     "The geographic pattern is [uniform/concentrated/etc.].
+     [Description of what the reader should look for] (@fig-dtou-map)." -->
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-dtou-map >}}
+:::
+
+<!-- WRITER: Equity finding. Example shape:
+     "Does DTOU disproportionately affect lower-income communities?
+     [Answer]. The relationship between block group income and bill
+     change is [flat/weak/etc.]." -->
+
+<!-- WRITER: Optional — income scatterplot for DTOU if it helps
+     make the "minimal equity concern" point visually.
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-dtou-income-scatter >}}
+:::
+-->
+
+<!-- WRITER: Transitional bridge to Rate BEST section. Example:
+     "DTOU is a modest reform — it only touches the delivery side of the
+     bill. What happens when we change both supply and delivery?" -->
+
+
+### How would bills change under Rate BEST?
+
+<!-- WRITER: This is the main findings section. Progressive revelation:
+     1. The median household in January vs. July.
+     2. Zoom out: maps showing geographic distribution, season by season.
+        These are the hero visuals.
+     3. Slice by income: the equity pattern emerges.
+
+     Lead with the headline: bigger impacts, and now clear seasonal
+     equity patterns emerge.
+-->
+
+<!-- WRITER: Headline finding paragraph. Example shape:
+     "Under Rate BEST, the picture changes. In January, the median household
+     would see [savings/change] of **`r best_jan_median_pct`%**. In July,
+     the median household would see [change] of **`r best_jul_median_pct`%**." -->
+
+
+<!-- WRITER: Introduce the January map BEFORE embedding:
+     "In winter, Rate BEST savings are not evenly distributed across
+     the service territory. [What to look for] (@fig-best-map-jan)." -->
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-best-map-jan >}}
+:::
+
+
+<!-- WRITER: Introduce the July map BEFORE embedding:
+     "In summer, the pattern [shifts/reverses/etc.]. [What to look for]
+     (@fig-best-map-jul)." -->
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-best-map-jul >}}
+:::
+
+
+<!-- WRITER: The equity finding — the core policy insight.
+     Use "While X, Y" construction for nuance.
+     Example: "While Rate BEST would produce savings for most households
+     in winter, those savings would not be evenly distributed across
+     income levels."
+
+     Winter: savings tilt toward higher-income areas. Explain why.
+     Summer: losses hit wealthier households harder. Explain why.
+-->
+
+<!-- WRITER: Income regression scatterplot as supporting evidence.
+     Introduce BEFORE embedding. -->
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-best-income-scatter >}}
+:::
+
+
+<!-- ============================================================
+     PLACEHOLDER: CUB's proposed rate
+     ============================================================ -->
+
+<!-- ### What would CUB's proposed rate have done?
+
+     WRITER: TBD whether this section is included. If so, it slots in
+     as the third tier of the progressive revelation. Same structure:
+     1. Median household impact
+     2. Map
+     3. Income equity slice
+
+     Framing: "what could have been." CUB proposed this rate in [proceeding],
+     but it was rejected. Our simulation shows it would have [finding].
+
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-cub-map >}}
+:::
+
+-->
+
+
+## The bottom line
+
+<!-- WRITER: 2–3 sentences. Use "The bottom line:" as a lead-in.
+     Synthesize: rate design choices — even ones that look small on average —
+     have real distributional consequences. The equity story depends on
+     the season and the structure.
+     [If CUB proposal included: CUB's proposal would have [done X],
+      but it was rejected.] -->
+
+
+## Appendix {.appendix}
+
+### Acknowledgments
+
+<!-- WRITER: Named individuals who provided input. -->
+
+### Data and Methods
+
+<!-- WRITER: Organize by finding, per Switchbox convention.
+     For each finding, describe:
+     - What dataset was used (with version, release, S3 path or URL)
+     - What transformations were applied
+     - What assumptions were made (and why)
+     - What limitations apply
+
+     Lighter than a formal Switchbox report appendix but still reproducible.
+-->
+
+#### "How would bills change under DTOU?" section
+
+<!-- WRITER: Describe:
+     - ComEd smart meter data (source, time range, ~328K accounts, S3 path)
+     - DTOU rate schedule (source, time periods, prices)
+     - Bill simulation methodology
+     - Geographic mapping: account_bg_map parquet files, tie-breaking logic
+     - Income data: ACS vintage, block group median household income
+     - Normalization to percentage bill changes -->
+
+#### "How would bills change under Rate BEST?" section
+
+<!-- WRITER: Describe:
+     - Rate BEST tariff construction: BESTECs + transmission adder (1.266¢/kWh)
+       + mandatory DTOU delivery. Four daily periods, seasonal supply
+       differentiation. Source: ICC Docket P2024-0378.
+     - Same simulation methodology as DTOU section, applied to the
+       Rate BEST tariff structure.
+     - Income regression methodology (block group median income vs.
+       percentage bill change). -->
+
+<!-- [PLACEHOLDER: CUB proposal methods section — TBD] -->
+
+### References
+
+:::{#refs}
+:::
