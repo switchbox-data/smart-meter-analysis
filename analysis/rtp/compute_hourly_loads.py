@@ -41,6 +41,7 @@ import tempfile
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -187,11 +188,38 @@ def _merge_aggregate(
         current_dir = next_dir
         paths = sorted(str(p) for p in current_dir.glob("*.parquet"))
 
-    logger.info("Final merge of %d files", len(paths))
-    lf = pl.scan_parquet(paths).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
+    # Dict-based merge avoids Polars OOM on the final pass: PyArrow
+    # iter_batches feeds a plain defaultdict(float), keeping peak memory
+    # proportional to the number of unique keys rather than Polars' internal
+    # hash-table overhead.
+    logger.info("Using dict-based merge for final pass (%d files)", len(paths))
+    from collections import defaultdict
+
+    accum: dict[tuple, float] = defaultdict(float)
+    for p in paths:
+        pf = pq.ParquetFile(p)
+        for batch in pf.iter_batches(batch_size=50_000, columns=[*_GROUP_KEYS, "kwh_hour"]):
+            acct = batch.column("account_identifier").to_pylist()
+            zips = batch.column("zip_code").to_pylist()
+            hours = batch.column("hour_chicago").to_pylist()
+            kwh = batch.column("kwh_hour").to_pylist()
+            for i in range(len(acct)):
+                accum[(acct[i], zips[i], hours[i])] += kwh[i]
+
+    keys = list(accum.keys())
+    table = pa.table({
+        "account_identifier": pa.array([k[0] for k in keys], type=pa.string()),
+        "zip_code": pa.array([k[1] for k in keys], type=pa.string()),
+        "hour_chicago": pa.array([k[2] for k in keys], type=pa.timestamp("us")),
+        "kwh_hour": pa.array([accum[k] for k in keys], type=pa.float64()),
+    })
     if sort_output:
-        lf = lf.sort(_GROUP_KEYS)
-    lf.sink_parquet(output_path)
+        table = table.sort_by([
+            ("account_identifier", "ascending"),
+            ("zip_code", "ascending"),
+            ("hour_chicago", "ascending"),
+        ])
+    pq.write_table(table, output_path)
 
 
 def compute_hourly_loads(
