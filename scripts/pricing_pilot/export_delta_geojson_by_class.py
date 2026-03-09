@@ -7,12 +7,13 @@ e.g. 202301_flat_vs_dtou_sf_no_esh.parquet
 
 For each file: joins to account_bg_map_{yyyymm}.parquet (202301 for January, 202307 for July),
 aggregates mean bill delta to block group (geoid_bg), joins to BG geometry, writes one GeoJSON.
-Delta computed as bill_b_dollars - bill_a_dollars when available; fallback to
+Delta computed as bill_a_dollars - bill_b_dollars when available; fallback to
 net_bill_diff_dollars, then bill_diff_dollars.
 
-Sign convention: delta = alternative_rate_bill - flat_rate_bill
-  - positive (+) means customer pays MORE under the alternative rate
-  - negative (-) means customer SAVES under the alternative rate
+Sign convention (canonical, matches compute_household_bills.py):
+  delta = flat_rate - alternative_rate (bill_a - bill_b)
+  - positive (+) means customer SAVES under the alternative rate (TOU is cheaper)
+  - negative (-) means customer PAYS MORE under the alternative rate (TOU is worse)
 
 BG universe: by default, all block groups in the shapefile (Illinois statewide).
 When --zip-file is provided, the universe is narrowed to block groups reachable
@@ -22,7 +23,7 @@ Produces 16 GeoJSON files (2 months x 2 rate comparisons x 4 delivery classes).
 
 Each GeoJSON contains:
   - geoid_bg: string, 12-digit Census block group ID (FIPS)
-  - mean_delta: float, mean monthly bill change ($); null for BGs with no data
+  - mean_delta: float, mean monthly bill delta ($, positive=saves); null for BGs with no data
   - n_households: int, count of simulated households; null for BGs with no data
   - mean_delta_cap_global_sym: float, mean_delta clamped to [-X, +X] where X is
       the p80 of |mean_delta| across ALL scenarios; null where mean_delta is null.
@@ -82,11 +83,11 @@ import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Sign convention applied consistently across all scenarios.
-# delta = alternative_rate_bill - flat_rate_bill
-# Positive (+) = customer pays MORE under alternative rate
-# Negative (-) = customer SAVES under alternative rate
-SIGN_CONVENTION = "delta = alternative_rate_bill - flat_rate_bill (positive = customer pays more under alt rate; negative = customer saves under alt rate)"
+# Sign convention (canonical, matches compute_household_bills.py):
+#   delta = flat_rate - alternative_rate (bill_a - bill_b)
+#   Positive = customer SAVES under the alternative (TOU is cheaper)
+#   Negative = customer PAYS MORE under the alternative (TOU is worse)
+SIGN_CONVENTION = "delta = flat_rate - alternative_rate (bill_a - bill_b); positive = customer saves under alt rate; negative = customer pays more under alt rate"
 
 
 @dataclass
@@ -101,21 +102,21 @@ class _ScenarioData:
 
 
 def _choose_delta(cols: list[str]) -> pl.Expr:
-    """Return a Polars expression for bill delta with the stated sign convention.
+    """Return a Polars expression for bill delta with the canonical sign convention.
 
     Preference order:
-      1. bill_b_dollars - bill_a_dollars  (explicit; matches sign convention by construction)
-      2. net_bill_diff_dollars            (fallback; semantics assumed to be alt - flat)
+      1. bill_a_dollars - bill_b_dollars  (explicit; matches sign convention by construction)
+      2. net_bill_diff_dollars            (fallback; semantics assumed to be flat - alt)
       3. bill_diff_dollars                (last resort; semantics may vary — Pass 1 consistency
                                            check will warn if sign is flipped)
 
-    Sign convention: delta = alternative_rate_bill - flat_rate_bill.
-    Positive = customer pays more under alt rate; negative = customer saves under alt rate.
+    Sign convention: delta = flat_rate - alternative_rate (bill_a - bill_b).
+    Positive = customer SAVES under alt rate; negative = customer pays more.
     """
     if "bill_b_dollars" in cols and "bill_a_dollars" in cols:
-        return pl.col("bill_b_dollars") - pl.col("bill_a_dollars")
+        return pl.col("bill_a_dollars") - pl.col("bill_b_dollars")
     if "net_bill_diff_dollars" in cols:
-        # Assumed semantics: alt - flat. Caller must verify.
+        # Assumed semantics: flat - alt. Caller must verify.
         return pl.col("net_bill_diff_dollars")
     if "bill_diff_dollars" in cols:
         # Last resort. Semantics may vary; consistency check below will warn if sign-flipped.
@@ -322,11 +323,11 @@ def main() -> int:
             continue
 
         # Internal consistency check: if both bill_a/b_dollars AND bill_diff_dollars
-        # are present, verify that bill_diff_dollars matches (b - a) and is not sign-flipped.
+        # are present, verify that bill_diff_dollars matches (a - b) and is not sign-flipped.
         # This catches upstream sign errors early and loudly.
         if {"bill_a_dollars", "bill_b_dollars", "bill_diff_dollars"}.issubset(cols):
             _chk = df.select(
-                (pl.col("bill_b_dollars") - pl.col("bill_a_dollars")).alias("d_ab"),
+                (pl.col("bill_a_dollars") - pl.col("bill_b_dollars")).alias("d_ab"),
                 pl.col("bill_diff_dollars").alias("d_col"),
             ).with_columns(
                 (pl.col("d_ab") - pl.col("d_col")).abs().alias("diff_same"),
@@ -337,21 +338,21 @@ def main() -> int:
             if mean_flip < mean_same:
                 print(
                     f"  WARNING [{bill_path.name}]: bill_diff_dollars is OPPOSITE-SIGN to"
-                    f" (bill_b - bill_a) [mean|b-a - diff|={mean_same:.4g},"
-                    f" mean|b-a + diff|={mean_flip:.4g}]."
-                    " Using (bill_b_dollars - bill_a_dollars); bill_diff_dollars IGNORED.",
+                    f" (bill_a - bill_b) [mean|a-b - diff|={mean_same:.4g},"
+                    f" mean|a-b + diff|={mean_flip:.4g}]."
+                    " Using (bill_a_dollars - bill_b_dollars); bill_diff_dollars IGNORED.",
                     file=sys.stderr,
                 )
             elif mean_same > 1e-6:
                 print(
-                    f"  WARNING [{bill_path.name}]: bill_diff_dollars differs from (bill_b - bill_a)"
+                    f"  WARNING [{bill_path.name}]: bill_diff_dollars differs from (bill_a - bill_b)"
                     f" but is not a clean sign-flip [mean|same|={mean_same:.4g},"
-                    f" mean|flip|={mean_flip:.4g}]. Using (bill_b - bill_a).",
+                    f" mean|flip|={mean_flip:.4g}]. Using (bill_a - bill_b).",
                     file=sys.stderr,
                 )
             # else: agree within tolerance — no warning
 
-        # Sign convention: delta = alternative_rate_bill - flat_rate_bill
+        # Sign convention: delta = flat_rate - alternative_rate (bill_a - bill_b)
         delta_expr = _choose_delta(cols)
         df = df.with_columns(delta_expr.alias("delta_dollars"))
 

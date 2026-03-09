@@ -8,6 +8,11 @@ Report for ~/pricing_pilot/bills_unscaled/:
 4. For each of the 16 files: share of block groups where mean delta is positive (savings)
    vs negative (losses).
 
+Sign convention (canonical, matches compute_household_bills.py):
+  delta = flat_rate - alternative_rate (bill_a - bill_b)
+  Positive = customer SAVES under the alternative (TOU is cheaper)
+  Negative = customer PAYS MORE under the alternative (TOU is worse)
+
 Usage::
 
   uv run python scripts/pricing_pilot/bill_stats_and_bg_correlation.py
@@ -33,15 +38,17 @@ CLASSES_ORDER = ("sf_no_esh", "mf_no_esh", "sf_esh", "mf_esh")
 def _get_delta_series(df: pd.DataFrame) -> pd.Series:
     """Return delta Series using the same priority fallback as export_delta_geojson_by_class.
 
-    Priority: bill_diff_dollars → net_bill_diff_dollars → bill_b_dollars - bill_a_dollars.
+    Priority: bill_diff_dollars → net_bill_diff_dollars → bill_a_dollars - bill_b_dollars.
     Resolved per-file so heterogeneous schemas across files are handled correctly.
+
+    Sign convention: delta = flat - alt (bill_a - bill_b); positive = saves.
     """
     if "bill_diff_dollars" in df.columns:
         return df["bill_diff_dollars"]
     if "net_bill_diff_dollars" in df.columns:
         return df["net_bill_diff_dollars"]
     if "bill_b_dollars" in df.columns and "bill_a_dollars" in df.columns:
-        return df["bill_b_dollars"] - df["bill_a_dollars"]
+        return df["bill_a_dollars"] - df["bill_b_dollars"]
     raise ValueError(
         f"No delta column in {list(df.columns)}; expected bill_diff_dollars, "
         "net_bill_diff_dollars, or both of bill_b_dollars/bill_a_dollars"
@@ -120,7 +127,7 @@ def main() -> int:
     # --- 1. Per-file stats ---
     print("=" * 70)
     print("1. PER-FILE STATS (row count, mean bill diff, median bill diff)")
-    print("   Delta column resolved per file: bill_diff_dollars → net_bill_diff_dollars → bill_b - bill_a")
+    print("   Delta column resolved per file: bill_diff_dollars → net_bill_diff_dollars → bill_a - bill_b")
     print("=" * 70)
 
     for f in files:
@@ -132,7 +139,7 @@ def main() -> int:
             delta = _get_delta_series(df)
             mean_d = delta.mean()
             median_d = delta.median()
-            col_label = delta.name if delta.name else "bill_b_dollars - bill_a_dollars"
+            col_label = delta.name if delta.name else "bill_a_dollars - bill_b_dollars"
         print(f"  {f.name}")
         print(f"    row_count={n}, mean_bill_diff={mean_d:.4f}, median_bill_diff={median_d:.4f} [col: {col_label}]")
 
