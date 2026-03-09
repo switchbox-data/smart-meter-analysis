@@ -178,6 +178,7 @@ def sample_missing(
 
 
 def main() -> int:
+    """Run chain-of-custody check: compare distinct account counts across pipeline stages."""
     default_root = Path.home() / "pricing_pilot" / "interval_data"
     default_bills = Path.home() / "pricing_pilot" / "bills_unscaled"
     default_map = str(Path.home() / "pricing_pilot" / "account_bg_map_{yyyymm}.parquet")
@@ -314,4 +315,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

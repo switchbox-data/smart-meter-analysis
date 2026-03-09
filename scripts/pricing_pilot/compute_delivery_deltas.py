@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Compute delivery deltas and combine with supply deltas for STOU analysis.
 
 The v2 STOU pipeline computed supply-only bills. Rate BEST shifts both
@@ -10,15 +11,16 @@ supply AND delivery charges by time of day. This script:
 5. Joins with existing supply-only household bills
 6. Outputs combined total delta files
 
-Usage (on EC2):
-    python scripts/pricing_pilot/compute_delivery_deltas.py \
-        --month 202301 \
-        --billing-output-dir /ebs/home/griffin_switch_box/runs/billing_output
+Usage::
+
+    uv run python scripts/pricing_pilot/compute_delivery_deltas.py \\
+        --month 202301 \\
+        --billing-output-dir ~/pricing_pilot/billing_output
 
     # Run both months back-to-back:
-    python scripts/pricing_pilot/compute_delivery_deltas.py \
-        --both \
-        --billing-output-dir /ebs/home/griffin_switch_box/runs/billing_output
+    uv run python scripts/pricing_pilot/compute_delivery_deltas.py \\
+        --both \\
+        --billing-output-dir ~/pricing_pilot/billing_output
 """
 
 from __future__ import annotations
@@ -33,15 +35,32 @@ import polars as pl
 # TOU period definitions (Chicago local time, from hour_chicago)
 # ---------------------------------------------------------------------------
 
-PERIOD_MAP: dict[int, str] = {}
-for h in (6, 7, 8, 9, 10, 11, 12):
-    PERIOD_MAP[h] = "morning"
-for h in (13, 14, 15, 16, 17, 18):
-    PERIOD_MAP[h] = "midday_peak"
-for h in (19, 20):
-    PERIOD_MAP[h] = "evening"
-for h in (21, 22, 23, 0, 1, 2, 3, 4, 5):
-    PERIOD_MAP[h] = "overnight"
+PERIOD_MAP: dict[int, str] = {
+    0: "overnight",
+    1: "overnight",
+    2: "overnight",
+    3: "overnight",
+    4: "overnight",
+    5: "overnight",
+    6: "morning",
+    7: "morning",
+    8: "morning",
+    9: "morning",
+    10: "morning",
+    11: "morning",
+    12: "morning",
+    13: "midday_peak",
+    14: "midday_peak",
+    15: "midday_peak",
+    16: "midday_peak",
+    17: "midday_peak",
+    18: "midday_peak",
+    19: "evening",
+    20: "evening",
+    21: "overnight",
+    22: "overnight",
+    23: "overnight",
+}
 
 PERIODS = ("morning", "midday_peak", "evening", "overnight")
 
@@ -79,10 +98,6 @@ def _resolve_paths(billing_output_dir: Path, month: str) -> tuple[Path, Path, Pa
     output_dir = billing_output_dir / "stou_combined"
 
     return hourly_loads_path, supply_bills_path, delivery_lookup_path, output_dir
-
-
-def _assign_period(hour: int) -> str:
-    return PERIOD_MAP[hour]
 
 
 def _aggregate_hourly_to_periods(hourly_loads_path: Path) -> pl.DataFrame:
@@ -220,12 +235,16 @@ def _compute_delivery_deltas(period_kwh: pl.DataFrame, delivery_lookup: pl.DataF
     )
 
 
-def _combine_with_supply(delivery: pl.DataFrame, supply_bills_path: Path) -> pl.DataFrame:
+def _combine_with_supply(delivery: pl.DataFrame, supply: pl.DataFrame) -> pl.DataFrame:
     """Join delivery deltas with supply-only household bills.
 
-    Returns the combined output with all required columns.
+    Args:
+        delivery: Delivery deltas per household.
+        supply: Supply-only household bills DataFrame.
+
+    Returns:
+        Combined output with supply + delivery deltas and totals.
     """
-    supply = pl.read_parquet(supply_bills_path)
     print(f"  Supply bills: {len(supply):,} rows")
 
     # Identify the supply delta column (bill_diff_dollars in pipeline output)
@@ -331,8 +350,8 @@ def _validate(combined: pl.DataFrame, n_hourly_hh: int, n_supply_hh: int) -> Non
             print(f"  No nulls in {col}")
 
 
-def process_month(month: str, billing_output_dir: Path) -> None:
-    """Process a single month end-to-end."""
+def process_month(month: str, billing_output_dir: Path) -> int:
+    """Process a single month end-to-end. Returns 0 on success, 1 on error."""
     print(f"\n{'=' * 60}")
     print(f"Processing {month}")
     print(f"{'=' * 60}")
@@ -343,17 +362,18 @@ def process_month(month: str, billing_output_dir: Path) -> None:
     if not delivery_lookup_path.exists():
         print(
             f"ERROR: delivery_class_lookup.parquet not found at {delivery_lookup_path}\n"
-            "Run scripts/pricing_pilot/build_delivery_class_lookup.py first."
+            "Run scripts/pricing_pilot/build_delivery_class_lookup.py first.",
+            file=sys.stderr,
         )
-        sys.exit(1)
+        return 1
 
     # Check input files exist
     if not hourly_loads_path.exists():
-        print(f"ERROR: hourly loads not found at {hourly_loads_path}")
-        sys.exit(1)
+        print(f"ERROR: hourly loads not found at {hourly_loads_path}", file=sys.stderr)
+        return 1
     if not supply_bills_path.exists():
-        print(f"ERROR: supply bills not found at {supply_bills_path}")
-        sys.exit(1)
+        print(f"ERROR: supply bills not found at {supply_bills_path}", file=sys.stderr)
+        return 1
 
     # Load delivery class lookup
     delivery_lookup = pl.read_parquet(delivery_lookup_path)
@@ -368,10 +388,10 @@ def process_month(month: str, billing_output_dir: Path) -> None:
     delivery = _compute_delivery_deltas(period_kwh, delivery_lookup)
     print(f"  Delivery deltas computed for {len(delivery):,} households")
 
-    # Step 3: Combine with supply bills
+    # Step 3: Combine with supply bills (single read)
     supply_bills = pl.read_parquet(supply_bills_path)
     n_supply_hh = len(supply_bills)
-    combined = _combine_with_supply(delivery, supply_bills_path)
+    combined = _combine_with_supply(delivery, supply_bills)
 
     # Step 4: Validate
     _validate(combined, n_hourly_hh, n_supply_hh)
@@ -384,8 +404,13 @@ def process_month(month: str, billing_output_dir: Path) -> None:
     print(f"  File size: {output_path.stat().st_size / (1024 * 1024):.1f} MB")
     print(f"  Rows: {len(combined):,}")
 
+    return 0
+
 
 def main() -> int:
+    """Parse CLI args and dispatch to process_month for each requested month."""
+    default_billing_output = Path.home() / "pricing_pilot" / "billing_output"
+
     parser = argparse.ArgumentParser(
         description="Compute delivery deltas and combine with supply deltas for STOU analysis."
     )
@@ -402,8 +427,8 @@ def main() -> int:
     parser.add_argument(
         "--billing-output-dir",
         type=Path,
-        default=Path("/ebs/home/griffin_switch_box/runs/billing_output"),
-        help="Root billing output directory.",
+        default=default_billing_output,
+        help=f"Root billing output directory (default: {default_billing_output}).",
     )
     args = parser.parse_args()
 
@@ -416,9 +441,11 @@ def main() -> int:
 
     for month in months:
         if len(month) != 6 or not month.isdigit():
-            print(f"ERROR: Invalid month format '{month}', expected YYYYMM")
+            print(f"ERROR: Invalid month format '{month}', expected YYYYMM", file=sys.stderr)
             return 1
-        process_month(month, args.billing_output_dir)
+        rc = process_month(month, args.billing_output_dir)
+        if rc != 0:
+            return rc
 
     print("\nDone.")
     return 0

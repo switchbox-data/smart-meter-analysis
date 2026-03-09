@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Build account → delivery_service_class lookup from raw interval Parquet.
 
 Reads the compacted production output for 202301 and 202307,
@@ -5,15 +6,17 @@ extracts the unique (account_identifier, delivery_service_class) pairs,
 validates 1:1 mapping within each month and cross-month consistency,
 then writes a single deduplicated lookup to Parquet.
 
-Usage (on EC2):
-    python scripts/pricing_pilot/build_delivery_class_lookup.py \
-        --base-dir /ebs/home/griffin_switch_box/runs \
-        --output /ebs/home/griffin_switch_box/runs/billing_output/delivery_class_lookup.parquet
+Usage::
+
+    uv run python scripts/pricing_pilot/build_delivery_class_lookup.py \\
+        --base-dir ~/pricing_pilot/runs \\
+        --output ~/pricing_pilot/runs/billing_output/delivery_class_lookup.parquet
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import polars as pl
@@ -22,10 +25,13 @@ MONTHS = ["202301", "202307"]
 
 
 def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
-    """Select account_identifier + delivery_service_class, deduplicate.
+    """Extract unique (account_identifier, delivery_service_class) pairs for one month.
 
     Streams each compacted part file in 500K-row batches via PyArrow's
-    iter_batches(), deduplicating per-file so peak memory stays low.
+    iter_batches(). Each batch is converted to Polars, cast to Utf8,
+    and merged into a single running result via concat + unique.
+    The result never exceeds ~270K rows so dedup every batch is fast
+    and uses minimal memory.
     """
     import pyarrow.parquet as pq
 
@@ -40,30 +46,22 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
     print(f"  Found {len(files)} compacted part files in {part_dir}")
 
     schema = {"account_identifier": pl.Utf8, "delivery_service_class": pl.Utf8}
-    month_chunks: list[pl.DataFrame] = []
+    result = pl.DataFrame(schema=schema)
+
     for i, f in enumerate(files):
         pf = pq.ParquetFile(str(f))
-        file_result = pl.DataFrame(schema=schema)
-        pending: list[pl.DataFrame] = []
         batch_count = 0
         for batch in pf.iter_batches(
             batch_size=500_000,
             columns=["account_identifier", "delivery_service_class"],
         ):
-            pending.append(pl.from_arrow(batch).with_columns(pl.col("delivery_service_class").cast(pl.Utf8)).unique())
+            chunk = pl.from_arrow(batch).with_columns(pl.col("delivery_service_class").cast(pl.Utf8))
+            result = pl.concat([result, chunk]).unique()
             batch_count += 1
-            if batch_count % 50 == 0:
-                file_result = pl.concat([file_result, *pending]).unique()
-                pending.clear()
 
-        if pending:
-            file_result = pl.concat([file_result, *pending]).unique()
-            pending.clear()
+        print(f"    File {i + 1}/{len(files)}: {f.name}  ({batch_count} batches, unique pairs: {result.height:,})")
 
-        month_chunks.append(file_result)
-        print(f"    File {i + 1}/{len(files)}: {f.name}  ({batch_count} batches, unique pairs: {file_result.height:,})")
-
-    return pl.concat(month_chunks).unique()
+    return result
 
 
 def validate_one_class_per_account(df: pl.DataFrame, label: str) -> None:
@@ -80,19 +78,23 @@ def validate_one_class_per_account(df: pl.DataFrame, label: str) -> None:
     print(f"  [{label}] All {len(df)} account→class pairs are 1:1.")
 
 
-def main() -> None:
+def main() -> int:
+    """Build and validate a deduplicated account → delivery_service_class lookup."""
+    default_base = Path.home() / "pricing_pilot" / "runs"
+    default_output = default_base / "billing_output" / "delivery_class_lookup.parquet"
+
     parser = argparse.ArgumentParser(description="Build account → delivery_service_class lookup")
     parser.add_argument(
         "--base-dir",
         type=Path,
-        default=Path("/ebs/home/griffin_switch_box/runs"),
-        help="Root directory containing out_YYYYMM_production/ folders",
+        default=default_base,
+        help=f"Root directory containing out_YYYYMM_production/ folders (default: {default_base}).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/ebs/home/griffin_switch_box/runs/billing_output/delivery_class_lookup.parquet"),
-        help="Output path for the lookup Parquet file",
+        default=default_output,
+        help=f"Output path for the lookup Parquet file (default: {default_output}).",
     )
     args = parser.parse_args()
 
@@ -108,9 +110,11 @@ def main() -> None:
         null_acct = df["account_identifier"].null_count()
         null_class = df["delivery_service_class"].null_count()
         if null_acct > 0 or null_class > 0:
-            raise ValueError(
-                f"{month}: found nulls — account_identifier: {null_acct}, delivery_service_class: {null_class}"
+            print(
+                f"ERROR: {month}: found nulls — account_identifier: {null_acct}, delivery_service_class: {null_class}",
+                file=sys.stderr,
             )
+            return 1
         print("  No nulls in either column.")
 
         vc = df["delivery_service_class"].value_counts().sort("delivery_service_class")
@@ -136,10 +140,14 @@ def main() -> None:
     else:
         print("  All overlapping accounts have consistent delivery class.")
 
+    del overlap, mismatches
+
     # ------------------------------------------------------------------
     # Merge and deduplicate
     # ------------------------------------------------------------------
     combined = pl.concat([jan, jul]).unique()
+    del jan, jul, lookups
+
     validate_one_class_per_account(combined, "combined")
 
     vc_final = combined["delivery_service_class"].value_counts().sort("delivery_service_class")
@@ -155,6 +163,8 @@ def main() -> None:
     print(f"\n  Saved to {args.output}")
     print(f"  File size: {args.output.stat().st_size / 1024:.1f} KB")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

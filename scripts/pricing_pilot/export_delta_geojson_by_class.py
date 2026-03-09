@@ -97,7 +97,7 @@ class _ScenarioData:
     delivery_class: str
     bill_path: Path
     # pandas DataFrame with columns: geoid_bg (str), mean_delta (float), n_households (int)
-    bg_pd: object  # pd.DataFrame
+    bg_pd: pd.DataFrame
     county_fips_set: frozenset
 
 
@@ -147,6 +147,7 @@ def _parse_bill_filename(path: Path) -> tuple[str, str, str] | None:
 
 
 def main() -> int:
+    """Export GeoJSON layers by delivery class from household bill parquets."""
     default_bills_dir = Path.home() / "pricing_pilot" / "bills_unscaled"
     default_map_pattern = str(Path.home() / "pricing_pilot" / "account_bg_map_{yyyymm}.parquet")
     default_out = Path.home() / "pricing_pilot" / "geojson_out"
