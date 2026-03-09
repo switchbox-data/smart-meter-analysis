@@ -39,26 +39,29 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
         print(f"  WARNING: expected 3 part files, found {len(files)} in {part_dir}")
     print(f"  Found {len(files)} compacted part files in {part_dir}")
 
+    schema = {"account_identifier": pl.Utf8, "delivery_service_class": pl.Utf8}
     month_chunks: list[pl.DataFrame] = []
     for i, f in enumerate(files):
         pf = pq.ParquetFile(str(f))
-        file_chunks: list[pl.DataFrame] = []
+        file_result = pl.DataFrame(schema=schema)
+        pending: list[pl.DataFrame] = []
         batch_count = 0
         for batch in pf.iter_batches(
             batch_size=500_000,
             columns=["account_identifier", "delivery_service_class"],
         ):
-            chunk = pl.from_arrow(batch).unique()
-            file_chunks.append(chunk)
+            pending.append(pl.from_arrow(batch).unique())
             batch_count += 1
+            if batch_count % 50 == 0:
+                file_result = pl.concat([file_result, *pending]).unique()
+                pending.clear()
 
-        file_result = pl.concat(file_chunks).unique()
+        if pending:
+            file_result = pl.concat([file_result, *pending]).unique()
+            pending.clear()
+
         month_chunks.append(file_result)
-        running_unique = pl.concat(month_chunks).unique().height
-        print(
-            f"    File {i + 1}/{len(files)}: {f.name}"
-            f"  ({batch_count} batches, running unique pairs: {running_unique:,})"
-        )
+        print(f"    File {i + 1}/{len(files)}: {f.name}  ({batch_count} batches, unique pairs: {file_result.height:,})")
 
     return pl.concat(month_chunks).unique()
 
@@ -113,6 +116,7 @@ def main() -> None:
         vc = df["delivery_service_class"].value_counts().sort("delivery_service_class")
         print(f"  Value counts:\n{vc}")
         lookups[month] = df
+        del df, null_acct, null_class, vc
 
     # ------------------------------------------------------------------
     # Cross-month consistency
