@@ -170,6 +170,9 @@ def _scatter_to_shards(
 def _aggregate_shard(shard_path: Path, agg_path: Path) -> int:
     """Aggregate a single shard file via Polars group_by. Returns unique key count."""
     df = pl.read_parquet(shard_path)
+    # Re-truncate to hourly grain so that any sub-hour timestamps surviving
+    # upstream streaming passes are collapsed before the final group_by.
+    df = df.with_columns(pl.col("hour_chicago").dt.truncate("1h"))
     agg = df.group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum())
     agg.write_parquet(agg_path)
     n_keys = agg.height
@@ -272,7 +275,9 @@ def _merge_aggregate(
         for g in range(n_groups):
             group = paths[g * fan_in : (g + 1) * fan_in]
             dest = next_dir / f"merged_{g:04d}.parquet"
-            pl.scan_parquet(group).group_by(_GROUP_KEYS).agg(pl.col("kwh_hour").sum()).sink_parquet(dest)
+            pl.scan_parquet(group).with_columns(pl.col("hour_chicago").dt.truncate("1h")).group_by(_GROUP_KEYS).agg(
+                pl.col("kwh_hour").sum()
+            ).sink_parquet(dest)
             gc.collect()
 
         # Free previous tier (but not the top-level tmp_dir — caller owns that)
