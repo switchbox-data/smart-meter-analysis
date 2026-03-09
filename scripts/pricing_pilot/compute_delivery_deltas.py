@@ -106,35 +106,10 @@ def _aggregate_hourly_to_periods(hourly_loads_path: Path) -> pl.DataFrame:
     Returns a DataFrame with columns:
         account_identifier, zip_code, period, kwh_period
 
-    Uses lazy scan → collect. Falls back to PyArrow streaming if OOM.
+    Uses PyArrow streaming to avoid OOM on large files.
     """
     print(f"  Scanning hourly loads: {hourly_loads_path}")
-
-    # Build a when/then chain for period assignment from the hour component
-    period_expr = (
-        pl.when(pl.col("hour_chicago").dt.hour().is_in([6, 7, 8, 9, 10, 11, 12]))
-        .then(pl.lit("morning"))
-        .when(pl.col("hour_chicago").dt.hour().is_in([13, 14, 15, 16, 17, 18]))
-        .then(pl.lit("midday_peak"))
-        .when(pl.col("hour_chicago").dt.hour().is_in([19, 20]))
-        .then(pl.lit("evening"))
-        .otherwise(pl.lit("overnight"))
-        .alias("period")
-    )
-
-    try:
-        result = (
-            pl.scan_parquet(hourly_loads_path)
-            .with_columns(period_expr)
-            .group_by("account_identifier", "zip_code", "period")
-            .agg(pl.col("kwh_hour").sum().alias("kwh_period"))
-            .collect()
-        )
-        print(f"  Aggregated to {len(result):,} (account, zip, period) rows via lazy scan")
-        return result
-    except Exception as e:
-        print(f"  Lazy collect failed ({e}), falling back to PyArrow streaming...")
-        return _aggregate_hourly_pyarrow(hourly_loads_path)
+    return _aggregate_hourly_pyarrow(hourly_loads_path)
 
 
 def _aggregate_hourly_pyarrow(hourly_loads_path: Path) -> pl.DataFrame:
