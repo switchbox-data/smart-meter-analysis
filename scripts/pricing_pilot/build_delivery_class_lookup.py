@@ -50,7 +50,7 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
             batch_size=500_000,
             columns=["account_identifier", "delivery_service_class"],
         ):
-            pending.append(pl.from_arrow(batch).unique())
+            pending.append(pl.from_arrow(batch).with_columns(pl.col("delivery_service_class").cast(pl.Utf8)).unique())
             batch_count += 1
             if batch_count % 50 == 0:
                 file_result = pl.concat([file_result, *pending]).unique()
