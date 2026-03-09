@@ -28,10 +28,9 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
     """Extract unique (account_identifier, delivery_service_class) pairs for one month.
 
     Streams each compacted part file in 500K-row batches via PyArrow's
-    iter_batches(). Each batch is converted to Polars, cast to Utf8,
-    and merged into a single running result via concat + unique.
-    The result never exceeds ~270K rows so dedup every batch is fast
-    and uses minimal memory.
+    iter_batches(). Each batch's pairs are added to a plain Python set,
+    keeping peak memory at ~50 MB regardless of input size. The set is
+    converted to a Polars DataFrame only after all files are processed.
     """
     import pyarrow.parquet as pq
 
@@ -45,8 +44,7 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
         print(f"  WARNING: expected 3 part files, found {len(files)} in {part_dir}")
     print(f"  Found {len(files)} compacted part files in {part_dir}")
 
-    schema = {"account_identifier": pl.Utf8, "delivery_service_class": pl.Utf8}
-    result = pl.DataFrame(schema=schema)
+    pairs: set[tuple[str, str]] = set()
 
     for i, f in enumerate(files):
         pf = pq.ParquetFile(str(f))
@@ -55,13 +53,22 @@ def load_lookup(base_dir: Path, month: str) -> pl.DataFrame:
             batch_size=500_000,
             columns=["account_identifier", "delivery_service_class"],
         ):
-            chunk = pl.from_arrow(batch).with_columns(pl.col("delivery_service_class").cast(pl.Utf8))
-            result = pl.concat([result, chunk]).unique()
+            acct_col = batch.column("account_identifier")
+            dsc_col = batch.column("delivery_service_class")
+            # Cast dictionary-encoded / categorical columns to plain strings
+            if hasattr(dsc_col, "dictionary_decode"):
+                dsc_col = dsc_col.dictionary_decode()
+            pairs.update(zip(acct_col.to_pylist(), (str(v) for v in dsc_col.to_pylist())))
             batch_count += 1
+            if batch_count % 100 == 0:
+                print(f"      batch {batch_count}, unique pairs so far: {len(pairs):,}")
 
-        print(f"    File {i + 1}/{len(files)}: {f.name}  ({batch_count} batches, unique pairs: {result.height:,})")
+        print(f"    File {i + 1}/{len(files)}: {f.name}  ({batch_count} batches, unique pairs: {len(pairs):,})")
 
-    return result
+    return pl.DataFrame(
+        {"account_identifier": [p[0] for p in pairs], "delivery_service_class": [p[1] for p in pairs]},
+        schema={"account_identifier": pl.Utf8, "delivery_service_class": pl.Utf8},
+    )
 
 
 def validate_one_class_per_account(df: pl.DataFrame, label: str) -> None:
