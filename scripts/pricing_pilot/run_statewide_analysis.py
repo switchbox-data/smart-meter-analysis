@@ -150,6 +150,10 @@ def _join_census(bg_df: pl.DataFrame, census: pl.DataFrame) -> pl.DataFrame:
     joined = joined.filter(pl.col("median_household_income").is_not_null() & (pl.col("median_household_income") > 0))
     n_after = joined.height
     print(f"    BGs with valid income: {n_after:,}/{n_before:,}")
+    # Census stores income as natural log; exponentiate to recover raw dollars.
+    joined = joined.rename({"median_household_income": "log_median_household_income"}).with_columns(
+        pl.col("log_median_household_income").exp().alias("median_household_income"),
+    )
     return joined
 
 
