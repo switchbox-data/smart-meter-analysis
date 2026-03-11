@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Compute delivery deltas and combine with supply deltas for STOU analysis.
+"""Compute delivery + supply deltas for STOU (Rate BEST) analysis.
 
-The v2 STOU pipeline computed supply-only bills. Rate BEST shifts both
-supply AND delivery charges by time of day. This script:
+Rate BEST shifts both supply AND delivery charges by time of day.
+This script computes both components inline from hourly load data,
+using the current rate constants (no dependency on pre-computed
+household_bills.parquet from the core pipeline).
+
+Steps:
 
 1. Loads hourly loads from the v2 pipeline _tmp/ output
 2. Assigns each hour to a TOU period
 3. Joins the delivery class lookup
 4. Computes delivery delta per household (flat delivery - TOU delivery)
-5. Joins with existing supply-only household bills
-6. Outputs combined total delta files
+5. Computes supply delta per household inline:
+   flat supply = total_kwh * flat PTC
+   STOU supply = sum(kwh_period * STOU rate[period])
+6. Combines delivery + supply into total delta output
 
 Usage::
 
@@ -30,6 +36,7 @@ import sys
 from pathlib import Path
 
 import polars as pl
+import yaml
 
 # ---------------------------------------------------------------------------
 # TOU period definitions (Chicago local time, from hour_chicago)
@@ -68,7 +75,12 @@ PERIODS = ("morning", "midday_peak", "evening", "overnight")
 # Delivery rates (raw, no adjustment factors, no uncollectible multipliers)
 # ---------------------------------------------------------------------------
 
-# TOU DFCs by delivery class (Info Sheet 67, cents/kWh)
+# TOU DFCs by delivery class (cents/kWh)
+# Source: CUB DTOD Fact Sheet (January 2026), cross-verified against
+#         ComEd Info Sheet 67 (2026 column)
+# URL (CUB): https://www.citizensutilityboard.org/wp-content/uploads/2025/12/ComEdDeliveryTOD.pdf
+# URL (Info Sheet 67, in 2026 Ratebook): https://www.comed.com/cdn/assets/v3/assets/blt3ebb3fed6084be2a/blt86ebee5fe6ed02f8/69ab092748ce0ef3e48504df/2026_Ratebook.pdf
+# Note: C28 overnight = 1.512 (CUB PDF has typo of 2.512; Info Sheet 67 confirms 1.512)
 TOU_DFCS: dict[str, dict[str, float]] = {
     "C23": {"morning": 4.009, "midday_peak": 10.712, "evening": 3.747, "overnight": 2.984},
     "C24": {"morning": 3.073, "midday_peak": 8.689, "evening": 2.856, "overnight": 2.251},
@@ -76,28 +88,57 @@ TOU_DFCS: dict[str, dict[str, float]] = {
     "C28": {"morning": 1.925, "midday_peak": 4.975, "evening": 1.823, "overnight": 1.512},
 }
 
-# Flat DFCs by delivery class (Info Sheet 64.1, cents/kWh)
+# Flat DFCs by delivery class (cents/kWh)
+# Source: CUB DTOD Fact Sheet (January 2026)
+# URL: https://www.citizensutilityboard.org/wp-content/uploads/2025/12/ComEdDeliveryTOD.pdf
 FLAT_DFCS: dict[str, float] = {
-    "C23": 5.698,
-    "C24": 4.354,
-    "C26": 2.712,
-    "C28": 2.576,
+    "C23": 6.228,
+    "C24": 4.791,
+    "C26": 3.165,
+    "C28": 2.996,
 }
+
+# ---------------------------------------------------------------------------
+# Supply rates
+# ---------------------------------------------------------------------------
+
+# Flat PTCs by season (cents/kWh)
+# Source: Client instruction (Eric, CUB) — current 2026 ComEd PTCs
+# No public URL; values provided via email
+FLAT_PTCS: dict[str, float] = {"summer": 10.028, "nonsummer": 9.660}
+
+# STOU supply rates loaded at runtime from this YAML (avoids rate drift)
+STOU_YAML_PATH = Path(__file__).resolve().parent.parent.parent / "rate_structures" / "comed_stou_2026.yaml"
 
 MONTHS = ["202301", "202307"]
 
 
-def _resolve_paths(billing_output_dir: Path, month: str) -> tuple[Path, Path, Path, Path]:
+def _month_to_season(month: str) -> str:
+    """Map YYYYMM to 'summer' (Jun-Sep) or 'nonsummer'."""
+    mm = int(month[4:6])
+    return "summer" if 6 <= mm <= 9 else "nonsummer"
+
+
+def _load_stou_supply_rates(yaml_path: Path) -> dict[str, dict[str, float]]:
+    """Parse STOU YAML into {season: {period: rate_cents_per_kwh}}."""
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+    rates: dict[str, dict[str, float]] = {}
+    for season in data["seasons"]:
+        rates[season["name"]] = {p["period"]: p["price"] for p in season["periods"]}
+    return rates
+
+
+def _resolve_paths(billing_output_dir: Path, month: str) -> tuple[Path, Path, Path]:
     """Derive all file paths from billing-output-dir and month."""
     run_name = f"statewide_stou_{month}_v2"
     run_dir = billing_output_dir / run_name / run_name
 
     hourly_loads_path = run_dir / "_tmp" / f"month={month}" / "hourly_loads.parquet"
-    supply_bills_path = run_dir / f"month={month}" / "household_bills.parquet"
     delivery_lookup_path = billing_output_dir / "delivery_class_lookup.parquet"
     output_dir = billing_output_dir / "stou_combined"
 
-    return hourly_loads_path, supply_bills_path, delivery_lookup_path, output_dir
+    return hourly_loads_path, delivery_lookup_path, output_dir
 
 
 def _aggregate_hourly_to_periods(hourly_loads_path: Path) -> pl.DataFrame:
@@ -210,43 +251,58 @@ def _compute_delivery_deltas(period_kwh: pl.DataFrame, delivery_lookup: pl.DataF
     )
 
 
-def _combine_with_supply(delivery: pl.DataFrame, supply: pl.DataFrame) -> pl.DataFrame:
-    """Join delivery deltas with supply-only household bills.
+def _compute_supply_inline(
+    period_kwh: pl.DataFrame, month: str, stou_rates: dict[str, dict[str, float]]
+) -> pl.DataFrame:
+    """Compute flat and STOU supply costs per household from period kWh.
 
-    Args:
-        delivery: Delivery deltas per household.
-        supply: Supply-only household bills DataFrame.
-
-    Returns:
-        Combined output with supply + delivery deltas and totals.
+    Returns a DataFrame with columns:
+        account_identifier, zip_code, bill_a_dollars (flat supply),
+        bill_b_dollars (STOU supply), supply_delta_dollars
     """
-    print(f"  Supply bills: {len(supply):,} rows")
+    season = _month_to_season(month)
+    flat_ptc = FLAT_PTCS[season]
+    season_rates = stou_rates[season]
 
-    # Identify the supply delta column (bill_diff_dollars in pipeline output)
-    if "bill_diff_dollars" in supply.columns:
-        supply = supply.rename({"bill_diff_dollars": "supply_delta_dollars"})
-    elif "bill_a_dollars" in supply.columns and "bill_b_dollars" in supply.columns:
-        supply = supply.with_columns(
-            (pl.col("bill_a_dollars") - pl.col("bill_b_dollars")).alias("supply_delta_dollars")
+    print(f"  Supply season: {season}")
+    print(f"  Flat PTC: {flat_ptc} ¢/kWh")
+    print(f"  STOU rates: {season_rates}")
+
+    # Build STOU rate expression: map each period to its cents/kWh rate
+    stou_rate_expr = pl.lit(0.0)
+    for period, rate in season_rates.items():
+        stou_rate_expr = pl.when(pl.col("period") == period).then(pl.lit(rate)).otherwise(stou_rate_expr)
+
+    supply = (
+        period_kwh.with_columns(
+            (pl.col("kwh_period") * flat_ptc / 100.0).alias("flat_supply_contrib"),
+            (pl.col("kwh_period") * stou_rate_expr / 100.0).alias("stou_supply_contrib"),
         )
-    else:
-        raise ValueError(f"Cannot derive supply delta from columns: {supply.columns}")
+        .group_by("account_identifier", "zip_code")
+        .agg(
+            pl.col("flat_supply_contrib").sum().alias("bill_a_dollars"),
+            pl.col("stou_supply_contrib").sum().alias("bill_b_dollars"),
+        )
+        .with_columns((pl.col("bill_a_dollars") - pl.col("bill_b_dollars")).alias("supply_delta_dollars"))
+    )
 
-    # Select only columns we need from supply
-    supply_cols = ["account_identifier", "bill_a_dollars", "bill_b_dollars", "supply_delta_dollars"]
-    supply = supply.select([c for c in supply_cols if c in supply.columns])
+    print(f"  Supply computed for {len(supply):,} households")
+    return supply
 
-    # Join on account_identifier
-    combined = delivery.join(supply, on="account_identifier", how="inner")
 
-    # Compute total bills and total delta
+def _combine_delivery_and_supply(delivery: pl.DataFrame, supply: pl.DataFrame) -> pl.DataFrame:
+    """Join delivery deltas with inline-computed supply costs.
+
+    Returns combined output with supply + delivery deltas and totals.
+    """
+    combined = delivery.join(supply, on=["account_identifier", "zip_code"], how="inner")
+
     combined = combined.with_columns(
         (pl.col("bill_a_dollars") + pl.col("flat_delivery_dollars")).alias("total_bill_a_dollars"),
         (pl.col("bill_b_dollars") + pl.col("tou_delivery_dollars")).alias("total_bill_b_dollars"),
         (pl.col("supply_delta_dollars") + pl.col("delivery_delta_dollars")).alias("total_delta_dollars"),
     )
 
-    # Percent savings (null if total_bill_a = 0)
     combined = combined.with_columns(
         pl.when(pl.col("total_bill_a_dollars") != 0)
         .then(pl.col("total_delta_dollars") / pl.col("total_bill_a_dollars") * 100)
@@ -272,16 +328,15 @@ def _combine_with_supply(delivery: pl.DataFrame, supply: pl.DataFrame) -> pl.Dat
     )
 
 
-def _validate(combined: pl.DataFrame, n_hourly_hh: int, n_supply_hh: int) -> None:
+def _validate(combined: pl.DataFrame, n_hourly_hh: int) -> None:
     """Print validation checks to stdout."""
     n_out = len(combined)
 
     # 1. Row counts
     print("\n  --- Validation ---")
     print(f"  Hourly loads households:  {n_hourly_hh:,}")
-    print(f"  Supply bills households:  {n_supply_hh:,}")
     print(f"  Combined output rows:     {n_out:,}")
-    drops_from_delivery = n_supply_hh - n_out if n_supply_hh > n_out else 0
+    drops_from_delivery = n_hourly_hh - n_out if n_hourly_hh > n_out else 0
     if drops_from_delivery > 0:
         print(f"  Dropped by delivery class join: {drops_from_delivery:,}")
 
@@ -331,7 +386,7 @@ def process_month(month: str, billing_output_dir: Path) -> int:
     print(f"Processing {month}")
     print(f"{'=' * 60}")
 
-    hourly_loads_path, supply_bills_path, delivery_lookup_path, output_dir = _resolve_paths(billing_output_dir, month)
+    hourly_loads_path, delivery_lookup_path, output_dir = _resolve_paths(billing_output_dir, month)
 
     # Check delivery class lookup exists
     if not delivery_lookup_path.exists():
@@ -346,9 +401,10 @@ def process_month(month: str, billing_output_dir: Path) -> int:
     if not hourly_loads_path.exists():
         print(f"ERROR: hourly loads not found at {hourly_loads_path}", file=sys.stderr)
         return 1
-    if not supply_bills_path.exists():
-        print(f"ERROR: supply bills not found at {supply_bills_path}", file=sys.stderr)
-        return 1
+
+    # Load STOU supply rates from YAML
+    stou_rates = _load_stou_supply_rates(STOU_YAML_PATH)
+    print(f"  Loaded STOU supply rates from {STOU_YAML_PATH.name}")
 
     # Load delivery class lookup
     delivery_lookup = pl.read_parquet(delivery_lookup_path)
@@ -363,15 +419,16 @@ def process_month(month: str, billing_output_dir: Path) -> int:
     delivery = _compute_delivery_deltas(period_kwh, delivery_lookup)
     print(f"  Delivery deltas computed for {len(delivery):,} households")
 
-    # Step 3: Combine with supply bills (single read)
-    supply_bills = pl.read_parquet(supply_bills_path)
-    n_supply_hh = len(supply_bills)
-    combined = _combine_with_supply(delivery, supply_bills)
+    # Step 3: Compute supply deltas inline (no household_bills.parquet dependency)
+    supply = _compute_supply_inline(period_kwh, month, stou_rates)
 
-    # Step 4: Validate
-    _validate(combined, n_hourly_hh, n_supply_hh)
+    # Step 4: Combine delivery + supply
+    combined = _combine_delivery_and_supply(delivery, supply)
 
-    # Step 5: Write output
+    # Step 5: Validate
+    _validate(combined, n_hourly_hh)
+
+    # Step 6: Write output
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"stou_combined_{month}.parquet"
     combined.sort("account_identifier").write_parquet(output_path)
