@@ -228,6 +228,10 @@ def main() -> int:
         # Clamp mean_delta to symmetric bound; NaN stays NaN.
         merged["mean_delta_clamped"] = merged["mean_delta"].clip(-bound, bound)
 
+        # Invert sign: positive = cost increase, negative = savings.
+        # Aligns with Felt's default diverging ramp (red=high=bad, blue=low=good).
+        merged["cost_change"] = -merged["mean_delta_clamped"]
+
         # Select output columns.
         out_cols = [
             "geoid_bg",
@@ -236,6 +240,7 @@ def main() -> int:
             "n_households",
             "median_household_income",
             "mean_delta_clamped",
+            "cost_change",
             "geometry",
         ]
         out_gdf = gpd.GeoDataFrame(merged[out_cols], geometry="geometry")
