@@ -54,12 +54,28 @@ SIGN_CONVENTION = (
     "negative = customer pays more under alt rate"
 )
 
-# The 4 scenarios we expect, mapped to their CSV filenames.
+# The 20 scenarios we expect: 4 pooled + 16 per-class, mapped to CSV filenames.
 SCENARIOS = {
     "stou_jan": "bg_level_stou_jan.csv",
     "stou_jul": "bg_level_stou_jul.csv",
     "dtou_jan": "bg_level_dtou_jan.csv",
     "dtou_jul": "bg_level_dtou_jul.csv",
+    "stou_jan_sf_no_esh": "bg_level_stou_jan_sf_no_esh.csv",
+    "stou_jan_mf_no_esh": "bg_level_stou_jan_mf_no_esh.csv",
+    "stou_jan_sf_esh": "bg_level_stou_jan_sf_esh.csv",
+    "stou_jan_mf_esh": "bg_level_stou_jan_mf_esh.csv",
+    "stou_jul_sf_no_esh": "bg_level_stou_jul_sf_no_esh.csv",
+    "stou_jul_mf_no_esh": "bg_level_stou_jul_mf_no_esh.csv",
+    "stou_jul_sf_esh": "bg_level_stou_jul_sf_esh.csv",
+    "stou_jul_mf_esh": "bg_level_stou_jul_mf_esh.csv",
+    "dtou_jan_sf_no_esh": "bg_level_dtou_jan_sf_no_esh.csv",
+    "dtou_jan_mf_no_esh": "bg_level_dtou_jan_mf_no_esh.csv",
+    "dtou_jan_sf_esh": "bg_level_dtou_jan_sf_esh.csv",
+    "dtou_jan_mf_esh": "bg_level_dtou_jan_mf_esh.csv",
+    "dtou_jul_sf_no_esh": "bg_level_dtou_jul_sf_no_esh.csv",
+    "dtou_jul_mf_no_esh": "bg_level_dtou_jul_mf_no_esh.csv",
+    "dtou_jul_sf_esh": "bg_level_dtou_jul_sf_esh.csv",
+    "dtou_jul_mf_esh": "bg_level_dtou_jul_mf_esh.csv",
 }
 
 # Columns carried from the BG-level CSV into the GeoJSON output.
