@@ -323,6 +323,10 @@ def main() -> int:
                 print(f"    Skipping {class_label}: only {bg_class.height} BGs with valid income")
                 continue
 
+            bg_class_csv = args.out_dir / f"bg_level_{scenario}_{class_label}.csv"
+            bg_class.sort("geoid_bg").write_csv(bg_class_csv)
+            print(f"    Wrote {bg_class_csv.name} ({bg_class.height:,} rows)")
+
             income_class = bg_class["median_household_income"].to_numpy() / 10_000
             for dep_var, col_name in [("mean_delta", "mean_delta"), ("mean_pct_savings", "mean_pct_savings")]:
                 y = bg_class[col_name].to_numpy()
