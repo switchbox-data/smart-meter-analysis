@@ -204,6 +204,72 @@ def _interpret(dep_var: str, beta_1: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 6 — Income quintiles
+# ---------------------------------------------------------------------------
+
+
+def compute_income_quintiles(
+    bg: pl.DataFrame,
+    label: str,
+) -> pl.DataFrame:
+    """Compute income-quintile summary statistics from BG-level data.
+
+    Assigns each block group to an income quintile (1 = lowest income),
+    then aggregates billing and demographic metrics within each quintile.
+
+    Parameters
+    ----------
+    bg : pl.DataFrame
+        BG-level DataFrame with columns: geoid_bg, mean_delta,
+        mean_pct_savings, median_delta, mean_kwh, n_households,
+        median_household_income.
+    label : str
+        Scenario label for logging (e.g., "stou_jan", "stou_jan_sf_no_esh").
+    """
+    # Filter out non-positive income (mirrors regression filter)
+    bg = bg.filter(pl.col("median_household_income") > 0)
+
+    # Sort deterministically: income ascending, geoid_bg as tiebreaker
+    bg = bg.sort("median_household_income", "geoid_bg")
+
+    n = bg.height
+    base_size = n // 5
+
+    # First 4 quintiles get base_size rows; quintile 5 absorbs remainder
+    assignments: list[int] = []
+    for q in range(1, 6):
+        if q < 5:
+            assignments.extend([q] * base_size)
+        else:
+            assignments.extend([q] * (n - len(assignments)))
+
+    bg = bg.with_columns(pl.Series("quintile", assignments))
+
+    return (
+        bg.group_by("quintile")
+        .agg(
+            pl.col("median_household_income").min().alias("income_min"),
+            pl.col("median_household_income").max().alias("income_max"),
+            pl.col("median_household_income").mean().alias("income_mean"),
+            pl.col("mean_delta").mean().alias("mean_delta_mean"),
+            pl.col("mean_pct_savings").mean().alias("mean_pct_savings_mean"),
+            pl.col("median_delta").mean().alias("median_delta_mean"),
+            pl.col("mean_kwh").mean().alias("mean_kwh_mean"),
+            pl.len().alias("n_bgs"),
+            pl.col("n_households").sum().alias("n_households"),
+            (pl.col("mean_delta") * pl.col("n_households")).sum().alias("_wt_delta"),
+            (pl.col("mean_pct_savings") * pl.col("n_households")).sum().alias("_wt_pct"),
+        )
+        .with_columns(
+            (pl.col("_wt_delta") / pl.col("n_households")).alias("hh_weighted_mean_delta"),
+            (pl.col("_wt_pct") / pl.col("n_households")).alias("hh_weighted_mean_pct_savings"),
+        )
+        .drop("_wt_delta", "_wt_pct")
+        .sort("quintile")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -270,6 +336,8 @@ def main() -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     regression_rows: list[dict[str, object]] = []
+    # Collect BG-level DataFrames for quintile analysis (second pass)
+    bg_datasets: list[tuple[str, str, str, str, pl.DataFrame]] = []
 
     # ------------------------------------------------------------------
     # Process each scenario
@@ -301,6 +369,7 @@ def main() -> int:
         bg_csv_path = args.out_dir / f"bg_level_{scenario}.csv"
         bg_all.sort("geoid_bg").write_csv(bg_csv_path)
         print(f"  Wrote {bg_csv_path.name} ({bg_all.height:,} rows)")
+        bg_datasets.append((scenario, month, rate, "all", bg_all))
 
         # Step 5: OLS regressions — pooled (all classes)
         income_scaled = bg_all["median_household_income"].to_numpy() / 10_000
@@ -326,6 +395,7 @@ def main() -> int:
             bg_class_csv = args.out_dir / f"bg_level_{scenario}_{class_label}.csv"
             bg_class.sort("geoid_bg").write_csv(bg_class_csv)
             print(f"    Wrote {bg_class_csv.name} ({bg_class.height:,} rows)")
+            bg_datasets.append((scenario, month, rate, class_label, bg_class))
 
             income_class = bg_class["median_household_income"].to_numpy() / 10_000
             for dep_var, col_name in [("mean_delta", "mean_delta"), ("mean_pct_savings", "mean_pct_savings")]:
@@ -351,6 +421,72 @@ def main() -> int:
             f"t={row['t_stat']:>8.3f}  p={row['p_value']:>8.4f}  R²={row['r_squared']:>8.4f}  n={row['n_obs']}"
         )
         print(_interpret(str(row["dep_var"]), float(row["beta_1"])))
+
+    # ------------------------------------------------------------------
+    # Quintile analysis (second pass over stored BG DataFrames)
+    # ------------------------------------------------------------------
+    print(f"\n{'=' * 60}")
+    print("Income quintile analysis")
+    print(f"{'=' * 60}")
+
+    all_quintile_dfs: list[pl.DataFrame] = []
+    pooled_quintiles: list[tuple[str, pl.DataFrame]] = []
+
+    for scenario, month, rate, delivery_class, bg_df in bg_datasets:
+        label = scenario if delivery_class == "all" else f"{scenario}_{delivery_class}"
+
+        # Check minimum BG count after filtering non-positive income
+        bg_valid = bg_df.filter(pl.col("median_household_income") > 0)
+        if bg_valid.height < 25:
+            print(f"  WARNING: {label} has only {bg_valid.height} BGs (< 25), skipping quintiles")
+            continue
+
+        q_df = compute_income_quintiles(bg_df, label)
+
+        # Write individual CSV
+        q_csv_path = args.out_dir / f"quintiles_{label}.csv"
+        q_df.write_csv(q_csv_path)
+        print(f"  Wrote {q_csv_path.name}")
+
+        # Add metadata columns for combined CSV
+        q_with_meta = q_df.select(
+            pl.lit(scenario).alias("scenario"),
+            pl.lit(month).alias("month"),
+            pl.lit(rate).alias("rate"),
+            pl.lit(delivery_class).alias("delivery_class"),
+            pl.all(),
+        )
+        all_quintile_dfs.append(q_with_meta)
+
+        if delivery_class == "all":
+            pooled_quintiles.append((scenario, q_df))
+
+    # Write combined quintile CSV
+    if all_quintile_dfs:
+        combined_q = pl.concat(all_quintile_dfs)
+        combined_csv_path = args.out_dir / "quintile_summary.csv"
+        combined_q.write_csv(combined_csv_path)
+        print(f"\n  Combined quintile summary: {combined_csv_path}")
+
+    # Print pooled quintile summary table
+    if pooled_quintiles:
+        print(f"\n{'=' * 60}")
+        print("Pooled quintile summary (all delivery classes)")
+        print(f"{'=' * 60}")
+        print(
+            f"  {'Scenario':<12s} {'Q':>2s}  {'Income Range':>27s}"
+            f"  {'Mean Δ':>10s}  {'Mean %':>8s}  {'BGs':>6s}  {'HH':>10s}"
+        )
+        for scenario, q_df in pooled_quintiles:
+            for row in q_df.iter_rows(named=True):
+                inc_range = f"${row['income_min']:,.0f}-${row['income_max']:,.0f}"
+                print(
+                    f"  {scenario:<12s} {row['quintile']:>2d}  {inc_range:>27s}"
+                    f"  ${row['mean_delta_mean']:>8.2f}"
+                    f"  {row['mean_pct_savings_mean']:>7.2f}%"
+                    f"  {row['n_bgs']:>6,d}"
+                    f"  {row['n_households']:>10,d}"
+                )
 
     print(f"\nAll outputs written to {args.out_dir}")
     print("Done.")
