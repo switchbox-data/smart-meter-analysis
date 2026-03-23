@@ -30,10 +30,17 @@ citation:
 #| echo: false
 #| message: false
 
-# TODO: Load pipeline outputs here (e.g., from parquet, CSV, or pickled dict)
-# import pickle
-# with open("cache/report_variables.pkl", "rb") as f:
-#     vars = pickle.load(f)
+import pickle
+from pathlib import Path
+from types import SimpleNamespace
+
+v = SimpleNamespace(**pickle.loads(Path("cache/report_variables.pkl").read_bytes()))
+
+def dollar(x, accuracy=0):
+    return f"${x:,.{accuracy}f}"
+
+def pct(x, accuracy=0):
+    return f"{x * 100:,.{accuracy}f}%"
 ```
 
 
@@ -75,16 +82,16 @@ under different rate structures. Three questions guide the analysis:
 
 ## Executive Summary
 
-We compare `{python} f"{n_households_jan:,}"` to
-`{python} f"{n_households_jul:,}"` accounts across the peak months for heating
+We compare `{python} f"{v.n_households_jan:,}"` to
+`{python} f"{v.n_households_jul:,}"` accounts across the peak months for heating
 (January) and cooling (July) to measure the bill effects of ComEd's new TOU
 rates: **Delivery Time of Use** (DTOU) and **Rate BEST**.
 
-- **More than `{python} f"{pct_save_worst_case:.0f}"`% of households would save money under either TOU rate structure.**
+- **More than `{python} f"{v.pct_save_worst_case:.0f}"`% of households would save money under either TOU rate structure.**
 Even in the least favorable scenario (DTOU in July) `{python}
-f"{pct_save_dtou_jul:.1f}"`% of households would pay less than they do under the
+f"{v.pct_save_dtou_jul:.1f}"`% of households would pay less than they do under the
 flat rate, even with no change in behavior. Under Rate BEST in January, that
-figure rises to `{python} f"{pct_save_stou_jan:.1f}"`%.
+figure rises to `{python} f"{v.pct_save_stou_jan:.1f}"`%.
 
 - **Neither rate structure would disproportionately burden lower-income communities.**
 We measured savings as the percentage of each household's total bill to account
@@ -95,13 +102,13 @@ cost lower-income households more (**regressive**). For July, both rates are
 mildly progressive. So during the summer, lower-income neighborhoods save a
 larger share of their bill than higher-income ones do. Under Rate BEST in July,
 the lowest-income quintile of neighborhoods would save
-`{python} f"{stou_jul_q1_pct_savings:.1f}"`% of their bill, compared
-to `{python} f"{stou_jul_q5_pct_savings:.1f}"`% for the highest-income quintile:
-a gap of `{python} f"{stou_jul_q1q5_gap:.1f}"` percentage points.
+`{python} f"{v.stou_jul_q1_pct_savings:.1f}"`% of their bill, compared
+to `{python} f"{v.stou_jul_q5_pct_savings:.1f}"`% for the highest-income quintile:
+a gap of `{python} f"{v.stou_jul_q1q5_gap:.1f}"` percentage points.
 
-- **The average block group would save `{python} f"${bg_mean_stou_jan:.2f}"` per month under Rate BEST in January, compared to `{python} f"${bg_mean_dtou_jan:.2f}"` under DTOU** — roughly three
+- **The average block group would save `{python} f"${v.bg_mean_stou_jan:.2f}"` per month under Rate BEST in January, compared to `{python} f"${v.bg_mean_dtou_jan:.2f}"` under DTOU** — roughly three
 to four times more. Across both seasons, monthly savings range from `{python}
-f"${bg_mean_dtou_jul:.2f}"` (DTOU in July) to `{python} f"${bg_mean_stou_jan:.2f}"`
+f"${v.bg_mean_dtou_jul:.2f}"` (DTOU in July) to `{python} f"${v.bg_mean_stou_jan:.2f}"`
 (Rate BEST in January). These savings are driven by Rate BEST's supply charges,
 which are far below the current flat supply rate during off-peak hours.
 
@@ -185,8 +192,8 @@ Rate BEST, timing could produce big savings for ComEd customers.
 
 ## Scope and approach
 
-We simulate what `{python} f"{n_households_jan:,}"` to
-`{python} f"{n_households_jul:,}"` ComEd residential accounts would have paid
+We simulate what `{python} f"{v.n_households_jan:,}"` to
+`{python} f"{v.n_households_jul:,}"` ComEd residential accounts would have paid
 under each TOU rate structure, using their 2023 half-hour usage data. We then
 compare those simulated bills to what each household would have paid under the
 current flat rate to measure who saves, who pays more, and whether the answer
@@ -259,11 +266,11 @@ small in absolute terms. However, they are also widespread.
 
 Under DTOU, the vast majority of households would save money with no change in
 behavior. Even in the least favorable scenario (July),
-**`{python} f"{pct_save_dtou_jul:.1f}"`%** of households would pay less under
+**`{python} f"{v.pct_save_dtou_jul:.1f}"`%** of households would pay less under
 DTOU than under the flat rate. In January, that figure rises to
-**`{python} f"{pct_save_dtou_jan:.1f}"`%**. The average block group would save
-**$`{python} f"{bg_mean_dtou_jan:.2f}"`** in January and
-**$`{python} f"{bg_mean_dtou_jul:.2f}"`** in July.
+**`{python} f"{v.pct_save_dtou_jan:.1f}"`%**. The average block group would save
+**$`{python} f"{v.bg_mean_dtou_jan:.2f}"`** in January and
+**$`{python} f"{v.bg_mean_dtou_jul:.2f}"`** in July.
 
 <!-- TODO: fig-map-dtou-jan — Felt map of mean bill change under DTOU, January.
      Blue = saves, red = pays more. Color range ±$25.45. -->
@@ -279,9 +286,9 @@ flatter usage patterns.
 But is the pattern equitable? We found that
 **DTOU is not meaningfully regressive in either season.** In winter, the income
 gradient on percentage savings is trivially small: the lowest-income quintile of
-block groups would save **`{python} f"{dtou_jan_q1_pct:.1f}"`%** of their bill,
-compared to **`{python} f"{dtou_jan_q5_pct:.1f}"`%** for the highest-income
-quintile. This gap of `{python} f"{dtou_jan_q1q5_gap:.1f}"` percentage points
+block groups would save **`{python} f"{v.dtou_jan_q1_pct:.1f}"`%** of their bill,
+compared to **`{python} f"{v.dtou_jan_q5_pct:.1f}"`%** for the highest-income
+quintile. This gap of `{python} f"{v.dtou_jan_q1q5_gap:.1f}"` percentage points
 has no practical policy significance.[^fn-dtou-jan-r2]
 
 [^fn-dtou-jan-r2]: The pooled DTOU January regression is statistically
@@ -290,9 +297,9 @@ essentially none of the variation in percentage savings.
 
 In summer, the pattern tilts progressive. Lower-income block groups would save a
 larger share of their bill than higher-income ones:
-**`{python} f"{dtou_jul_q1_pct:.1f}"`%** for the lowest-income quintile versus
-**`{python} f"{dtou_jul_q5_pct:.1f}"`%** for the highest: a gap of
-`{python} f"{dtou_jul_q1q5_gap:.1f}"` percentage points. In other words, DTOU
+**`{python} f"{v.dtou_jul_q1_pct:.1f}"`%** for the lowest-income quintile versus
+**`{python} f"{v.dtou_jul_q5_pct:.1f}"`%** for the highest: a gap of
+`{python} f"{v.dtou_jul_q1q5_gap:.1f}"` percentage points. In other words, DTOU
 slightly favors lower-income neighborhoods in summer and is essentially neutral
 in winter.
 
@@ -308,10 +315,10 @@ supply and delivery charges by time of day, the bill impacts are substantially
 larger and the equity patterns are sharper.
 
 The savings are near-universal. In January,
-**`{python} f"{pct_save_stou_jan:.1f}"`%** of households would save money under
-Rate BEST. In July, **`{python} f"{pct_save_stou_jul:.1f}"`%** would save. The
-average block group would save **$`{python} f"{bg_mean_stou_jan:.2f}"`** in
-January and **$`{python} f"{bg_mean_stou_jul:.2f}"`** in July — roughly three to
+**`{python} f"{v.pct_save_stou_jan:.1f}"`%** of households would save money under
+Rate BEST. In July, **`{python} f"{v.pct_save_stou_jul:.1f}"`%** would save. The
+average block group would save **$`{python} f"{v.bg_mean_stou_jan:.2f}"`** in
+January and **$`{python} f"{v.bg_mean_stou_jul:.2f}"`** in July — roughly three to
 four times the DTOU savings.
 
 <!-- TODO: fig-map-stou-jan — Felt map of mean bill change under Rate BEST,
@@ -332,10 +339,10 @@ savings. This leads us back to the question of equity.
 **In summer, Rate BEST is mildly progressive.** Lower-income block groups would
 save a larger share of their bill than higher-income ones. Across all delivery
 classes, the lowest-income quintile would save
-**`{python} f"{stou_jul_q1_pct_savings:.1f}"`%** of their July bill, compared to
-**`{python} f"{stou_jul_q5_pct_savings:.1f}"`%** for the highest-income
+**`{python} f"{v.stou_jul_q1_pct_savings:.1f}"`%** of their July bill, compared to
+**`{python} f"{v.stou_jul_q5_pct_savings:.1f}"`%** for the highest-income
 quintile: a gap of
-**`{python} f"{stou_jul_q1q5_gap:.1f}"` percentage points**.
+**`{python} f"{v.stou_jul_q1q5_gap:.1f}"` percentage points**.
 
 <!-- TODO: fig-scatter-stou-jul-pct — Scatterplot of block group median income
      (x) vs. percentage savings under Rate BEST in July (y), with OLS regression
@@ -344,18 +351,18 @@ quintile: a gap of
 The scatterplot makes the summer pattern visible. Each dot is a block group. The
 downward slope confirms that lower-income neighborhoods save a proportionally
 larger share of their bill. The relationship is modest (income explains about
-`{python} f"{stou_jul_r2:.1f}"`% of the variation) but it is statistically
+`{python} f"{v.stou_jul_r2:.1f}"`% of the variation) but it is statistically
 robust and consistent across customer types. Among single-family gas-heated
 homes, the largest customer class, the pattern is monotonic across all five
-income quintiles: **`{python} f"{c23_stou_jul_q1_pct:.2f}"`%** for the
+income quintiles: **`{python} f"{v.c23_stou_jul_q1_pct:.2f}"`%** for the
 lowest-income quintile, declining steadily to
-**`{python} f"{c23_stou_jul_q5_pct:.2f}"`%** for the highest — a gap of
-**`{python} f"{c23_stou_jul_q1q5_gap:.1f}"` percentage points**.
+**`{python} f"{v.c23_stou_jul_q5_pct:.2f}"`%** for the highest — a gap of
+**`{python} f"{v.c23_stou_jul_q1q5_gap:.1f}"` percentage points**.
 
 **In winter, the income gradient on percentage savings disappears.** The pooled
 Rate BEST January regression is not statistically significant
-(p = `{python} f"{stou_jan_p_value:.3f}"`). Percentage savings hover around
-`{python} f"{stou_jan_mean_pct:.1f}"`% across all income quintiles, with no
+(p = `{python} f"{v.stou_jan_p_value:.3f}"`). Percentage savings hover around
+`{python} f"{v.stou_jan_mean_pct:.1f}"`% across all income quintiles, with no
 meaningful trend. In other words, everyone saves roughly the same share of their
 bill in winter, regardless of income.
 
@@ -371,21 +378,21 @@ The answer is not about when people use electricity. It's about the level of
 Rate BEST's off-peak supply rates.
 
 Under the current flat rate, ComEd customers pay roughly
-**`{python} f"{flat_ptc_nonsummer:.3f}"`¢ per kilowatt-hour** for supply. Under
+**`{python} f"{v.flat_ptc_nonsummer:.3f}"`¢ per kilowatt-hour** for supply. Under
 the illustrative "placeholder" rates that ComEd showed the ICC, the off-peak
 supply charges (morning, evening, and overnight) range from roughly
-**`{python} f"{bestec_low:.1f}"`¢ to `{python} f"{bestec_high:.1f}"`¢**. That is
+**`{python} f"{v.bestec_low:.1f}"`¢ to `{python} f"{v.bestec_high:.1f}"`¢**. That is
 a discount of **60–70%** below the flat rate during most hours of the day.
 
 Most residential electricity consumption falls outside the expensive mid-day
 peak window (1–7 PM). The math is simple: when off-peak rates are 60–70% below
 the flat rate, and most consumption is off-peak, nearly every household saves
 money. The mid-day peak supply charge (roughly
-`{python} f"{bestec_peak_summer:.1f}"`¢ in summer) is high, but it applies to a
+`{python} f"{v.bestec_peak_summer:.1f}"`¢ in summer) is high, but it applies to a
 relatively small share of the total consumption. For the vast majority of
 households, the big off-peak savings overwhelm the peak penalty.
 
-This is why `{python} f"{pct_save_stou_jan:.1f}"`% of households save under Rate
+This is why `{python} f"{v.pct_save_stou_jan:.1f}"`% of households save under Rate
 BEST in January. It is not because those households have unusually favorable
 usage patterns. It is because the off-peak supply rates ComEd has provided so
 far are so low.
@@ -436,8 +443,8 @@ AMI meters, anonymized under the 15/15 Rule.
 
 | Month | Accounts in raw data | Accounts in BG-level analysis |
 |-------|---------------------|-------------------------------|
-| January 2023 | `{python} f"{n_households_jan:,}"` | `{python} f"{n_bg_analysis_jan:,}"` |
-| July 2023 | `{python} f"{n_households_jul:,}"` | `{python} f"{n_bg_analysis_jul:,}"` |
+| January 2023 | `{python} f"{v.n_households_jan:,}"` | `{python} f"{v.n_bg_analysis_jan:,}"` |
+| July 2023 | `{python} f"{v.n_households_jul:,}"` | `{python} f"{v.n_bg_analysis_jul:,}"` |
 
 The difference between raw and BG-level counts reflects two filters: (1) an
 inner join to the account-to-block-group crosswalk, which drops approximately
@@ -483,8 +490,8 @@ the American Community Survey 2023 5-year estimates.
 | Median BG median income | $88,710 |
 | Minimum | $2,500 |
 | Maximum | $250,002 (Census top-code) |
-| Total BGs with data (Jan) | `{python} f"{n_bgs_jan:,}"` |
-| Total BGs with data (Jul) | `{python} f"{n_bgs_jul:,}"` |
+| Total BGs with data (Jan) | `{python} f"{v.n_bgs_jan:,}"` |
+| Total BGs with data (Jul) | `{python} f"{v.n_bgs_jul:,}"` |
 
 
 #### Bill calculation
