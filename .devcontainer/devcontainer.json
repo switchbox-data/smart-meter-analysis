@@ -1,5 +1,6 @@
 {
   "name": "smart_meter_analysis",
+  "runArgs": ["--ulimit", "nofile=65536:65536"],
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
