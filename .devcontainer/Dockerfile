@@ -23,3 +23,6 @@ RUN rm -f /etc/apt/sources.list.d/yarn.list && \
     apt-get update && \
     apt-get install -y chromium && \
     apt-get clean
+
+# Create workspaces directory expected by devcontainer
+RUN mkdir -p /workspaces
