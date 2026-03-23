@@ -1,5 +1,6 @@
 {
   "name": "smart_meter_analysis",
+  "workspaceFolder": "/workspaces/smart-meter-analysis",
   "runArgs": ["--ulimit", "nofile=65536:65536"],
   "build": {
     "dockerfile": "Dockerfile",
@@ -14,7 +15,8 @@
   },
   "postCreateCommand": "./.devcontainer/postCreateCommand.sh",
   "containerEnv": {
-    "QUARTO_PYTHON": "/workspaces/smart-meter-analysis/.venv/bin/python"
+    "UV_PROJECT_ENVIRONMENT": "/opt/venv",
+    "QUARTO_PYTHON": "/opt/venv/bin/python"
   },
   "customizations": {
     "vscode": {
@@ -28,8 +30,8 @@
         "python.testing.pytestArgs": ["tests"],
         "python.testing.unittestEnabled": false,
         "python.testing.pytestEnabled": true,
-        "python.defaultInterpreterPath": "/workspaces/smart-meter-analysis/.venv/bin/python",
-        "python.testing.pytestPath": "/workspaces/smart-meter-analysis/.venv/bin/pytest",
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.testing.pytestPath": "/opt/venv/bin/pytest",
         "python.terminal.activateEnvironment": true
       }
     }

@@ -25,4 +25,6 @@ RUN rm -f /etc/apt/sources.list.d/yarn.list && \
     apt-get clean
 
 # Create workspaces directory expected by devcontainer
-RUN mkdir -p /workspaces
+RUN mkdir -p /workspaces/smart-meter-analysis
+RUN mkdir -p /opt/venv && chown vscode:vscode /opt/venv
+WORKDIR /workspaces/smart-meter-analysis
