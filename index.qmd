@@ -182,8 +182,9 @@ how much) matters. Because demand costs are relatively stable throughout the
 day, under DTOU timing matters relatively less. But as this memo shows, under
 Rate BEST, timing could produce big savings for ComEd customers.
 
-<!-- TODO: @fig-rate-structures — side-by-side visual comparing flat, DTOU,
-     and Rate BEST rate structures across the four time blocks? -->
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-rate-structures >}}
+:::
 
 
 <!-- ============================================================
@@ -344,9 +345,9 @@ classes, the lowest-income quintile would save
 quintile: a gap of
 **`{python} f"{v.stou_jul_q1q5_gap:.1f}"` percentage points**.
 
-<!-- TODO: fig-scatter-stou-jul-pct — Scatterplot of block group median income
-     (x) vs. percentage savings under Rate BEST in July (y), with OLS regression
-     line and 95% confidence band. Downward slope = progressive. -->
+:::{.column-page-inset-right}
+{{< embed notebooks/analysis.qmd#fig-scatter-stou-jul-pct >}}
+:::
 
 The scatterplot makes the summer pattern visible. Each dot is a block group. The
 downward slope confirms that lower-income neighborhoods save a proportionally
