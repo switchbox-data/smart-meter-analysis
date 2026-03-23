@@ -18,5 +18,8 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv
     ./aws/install && \
     rm -rf aws awscliv2.zip
 
-# Install Chromium
-RUN apt-get update && apt-get install -y chromium && apt-get clean
+# Install Chromium (remove stale yarn repo first to unblock apt-get update)
+RUN rm -f /etc/apt/sources.list.d/yarn.list && \
+    apt-get update && \
+    apt-get install -y chromium && \
+    apt-get clean
