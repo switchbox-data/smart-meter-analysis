@@ -10,7 +10,7 @@ author:
 
 keywords: [time-of-use rates, ComEd, rate equity, smart meter data, DTOU, Rate BEST]
 
-bibliography: ../references.bib
+bibliography: references.bib
 license: "CC BY-NC"
 
 toc: true
@@ -144,7 +144,7 @@ infrastructure that transports it to your home.
 :::
 
 Both of these components cost more at some points during the day than others. A
-flat rate doesn't reflect this difference and simply chargesa single "average"
+flat rate doesn't reflect this difference and simply charges a single "average"
 price for all hours of the day.
 
 **Time-of-use (TOU) rates** replace that single flat price with prices that vary
@@ -283,10 +283,9 @@ DTOU than under the flat rate. In January, that figure rises to
 **$`{python} f"{v.bg_mean_dtou_jan:.2f}"`** in January and
 **$`{python} f"{v.bg_mean_dtou_jul:.2f}"`** in July.
 
-<!-- TODO: fig-map-dtou-jan — Felt map of mean bill change under DTOU, January.
-     Blue = saves, red = pays more. Color range ±$25.45. -->
+<iframe width="100%" height="500" frameborder="0" title="DTOU January" src="https://felt.com/embed/map/DTOU-January-W4lO5hIER9ACQXMRRUVhJUC?loc=39.795,-89.267,6.74z"></iframe>
 
-<!-- TODO: fig-map-dtou-jul — Felt map of mean bill change under DTOU, July. -->
+<iframe width="100%" height="500" frameborder="0" title="DTOU July" src="https://felt.com/embed/map/DTOU-July-1b4Tp9CjeQgabwnAocrM20D?loc=39.795,-89.267,6.74z"></iframe>
 
 The maps tell a straightforward story. In January, the territory is
 predominantly blue — nearly every block group saves money on average. In July,
@@ -332,15 +331,13 @@ average block group would save **$`{python} f"{v.bg_mean_stou_jan:.2f}"`** in
 January and **$`{python} f"{v.bg_mean_stou_jul:.2f}"`** in July — roughly three to
 four times the DTOU savings.
 
-<!-- TODO: fig-map-stou-jan — Felt map of mean bill change under Rate BEST,
-     January. Blue = saves. Color range ±$25.45. -->
+<iframe width="100%" height="500" frameborder="0" title="Rate BEST January" src="https://felt.com/embed/map/STOU-January-ZzD4gI2PRZGS9ArFjbv7QZD?loc=39.795,-89.504,6.74z"></iframe>
 
 The January map is entirely blue. Every single block group saves money on
 average. The uniformity is striking, and it's driven by the structure of Rate
 BEST's supply rates, which we'll examine in the next section.
 
-<!-- TODO: fig-map-stou-jul — Felt map of mean bill change under Rate BEST,
-     July. Color range ±$25.45. -->
+<iframe width="100%" height="500" frameborder="0" title="Rate BEST July" src="https://felt.com/embed/map/STOU-July-ru57u4vcTLuX0Uwno9C9An2B?loc=39.795,-89.267,6.74z"></iframe>
 
 The July map shows more texture. Savings are still overwhelmingly positive, but
 the variation across neighborhoods is greater. Some block groups, particularly

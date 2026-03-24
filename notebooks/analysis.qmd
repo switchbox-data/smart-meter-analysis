@@ -142,16 +142,16 @@ print(f"DTOU July: {dtou_jul.height:,} households × {dtou_jul.width} columns")
 dtou_jul.head(5)
 ```
 
-Each row represents one household's monthly billing outcome. The key column is
-`delta` (flat bill minus alternative bill, in dollars) — positive means the
-household saves under TOU.
+Each row represents one household's monthly billing outcome. The key savings
+column differs by rate type: STOU parquets use `total_delta_dollars`, DTOU
+parquets use `dtou_total_delta_dollars`. In both cases positive means the
+household saves under TOU (flat minus alternative).
 
 ::: {.callout-note}
-## Column names may vary
-The exact column names in these parquets depend on the upstream pipeline
-configuration. If the delta column is named something other than `delta`
-(e.g., `bill_diff_dollars`, `savings`), update the references below. Run
-`stou_jan.columns` to check.
+## Parquet column names
+STOU parquets store flat-minus-alternative savings in `total_delta_dollars`.
+DTOU parquets store the same quantity in `dtou_total_delta_dollars`. Both
+follow the same sign convention: positive = customer saves under TOU.
 :::
 
 
@@ -275,23 +275,25 @@ with positive delta (i.e., they would save under the alternative rate).
 #| label: compute-pct-saving
 
 # ── STOU ─────────────────────────────────────────────────────────────────
-# NOTE: Adjust column name if delta is stored under a different name.
-# Check stou_jan.columns if this fails.
-DELTA_COL = "delta"
+# STOU parquets store flat-minus-alternative savings in total_delta_dollars.
+STOU_DELTA_COL = "total_delta_dollars"
 
 report_vars["pct_save_stou_jan"] = round(
-    (stou_jan[DELTA_COL] > 0).mean() * 100, 1
+    (stou_jan[STOU_DELTA_COL] > 0).mean() * 100, 1
 )
 report_vars["pct_save_stou_jul"] = round(
-    (stou_jul[DELTA_COL] > 0).mean() * 100, 1
+    (stou_jul[STOU_DELTA_COL] > 0).mean() * 100, 1
 )
 
 # ── DTOU ─────────────────────────────────────────────────────────────────
+# DTOU parquets store flat-minus-alternative savings in dtou_total_delta_dollars.
+DTOU_DELTA_COL = "dtou_total_delta_dollars"
+
 report_vars["pct_save_dtou_jan"] = round(
-    (dtou_jan[DELTA_COL] > 0).mean() * 100, 1
+    (dtou_jan[DTOU_DELTA_COL] > 0).mean() * 100, 1
 )
 report_vars["pct_save_dtou_jul"] = round(
-    (dtou_jul[DELTA_COL] > 0).mean() * 100, 1
+    (dtou_jul[DTOU_DELTA_COL] > 0).mean() * 100, 1
 )
 
 # ── Worst-case floor stated in the executive summary ─────────────────────
@@ -562,10 +564,9 @@ We extract three specific results that appear in the report narrative.
 ```{python}
 #| label: extract-regression
 
-# NOTE: Adjust column names and filter values based on actual
-# regression_summary.csv structure. Print columns above to verify.
-# Expected columns might include: rate_type, month, outcome, p_value,
-# r_squared, mean_pct, etc.
+# Regression summary columns: scenario, month, rate, delivery_class, dep_var,
+# beta_0, beta_1, se_beta_1, t_stat, p_value, r_squared, n_obs.
+# Filter on "rate" (not "rate_type") and "dep_var" (not "outcome").
 
 print("Regression summary columns for reference:")
 print(regression_df.columns)
@@ -580,43 +581,32 @@ regression_df
 # The report states: "STOU January percentage savings is NOT progressive
 # (p=0.357)." This p-value comes from the income coefficient in the
 # STOU January pct_savings regression.
-#
-# Adjust the filter logic below to match your regression_summary.csv
-# column names. The values are verified from the pipeline — if the filter
-# doesn't match, hardcode from the known values.
 
-# Attempt to extract from the CSV; fall back to hardcoded if structure unknown
-try:
-    stou_jan_row = regression_df.filter(
-        (pl.col("rate_type") == "stou")
-        & (pl.col("month") == "202301")
-        & (pl.col("outcome").str.contains("pct"))
-    )
-    if stou_jan_row.height > 0:
-        report_vars["stou_jan_p_value"] = round(stou_jan_row["p_value"][0], 3)
-        report_vars["stou_jan_mean_pct"] = round(stou_jan_row["mean_pct"][0], 2)
-    else:
-        raise ValueError("No matching row found")
-except Exception:
-    # Hardcoded fallback from verified pipeline outputs
+stou_jan_row = regression_df.filter(
+    (pl.col("rate") == "stou")
+    & (pl.col("month") == 202301)
+    & (pl.col("dep_var").str.contains("pct"))
+)
+if stou_jan_row.height > 0:
+    report_vars["stou_jan_p_value"] = round(stou_jan_row["p_value"][0], 3)
+else:
     report_vars["stou_jan_p_value"] = 0.357
-    report_vars["stou_jan_mean_pct"] = 25.66
-    print("⚠ Used hardcoded regression values — verify regression_summary.csv columns")
+    print("⚠ No matching row for STOU January p-value — using hardcoded fallback")
+
+# There is no mean_pct column in regression_summary.csv — hardcode from pipeline output.
+report_vars["stou_jan_mean_pct"] = 25.66
 
 # ── STOU July R² ─────────────────────────────────────────────────────────
-try:
-    stou_jul_row = regression_df.filter(
-        (pl.col("rate_type") == "stou")
-        & (pl.col("month") == "202307")
-        & (pl.col("outcome").str.contains("pct"))
-    )
-    if stou_jul_row.height > 0:
-        report_vars["stou_jul_r2"] = round(stou_jul_row["r_squared"][0], 2)
-    else:
-        raise ValueError("No matching row found")
-except Exception:
+stou_jul_row = regression_df.filter(
+    (pl.col("rate") == "stou")
+    & (pl.col("month") == 202307)
+    & (pl.col("dep_var").str.contains("pct"))
+)
+if stou_jul_row.height > 0:
+    report_vars["stou_jul_r2"] = round(stou_jul_row["r_squared"][0], 2)
+else:
     report_vars["stou_jul_r2"] = 7.04
-    print("⚠ Used hardcoded R² — verify regression_summary.csv columns")
+    print("⚠ No matching row for STOU July R² — using hardcoded fallback")
 
 print(f"STOU January p-value (income → pct savings): {report_vars['stou_jan_p_value']}")
 print(f"STOU January mean pct savings: {report_vars['stou_jan_mean_pct']}%")
