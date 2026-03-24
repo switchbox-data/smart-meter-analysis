@@ -46,12 +46,17 @@ def pct(x, accuracy=0):
 
 ## Introduction
 
-Today, most of ComEd's residential customers pay a **flat rate**. That means
-their electricity costs them the same price at every hour of the day. But this
-year, ComEd is introducing two new **time-of-use** (TOU) rates. Under TOU rates
-customers pay more for energy when the power grid is under strain, and less when
-demand is smaller. So electricity is expensive when everyone blasts their AC on
-a hot summer afternoon but cheaper at 1 AM that same night.
+Today, most of ComEd's residential customers pay a **flat rate** for their
+electiricty. That means that they pay the same amount of money for a given
+amount of electrical usage, at any time of day, on any date throughout the
+year. 
+
+This year, ComEd is introducing two new **time-of-use** (TOU) rates. Under TOU
+rates, customers pay more for energy during the times when the power grid is
+most likely to be under strain, and less when demand is typically smaller.
+Electricity is expensive when everyone blasts their AC on a hot summer
+afternoon, but cheaper at 1 AM that same night. This is designed to incentivize
+people to shift their usage to times that create less strain on the grid.
 
 These new rates are the product of a years-long regulatory process. Illinois's
 2021 **Climate and Equitable Jobs Act** (CEJA) directed utility companies to
@@ -59,8 +64,8 @@ promote electrification and to shift electricity demand away from peak hours:
 making the grid more resilient and reducing costs for customers. This
 legislation created the context for the **Illinois Commerce Commission** (ICC)
 to approve both TOU programs in 2025 after extensive stakeholder negotiations
-involving ComEd, the **Citizens Utility Board** (CUB), environmental groups, and
-competitive energy suppliers.[^fn-reg-context]
+involving ComEd, the **Citizens Utility Board** (CUB), environmental groups,
+and competitive energy suppliers.[^fn-reg-context]
 
 [^fn-reg-context]: For a fuller account of the regulatory history, see the
 Regulatory Context section of the Appendix.
@@ -71,14 +76,19 @@ using it during the cheaper off-peak hours and avoiding the more expensive peak
 hours. But how much money could they save, exactly? And who would save the most?
 
 This memo analyzes data from **smart meters** installed across ComEd's service
-territory. These devices track how much electricity a customer uses on a
-half-hourly basis: making it easy to compare the costs of the same behavior
-under different rate structures. Three questions guide the analysis:
+territory, for two key months: January and July. Smart meters track how much
+electricity a customer uses on a half-hourly basis, making it easy to compare
+the costs of the same behavior under different rate structures. Three questions
+guide the analysis:
 
 1. How would different households' bills change under ComEd's new TOU rates?
 2. Would lower-income households be negatively affected?
 3. If one of the two new TOU rates outperforms the other, why?
 
+A full analysis would model how customer behavior might change in response to
+changes in the rate structure. In this case, we are assuming that customers
+sign up, but then continue to use electricity as usual. As a result, these are
+conservative estimates on how much households might save.
 
 ## Executive Summary
 
