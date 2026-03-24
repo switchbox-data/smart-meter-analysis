@@ -127,6 +127,7 @@ fix = true
 exclude = [
     "archive/",
     "lib/",
+    "_manuscript/",
     ".git",
     ".venv",
     "__pycache__",

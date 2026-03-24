@@ -1,0 +1,62 @@
+<script>
+  const figures = document.querySelectorAll('figcaption')
+
+  figures.forEach(figure => {
+  const idx = figure.innerHTML.indexOf(':')
+  const figureNum = figure.innerHTML.slice(0, idx)
+  const text = figure.innerHTML.slice(idx + 1)
+    figure.innerHTML = `<p class="figure">${figureNum}:</p><p>${text}</p>`
+  })
+
+  function footnoteNum(el) {
+    const m = el.id && el.id.match(/^fn(\d+)$/)
+    return m ? parseInt(m[1], 10) : Infinity
+  }
+
+  function fixMarginFootnotes() {
+    const sel = '.no-row-height.column-margin.column-container'
+    const all = [...document.querySelectorAll(sel)]
+
+    // 1. Consolidate adjacent containers and sort children by footnote number
+    let i = 0
+    while (i < all.length) {
+      let j = i + 1
+      while (j < all.length && all[j].previousElementSibling === all[j - 1]) {
+        j++
+      }
+      if (j - i > 1) {
+        const run = all.slice(i, j)
+        const target = run[0]
+        const children = []
+        for (const c of run) {
+          for (const child of [...c.children]) children.push(child)
+        }
+        children.sort((a, b) => footnoteNum(a) - footnoteNum(b))
+        for (const child of children) target.appendChild(child)
+        for (let k = 1; k < run.length; k++) run[k].remove()
+      }
+      i = j
+    }
+
+    // 2. Fix overlap on ALL margin children across the page
+    const marginChildren = document.querySelectorAll(
+      '.column-margin.column-container > *'
+    )
+    let lastBottom = 0
+    for (const child of marginChildren) {
+      if (child.offsetParent === null) continue
+      child.style.marginTop = null
+      const rect = child.getBoundingClientRect()
+      const top = rect.top + window.scrollY
+      if (top < lastBottom) {
+        child.style.marginTop = (lastBottom - top) + 'px'
+      }
+      const newRect = child.getBoundingClientRect()
+      lastBottom = newRect.top + window.scrollY + newRect.height + 4
+    }
+  }
+
+  window.addEventListener('load', () => {
+    setTimeout(fixMarginFootnotes, 100)
+  })
+</script>

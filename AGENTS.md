@@ -641,6 +641,9 @@ Keep status updated as work progresses — this is critical for team visibility:
 12. **Use the conditional "would"** for modeled outcomes, never "will."
 13. **When adding or removing files under `reports/`**, verify `_quarto.yml` render lists are updated.
 14. **Respect data boundaries.** Don't assume large data is in git. Follow S3 paths documented in existing notebooks.
+15. **Never under any circumstances** make a commit with agent attribution. Commits should never include "co-authored by Claude
+or any similar message.
+16. **Always** make sure commits are made with an appropriate message pass all pre-commit hooks, mypy tests, deptry tests, and ruff tests
 
 ## Quarto reference
 

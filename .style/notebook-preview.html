@@ -1,0 +1,40 @@
+<!--
+  Notebook preview style overrides (shared across all manuscript projects).
+
+  Quarto's manuscript project sets produce-source-notebook=true on all
+  non-article .qmd files, stripping code block classes (.python, .r, .cell-code).
+  Without these classes, Pandoc's syntax highlighter cannot operate. This file
+  restores syntax highlighting via highlight.js and applies a cleaner code font.
+
+  Included via _quarto.yml `include-in-header`. Scoped to .quarto-notebook
+  so it only affects notebook preview pages, not the main article.
+-->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/r.min.js"></script>
+
+<style>
+/* ── Hide Jupyter cell decorators (In [N]:) ─────────────────────────── */
+.quarto-notebook .cell-container .cell-decorator {
+  display: none;
+}
+
+/* ── Code block font: SF Mono, smaller size ──────────────────────────── */
+.quarto-notebook .cell-container .cell pre code {
+  font-family: "SFMono", "SF Mono", SFMono-Regular, ui-monospace, monospace;
+  font-size: 0.7em;
+  line-height: 1.2;
+}
+</style>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  var nb = document.querySelector(".quarto-notebook");
+  if (!nb) return;
+
+  nb.querySelectorAll(".cell-container .cell pre code").forEach(function (code) {
+    hljs.highlightElement(code);
+  });
+});
+</script>
