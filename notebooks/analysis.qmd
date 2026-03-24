@@ -584,7 +584,7 @@ regression_df
 
 stou_jan_row = regression_df.filter(
     (pl.col("rate") == "stou")
-    & (pl.col("month") == "202301")
+    & (pl.col("month") == 202301)
     & (pl.col("dep_var").str.contains("pct"))
 )
 if stou_jan_row.height > 0:
@@ -599,7 +599,7 @@ report_vars["stou_jan_mean_pct"] = 25.66
 # ── STOU July R² ─────────────────────────────────────────────────────────
 stou_jul_row = regression_df.filter(
     (pl.col("rate") == "stou")
-    & (pl.col("month") == "202307")
+    & (pl.col("month") == 202307)
     & (pl.col("dep_var").str.contains("pct"))
 )
 if stou_jul_row.height > 0:
