@@ -301,3 +301,16 @@ typecheck:
 
 test-coverage:
     uv run pytest --cov=smart_meter_analysis --cov-report=html
+
+# =============================================================================
+# 📄 REPORT RENDERING
+# =============================================================================
+
+render:
+    quarto render
+
+draft:
+    quarto render --to docx
+
+clean:
+    rm -rf docs cache/_freeze

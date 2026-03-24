@@ -1,0 +1,12 @@
+project:
+  type: manuscript
+  render:
+    - index.qmd
+    - notebooks/analysis.qmd
+
+format:
+  html:
+    theme: .style/switchbox.scss
+    include-in-header: .style/switchbox.html
+
+fig-format: svg

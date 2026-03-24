@@ -192,3 +192,5 @@ subagent_packages/
 data/pilot_interval_parquet/
 CLAUDE.md
 .cursor/
+
+/.quarto/
