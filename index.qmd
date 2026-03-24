@@ -10,7 +10,7 @@ author:
 
 keywords: [time-of-use rates, ComEd, rate equity, smart meter data, DTOU, Rate BEST]
 
-bibliography: ../references.bib
+bibliography: references.bib
 license: "CC BY-NC"
 
 toc: true
@@ -134,7 +134,7 @@ infrastructure that transports it to your home.
 :::
 
 Both of these components cost more at some points during the day than others. A
-flat rate doesn't reflect this difference and simply chargesa single "average"
+flat rate doesn't reflect this difference and simply charges a single "average"
 price for all hours of the day.
 
 **Time-of-use (TOU) rates** replace that single flat price with prices that vary
