@@ -1,0 +1,30 @@
+```{r}
+library(dplyr)
+library(arrow)
+library(feather)
+
+# Read data dictionary and create column lists
+ddl <- read.csv("/workspaces/reports2/lib/resstock/2024/data_dictionary_2024_labeled.csv")
+
+# Split the "field_name" column by "." and extract "fuel" and "end_use"
+ddl <- ddl |>
+  filter(functional_group != "") |>
+  mutate(
+    timeseries_field_name = sapply(
+      strsplit(field_name, "\\."),
+      function(x) if(length(x) >= 3) paste0(paste(x[1:3], collapse = "."), ".energy_consumption") else NA
+    ),
+    fuel = sapply(strsplit(field_name, "\\."), function(x) if(length(x) >= 2) x[2] else NA),
+    end_use = sapply(strsplit(field_name, "\\."), function(x) if(length(x) >= 3) x[3] else NA)
+  ) |>
+  select(functional_group, fuel, end_use, timeseries_field_name)
+
+View(ddl)
+
+
+# save ddl as a csv and an RData file
+write.csv(ddl, "/workspaces/reports2/lib/resstock/2024/end_use_groups.csv", row.names = FALSE)
+
+# save as feather
+write_feather(ddl, "/workspaces/reports2/lib/resstock/2024/end_use_groups.feather")
+```
