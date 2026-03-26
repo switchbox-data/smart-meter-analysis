@@ -696,6 +696,55 @@ display_svg(fig)
 ```
 
 
+## Scatterplot: STOU January percentage savings by income
+
+This figure mirrors the July scatterplot for the January billing period, showing
+how block group median household income relates to mean percentage savings under
+Rate BEST in a non-summer month. Comparing the two seasons reveals how the
+income gradient shifts when the peak window overlaps with morning and evening
+routines rather than afternoon air-conditioning.
+
+```{python}
+#| label: fig-scatter-stou-jan-pct
+#| fig-cap: "Block group percentage savings under Rate BEST (January) vs. median household income. Each point is one Census block group. The regression line captures the income–savings gradient across the non-summer billing period."
+#| fig-width: 10
+
+scatter_jan_df = bg_stou_jan.filter(
+    pl.col(INCOME_COL).is_not_null() & pl.col(PCT_SAVINGS_COL).is_not_null()
+)
+if INCOME_TRANSFORM == "exp":
+    scatter_jan_df = scatter_jan_df.with_columns(
+        (pl.col(INCOME_COL).exp() / 1000).alias("income_thousands")
+    )
+else:
+    scatter_jan_df = scatter_jan_df.with_columns(
+        (pl.col(INCOME_COL) / 1000).alias("income_thousands")
+    )
+
+p = (
+    ggplot(scatter_jan_df, aes(x="income_thousands", y=PCT_SAVINGS_COL))
+    + geom_point(alpha=0.25, size=1, color=SB_COLORS["sky"])
+    + geom_smooth(
+        method="lm",
+        color=SB_COLORS["midnight"],
+        fill=SB_COLORS["sky"],
+        alpha=0.3,
+    )
+    + labs(
+        title="Rate BEST (January): percentage savings by block group income",
+        x="Median household income ($, thousands)",
+        y="Mean percentage savings (%)",
+    )
+    + scale_x_continuous(labels=lambda lst: [f"${x:.0f}k" for x in lst])
+    + theme_switchbox()
+    + theme(figure_size=(10.5, 4.5))
+)
+
+fig = p.draw()
+display_svg(fig)
+```
+
+
 ## Rate structure comparison
 
 This grouped bar chart compares the total all-in electricity rate (supply +
@@ -820,6 +869,122 @@ if all_pass:
     print("\n✓ All spot-checks pass")
 else:
     print("\n✗ Some spot-checks failed — review before proceeding")
+```
+
+
+# Geographic comparison: core Chicago vs. suburban
+
+To understand how savings vary by geography, we compare mean STOU July bill
+impacts across two groups of ZIP codes: the dense, majority-multifamily
+neighborhoods of core Chicago, and the lower-density suburban communities
+in ComEd's outer service territory.
+
+We build the ZIP-to-block-group mapping from the ComEd ZIP+4 crosswalk,
+then compute the mean of block-group mean deltas (treating each block group
+equally) and the multi-family share (pooled households minus SF-only
+households, divided by pooled households).
+
+```{python}
+#| label: geo-comparison
+
+core_chicago_zips = [
+    "60617", "60649", "60637", "60615", "60653", "60616", "60605", "60604",
+    "60603", "60602", "60601", "60611", "60610", "60614", "60657", "60613",
+    "60640", "60622", "60612", "60607", "60642", "60647", "60661", "60606", "60654",
+]
+
+suburban_zips = [
+    "60014", "60012", "60050", "60051", "60098", "60030", "60084", "60013",
+    "60047", "60060", "60073", "60156", "60102", "60010", "60110", "60067",
+    "60074", "60004", "60005", "60120", "60123", "60124", "60177", "60173",
+    "60194", "60195", "60107", "60103", "60172", "60108",
+    "60068", "60712", "60706", "60707", "60131", "60160", "60153",
+    "60301", "60302", "60304", "60402", "60804", "60513", "60534", "60501", "60455",
+]
+
+# Build ZIP -> block group mapping from the ComEd ZIP+4 crosswalk.
+# CensusKey2023 is a 15-character block FIPS; the first 12 characters are the
+# block group GEOID (state + county + tract + BG).
+zip_bg_xwalk = (
+    pl.read_csv(
+        DATA_DIR / "reference/comed_bg_zip4_crosswalk.txt",
+        separator="\t",
+        schema_overrides={"CensusKey2023": pl.Utf8},
+    )
+    .with_columns(
+        pl.col("Zip").cast(pl.Utf8).str.zfill(5),
+        pl.col("CensusKey2023").str.slice(0, 12).alias("geoid_bg"),
+    )
+    .select(["Zip", "geoid_bg"])
+    .unique()
+)
+
+bg_jul_pooled = pl.read_csv(
+    DATA_DIR / "bg_level_stou_jul.csv",
+    schema_overrides={"geoid_bg": pl.Utf8},
+)
+bg_jul_sf = pl.read_csv(
+    DATA_DIR / "statewide_analysis_regressions/bg_level_stou_jul_sf_no_esh.csv",
+    schema_overrides={"geoid_bg": pl.Utf8},
+)
+
+
+def geo_stats(
+    zips: list[str],
+    pooled: pl.DataFrame,
+    sf: pl.DataFrame,
+    xwalk: pl.DataFrame,
+) -> dict[str, float]:
+    """Compute mean STOU July savings and MF share for a set of ZIP codes.
+
+    Returns a dict with:
+    - pooled_mean: unweighted mean of block-group mean_delta (pooled)
+    - sf_mean: unweighted mean of block-group mean_delta (SF-only)
+    - mf_share: 1 - (SF households / pooled households), left-joining pooled
+      to SF and filling missing SF counts with 0
+    """
+    bgs = xwalk.filter(pl.col("Zip").is_in(zips))["geoid_bg"].unique().to_list()
+
+    pooled_geo = pooled.filter(pl.col("geoid_bg").is_in(bgs))
+    sf_geo = sf.filter(pl.col("geoid_bg").is_in(bgs))
+
+    pooled_mean = pooled_geo["mean_delta"].mean()
+    sf_mean = sf_geo["mean_delta"].mean()
+
+    joined = pooled_geo.select(["geoid_bg", "n_households"]).join(
+        sf_geo.select(["geoid_bg", pl.col("n_households").alias("n_households_sf")]),
+        on="geoid_bg",
+        how="left",
+    ).with_columns(pl.col("n_households_sf").fill_null(0))
+
+    mf_share = 1 - joined["n_households_sf"].sum() / joined["n_households"].sum()
+
+    return {"pooled_mean": pooled_mean, "sf_mean": sf_mean, "mf_share": mf_share}
+
+
+cc = geo_stats(core_chicago_zips, bg_jul_pooled, bg_jul_sf, zip_bg_xwalk)
+sub = geo_stats(suburban_zips, bg_jul_pooled, bg_jul_sf, zip_bg_xwalk)
+
+print("Core Chicago:")
+print(f"  pooled mean STOU July savings: ${cc['pooled_mean']:.2f}")
+print(f"  SF-only mean STOU July savings: ${cc['sf_mean']:.2f}")
+print(f"  multi-family share: {cc['mf_share']:.1%}")
+print()
+print("Suburban:")
+print(f"  pooled mean STOU July savings: ${sub['pooled_mean']:.2f}")
+print(f"  SF-only mean STOU July savings: ${sub['sf_mean']:.2f}")
+print(f"  multi-family share: {sub['mf_share']:.1%}")
+
+report_vars.update(
+    {
+        "core_chicago_pooled_mean_stou_jul": cc["pooled_mean"],
+        "suburban_pooled_mean_stou_jul": sub["pooled_mean"],
+        "core_chicago_sf_mean_stou_jul": cc["sf_mean"],
+        "suburban_sf_mean_stou_jul": sub["sf_mean"],
+        "core_chicago_mf_share": cc["mf_share"],
+        "suburban_mf_share": sub["mf_share"],
+    }
+)
 ```
 
 
