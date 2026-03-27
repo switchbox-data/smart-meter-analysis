@@ -54,17 +54,18 @@ year.
 This year though, ComEd is introducing two new **time-of-use** (TOU) rates.
 Under TOU rates, customers pay more for energy during the times when the power
 grid is most likely to be under strain, and less when demand is typically
-smaller. Electricity is expensive when everyone blasts their AC on a hot summer
-afternoon, but cheaper at 1 AM that same night. This is designed to incentivize
-people to shift their usage to times that create less strain on the grid.
+smaller. Electricity is expensive at times everyone when everyone is likely to
+be blasting their AC on a hot summer afternoon, but cheaper at 1 AM that same
+night. This is designed to incentivize people to shift their usage to times
+that create less strain on the grid.
 
 These new rates are the product of a years-long regulatory process. Illinois's
 2021 **Climate and Equitable Jobs Act** (CEJA) directed utility companies to
 promote electrification and to shift electricity demand away from peak hours:
 making the grid more resilient and reducing costs for customers. This
-legislation created the context for the **Illinois Commerce Commission** (ICC)
+legislation created the context for the Illinois Commerce Commission (ICC)
 to approve both TOU programs in 2025 after extensive stakeholder negotiations
-involving ComEd, the **Citizens Utility Board** (CUB), environmental groups,
+involving ComEd, the Citizens Utility Board (CUB), environmental groups,
 and competitive energy suppliers.[^fn-reg-context]
 
 [^fn-reg-context]: For a fuller account of the regulatory history, see the
@@ -78,7 +79,9 @@ hours. But how much money could they save, exactly? And who would save the most?
 This memo analyzes data from **smart meters** installed across ComEd's service
 territory. Smart meters track how much electricity a customer uses on a
 half-hourly basis, making it easy to compare the costs of the same behavior
-under different rate structures. Three questions guide the analysis:
+under different rate structures. 
+
+Three questions guide the analysis:
 
 1. How would different households' bills change under ComEd's new TOU rates?
 2. Would lower-income households be negatively affected?
@@ -301,7 +304,7 @@ sufficient data to model.
 <iframe width="100%" height="500" frameborder="0" title="DTOU January" src="https://felt.com/embed/map/DTOU-January-W4lO5hIER9ACQXMRRUVhJUC?loc=39.795,-89.267,6.74z"></iframe>
 
 
-But as we mentioned earlier, delivery charges are relatively stable throughout
+But as discussed earlier, delivery charges are relatively stable throughout
 the day compared to supply charges. So while DTOU savings are widespread but
 relatively small, shouldn't we expect to see the potential for larger savings
 under STOU?
@@ -581,11 +584,13 @@ the American Community Survey 2023 5-year estimates.
 
 For each household and each month, three bills are computed:
 
-```
-Flat bill       = (flat PTC × total kWh) + (flat DFC × total kWh)
-DTOU bill       = (flat PTC × total kWh) + Σ(TOU DFC[period] × kWh[period])
-STOU bill       = Σ(BESTEC[period] × kWh[period]) + Σ(TOU DFC[period] × kWh[period])
-```
+$$
+\begin{aligned}
+\text{Flat bill} &= \text{PTC}_{\text{flat}} \times \text{kWh}_{\text{total}} + \text{DFC}_{\text{flat}} \times \text{kWh}_{\text{total}} \\
+\text{DTOU bill} &= \text{PTC}_{\text{flat}} \times \text{kWh}_{\text{total}} + \sum_{p} \text{DFC}_{\text{TOU}}^{(p)} \times \text{kWh}^{(p)} \\
+\text{STOU bill} &= \sum_{p} \text{BESTEC}^{(p)} \times \text{kWh}^{(p)} + \sum_{p} \text{DFC}_{\text{TOU}}^{(p)} \times \text{kWh}^{(p)}
+\end{aligned}
+$$
 
 **Sign convention:** `delta = flat bill − alternative bill`. Positive delta means
 the customer saves money under TOU.
