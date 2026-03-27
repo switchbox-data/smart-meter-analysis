@@ -731,7 +731,7 @@ p = (
         alpha=0.3,
     )
     + labs(
-        title="Rate BEST (January): percentage savings by block group income",
+        title="STOU (January): precentage savings by block group income",
         x="Median household income ($, thousands)",
         y="Mean percentage savings (%)",
     )
@@ -817,7 +817,7 @@ p = (
         values=[SB_COLORS["midnight"], SB_COLORS["sky"], SB_COLORS["carrot"]]
     )
     + labs(
-        title="Total C23 electricity rate by time-of-day period (non-summer)",
+        title="Total single-family home without electric heat by time-of-day period (non-summer)",
         x="Time-of-day period",
         y="All-in rate (¢/kWh)",
         fill="Rate structure",
