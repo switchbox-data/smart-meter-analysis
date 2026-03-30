@@ -7,6 +7,10 @@ out_*_production and audits the parquet files inside each for correctness.
 All metrics are computed via streaming (constant memory): pyarrow iter_batches only,
 no read_table() or full-file collects.
 
+Within each batch, all ordering/duplicate checks and acct-day counting use
+vectorized columnar operations (numpy + pyarrow.compute) rather than Python
+row-by-row loops.
+
 Outputs:
   /tmp/phase1_streaming_audit.tsv
   /tmp/phase1_streaming_audit.json
@@ -20,6 +24,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 # ── paths ──────────────────────────────────────────────────────────────────
@@ -60,15 +67,17 @@ def discover_months() -> list[tuple[str, Path]]:
 # ── per-month audit ────────────────────────────────────────────────────────
 
 
-def _dt_to_str(dt_val: Any) -> str:
-    """Convert a datetime column value to a consistent ISO string."""
-    if dt_val is None:
-        return ""
-    if isinstance(dt_val, str):
-        return dt_val
-    if hasattr(dt_val, "isoformat"):
-        return dt_val.isoformat()
-    return str(dt_val)
+def _to_str_col(col: pa.Array) -> pa.Array:
+    """
+    Normalize a pyarrow column to pa.string() with nulls replaced by ''.
+
+    Casts timestamps and any non-string type to string first so that all
+    three key columns can be compared uniformly as lexicographic strings.
+    ISO-format datetime strings sort correctly without further processing.
+    """
+    if not (pa.types.is_string(col.type) or pa.types.is_large_string(col.type)):
+        col = pc.cast(col, pa.string())
+    return pc.fill_null(col, "")
 
 
 def audit_month(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
@@ -76,10 +85,16 @@ def audit_month(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
     Stream all batch_*.parquet files in parquet_dir and compute metrics.
 
     Streaming guarantees:
-    - Uses iter_batches(columns=COLUMNS, batch_size=BATCH_SIZE).
-    - prev_key carries across file boundaries within the month.
-    - acct_day_counts is a running dict bounded by unique (account, date) pairs
-      in the month; discarded after stats are computed.
+    - Uses iter_batches(columns=COLUMNS, batch_size=BATCH_SIZE); no read_table().
+    - prev_key (tuple of 3 strings) carries across file boundaries within the month.
+    - acct_day_counts accumulates (account, date) → row_count across all batches;
+      bounded by unique acct-days in the month, discarded after stats are computed.
+
+    Vectorized inner loop:
+    - Ordering/duplicate detection uses numpy sliced-array comparisons over the
+      full batch at once; only the single cross-batch boundary uses Python.
+    - Acct-day grouping uses pyarrow group_by (C++), iterating only over the
+      unique (account, date) pairs per batch (~acct-days/batch), not every row.
     """
     files = sorted(parquet_dir.glob("batch_*.parquet"))
 
@@ -95,7 +110,7 @@ def audit_month(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
     # Bounded: one month has a finite number of (account, date) pairs.
     acct_day_counts: dict[tuple[str, str], int] = {}
 
-    # prev_key carries across file boundaries within this month
+    # Carries the composite key of the last row across batch/file boundaries.
     prev_key: tuple[str, str, str] | None = None
 
     for f in files:
@@ -108,49 +123,70 @@ def audit_month(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
                 if n_rows == 0:
                     continue
 
-                zip_list = batch.column("zip_code").to_pylist()
-                acct_list = batch.column("account_identifier").to_pylist()
-                dt_list = batch.column("datetime").to_pylist()
-
-                # Convert datetime values to strings once per batch
-                dt_str_list = [_dt_to_str(dt) for dt in dt_list]
-
-                # Build composite sort keys for the entire batch
-                keys: list[tuple[str, str, str]] = [
-                    (
-                        str(zip_list[i]) if zip_list[i] is not None else "",
-                        str(acct_list[i]) if acct_list[i] is not None else "",
-                        dt_str_list[i],
-                    )
-                    for i in range(n_rows)
-                ]
+                # Normalize all three columns to pa.string(), nulls → ""
+                zip_s = _to_str_col(batch.column("zip_code"))
+                acct_s = _to_str_col(batch.column("account_identifier"))
+                dt_s = _to_str_col(batch.column("datetime"))
 
                 # ── boundary check: last row of previous batch vs. first row here ──
+                # Only one Python-level comparison per batch crossing — acceptable.
+                first_key: tuple[str, str, str] = (
+                    zip_s[0].as_py(),
+                    acct_s[0].as_py(),
+                    dt_s[0].as_py(),
+                )
                 if prev_key is not None:
-                    first = keys[0]
-                    if first == prev_key:
+                    if first_key == prev_key:
                         has_duplicates = True
                         duplicate_count += 1
-                    elif first < prev_key:
+                    elif first_key < prev_key:
                         order_breaks += 1
 
-                # ── within-batch ordering/duplicate check ──
-                for i in range(1, n_rows):
-                    if keys[i] == keys[i - 1]:
+                # ── within-batch ordering/duplicate detection (vectorized) ──
+                if n_rows > 1:
+                    # numpy object arrays — string < / == / > works lexicographically
+                    zip_np = np.asarray(zip_s.to_pylist(), dtype=object)
+                    acct_np = np.asarray(acct_s.to_pylist(), dtype=object)
+                    dt_np = np.asarray(dt_s.to_pylist(), dtype=object)
+
+                    # Sliced views: curr[j] = row j+1, prev[j] = row j
+                    z_c, z_p = zip_np[1:], zip_np[:-1]
+                    a_c, a_p = acct_np[1:], acct_np[:-1]
+                    d_c, d_p = dt_np[1:], dt_np[:-1]
+
+                    z_eq = z_c == z_p
+                    a_eq = a_c == a_p
+
+                    # Duplicate: all three columns equal on adjacent rows
+                    dup_mask = z_eq & a_eq & (d_c == d_p)
+                    n_dups = int(np.sum(dup_mask))
+                    if n_dups:
                         has_duplicates = True
-                        duplicate_count += 1
-                    elif keys[i] < keys[i - 1]:
-                        order_breaks += 1
+                        duplicate_count += n_dups
 
-                # ── acct-day accumulation ──
-                for i in range(n_rows):
-                    date_str = dt_str_list[i][:10]  # first 10 chars = YYYY-MM-DD
-                    acct = str(acct_list[i]) if acct_list[i] is not None else ""
-                    k = (acct, date_str)
-                    acct_day_counts[k] = acct_day_counts.get(k, 0) + 1
+                    # Order break: composite (zip, acct, datetime) tuple less-than
+                    # i.e. current row sorts strictly before previous row
+                    composite_less = (z_c < z_p) | (z_eq & (a_c < a_p)) | (z_eq & a_eq & (d_c < d_p))
+                    order_breaks += int(np.sum(composite_less))
+
+                # ── acct-day counting via pyarrow group_by (C++ kernel) ──
+                # Extract YYYY-MM-DD (first 10 chars of any ISO datetime string)
+                date_s = pc.utf8_slice_codeunits(dt_s, 0, 10)
+
+                mini = pa.table({"acct": acct_s, "date": date_s})
+                grouped = mini.group_by(["acct", "date"]).aggregate([("acct", "count")])
+
+                # Iterate over unique (acct, date) pairs — O(acct-days/batch), not O(rows)
+                accts_g = grouped.column("acct").to_pylist()
+                dates_g = grouped.column("date").to_pylist()
+                counts_g = grouped.column("acct_count").to_pylist()
+                for a, d, c in zip(accts_g, dates_g, counts_g):
+                    k = (a or "", d or "")
+                    acct_day_counts[k] = acct_day_counts.get(k, 0) + (c or 0)
 
                 total_rows += n_rows
-                prev_key = keys[-1]
+                # Persist last-row key for boundary check at start of next batch/file
+                prev_key = (zip_s[-1].as_py(), acct_s[-1].as_py(), dt_s[-1].as_py())
 
         except Exception as exc:
             msg = f"Error reading {f.name}: {exc}"
