@@ -160,6 +160,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 "scripts/csv_to_parquet/migrate_month_runner.py" = ["C901"]
 "scripts/csv_to_parquet/compact_month_output.py" = ["C901", "S603", "S607"]
 "scripts/csv_to_parquet/restructure_for_export.py" = ["C901", "S603", "S607"]
+"scripts/audit/phase1_streaming_audit.py" = ["C901", "S108"]
 "tests/*" = ["S101", "S603", "RUF001"]
 
 
