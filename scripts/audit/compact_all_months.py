@@ -76,9 +76,9 @@ def needs_compaction(year_month: str, out_root: Path) -> bool:
 
     Skip if part-* files exist AND no batch_* files exist (already compacted).
     """
-    yyyy = year_month[:4]
-    mm = year_month[4:]
-    month_dir = out_root / f"year={yyyy}" / f"month={mm}"
+    yyyy = f"{int(year_month[:4]):04d}"
+    mm = f"{int(year_month[4:]):02d}"
+    month_dir = out_root / yyyy / mm
     if not month_dir.exists():
         return False
     files = list(month_dir.iterdir())
