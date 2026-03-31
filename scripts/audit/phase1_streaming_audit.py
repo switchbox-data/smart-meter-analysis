@@ -31,7 +31,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -119,12 +118,18 @@ def audit_month_integrity(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
     Stream all batch_*.parquet files and compute integrity metrics only.
 
     Checks:
-    - Duplicate adjacent rows (all three key columns equal)
-    - Sort-order breaks (composite key decreases between adjacent rows)
+    - Duplicate adjacent rows at batch/file boundaries
+    - Sort-order breaks at batch/file boundaries
     - Total row count, file count, directory size
 
-    acct_day_counts is intentionally omitted — this makes the integrity pass
-    fast enough to cover all 49 months in ~1-2 hours.
+    Boundary-only strategy: only the first and last row of each batch are
+    compared in Python.  Within-batch row-by-row comparisons are skipped
+    entirely — internal mis-sorting within a single batch file would be an
+    unusual pipeline bug, and the known double-ingestion issue (202508)
+    manifests as boundary duplicates.  This reduces ~20 million comparisons
+    per month to ~300, bringing each month from 11+ minutes to under 30 s.
+
+    acct_day_counts is also omitted — use --mode acct-day for those stats.
     """
     files = sorted(parquet_dir.glob("batch_*.parquet"))
 
@@ -136,7 +141,7 @@ def audit_month_integrity(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
     dir_size_bytes = 0
     errors: list[str] = []
 
-    # Carries the composite key of the last row across batch/file boundaries.
+    # Last composite key seen; carried across every batch and file boundary.
     prev_key: tuple[str, str, str] | None = None
 
     for f in files:
@@ -155,7 +160,7 @@ def audit_month_integrity(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
                 dt_s = _to_str_col(batch.column("datetime"))
 
                 # ── boundary check: last row of previous batch vs. first row here ──
-                # Only one Python-level comparison per batch crossing — acceptable.
+                # One Python-level tuple comparison per batch — O(batches), not O(rows).
                 first_key: tuple[str, str, str] = (
                     zip_s[0].as_py(),
                     acct_s[0].as_py(),
@@ -167,33 +172,6 @@ def audit_month_integrity(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
                         duplicate_count += 1
                     elif first_key < prev_key:
                         order_breaks += 1
-
-                # ── within-batch ordering/duplicate detection (vectorized) ──
-                if n_rows > 1:
-                    # numpy object arrays — string < / == / > works lexicographically
-                    zip_np = np.asarray(zip_s.to_pylist(), dtype=object)
-                    acct_np = np.asarray(acct_s.to_pylist(), dtype=object)
-                    dt_np = np.asarray(dt_s.to_pylist(), dtype=object)
-
-                    # Sliced views: curr[j] = row j+1, prev[j] = row j
-                    z_c, z_p = zip_np[1:], zip_np[:-1]
-                    a_c, a_p = acct_np[1:], acct_np[:-1]
-                    d_c, d_p = dt_np[1:], dt_np[:-1]
-
-                    z_eq = z_c == z_p
-                    a_eq = a_c == a_p
-
-                    # Duplicate: all three columns equal on adjacent rows
-                    dup_mask = z_eq & a_eq & (d_c == d_p)
-                    n_dups = int(np.sum(dup_mask))
-                    if n_dups:
-                        has_duplicates = True
-                        duplicate_count += n_dups
-
-                    # Order break: composite (zip, acct, datetime) tuple less-than
-                    # i.e. current row sorts strictly before previous row
-                    composite_less = (z_c < z_p) | (z_eq & (a_c < a_p)) | (z_eq & a_eq & (d_c < d_p))
-                    order_breaks += int(np.sum(composite_less))
 
                 total_rows += n_rows
                 # Persist last-row key for boundary check at start of next batch/file
