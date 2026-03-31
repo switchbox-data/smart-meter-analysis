@@ -131,7 +131,7 @@ def audit_month_integrity(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
 
     acct_day_counts is also omitted — use --mode acct-day for those stats.
     """
-    files = sorted(parquet_dir.glob("batch_*.parquet"))
+    files = sorted(parquet_dir.glob("*.parquet"))
 
     n_files = len(files)
     total_rows = 0
@@ -206,7 +206,7 @@ def audit_month_acct_day(yyyymm: str, parquet_dir: Path) -> dict[str, Any]:
     duplicate checks are skipped entirely — this mode is meant for targeted
     follow-up on months flagged by the integrity pass.
     """
-    files = sorted(parquet_dir.glob("batch_*.parquet"))
+    files = sorted(parquet_dir.glob("*.parquet"))
 
     n_files = len(files)
     total_rows = 0
