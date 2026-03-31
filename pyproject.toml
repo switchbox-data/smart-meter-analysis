@@ -143,6 +143,7 @@ extend-ignore = ["TRY003", "TRY300", "TRY400"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/run_comed_pipeline.py" = ["C901", "S603", "S607"]
+"scripts/audit/*.py" = ["C901", "S108", "S603", "S607"]
 "scripts/diagnostics/*.py" = ["C901"]
 "smart_meter_analysis/pipeline_validator.py" = ["C901", "PGH003"]
 "smart_meter_analysis/wide_to_long.py" = ["C901"]
