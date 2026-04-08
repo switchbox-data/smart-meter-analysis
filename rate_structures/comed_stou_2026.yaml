@@ -1,0 +1,70 @@
+# ComEd Space-Time-of-Use rate structure for 2026 (BES supply).
+# All prices are in cents/kWh—matches the pipeline's internal convention
+# and avoids floating-point confusion between cents and dollars.
+#
+# Source: ComEd Ex. 19.0, Figure 1 (Kremer rebuttal testimony, May 12, 2025)
+# ICC Docket No. 24-0378 (on Rehearing)
+# URL: https://www.icc.illinois.gov/docket/P2024-0378/documents/365088/files/639688.pdf
+#
+# Compromise Proposal rates plus 1.266 cents/kWh Transmission & Misc. Procurement
+# (T&MP from same exhibit). Illustrative rates with 100% capacity costs rolled
+# into midday peak.
+#
+# Original Compromise rates (without T&MP): Summer morning 3.013,
+# midday_peak 18.219, evening 3.090, overnight 1.870;
+# Nonsummer morning 2.829, midday_peak 16.814, evening 3.086, overnight 2.012.
+#
+# Raw BESTECs (for future sensitivity analysis only, NOT used here):
+# Source: ComEd Ex. 19.01, page 1, columns g and h (corrected illustrative BESTEC)
+# URL: https://icc.illinois.gov/docket/P2024-0378/documents/365088/files/639689.pdf
+name: comed_stou_2026_rate_best_supply
+timezone: America/Chicago
+unit: cents_per_kwh
+holiday_rule: treat_as_weekend
+
+# Hour ranges are half-open [start_hour, end_hour) so adjacent periods
+# tile without overlap.  Wrap-around (e.g. 21→6) is handled in code.
+seasons:
+  - name: summer
+    start_mmdd: "06-01"
+    end_mmdd: "09-30"
+    periods:
+      - period: morning
+        start_hour: 6
+        end_hour: 13
+        price: 4.279
+      - period: midday_peak
+        start_hour: 13
+        end_hour: 19
+        price: 19.485
+      - period: evening
+        start_hour: 19
+        end_hour: 21
+        price: 4.356
+      - period: overnight
+        start_hour: 21
+        end_hour: 6
+        price: 3.136
+
+  # Nonsummer wraps around the calendar year (Oct 1 → May 31).
+  # _in_season() handles this wrap via day-of-year comparison.
+  - name: nonsummer
+    start_mmdd: "10-01"
+    end_mmdd: "05-31"
+    periods:
+      - period: morning
+        start_hour: 6
+        end_hour: 13
+        price: 4.095
+      - period: midday_peak
+        start_hour: 13
+        end_hour: 19
+        price: 18.080
+      - period: evening
+        start_hour: 19
+        end_hour: 21
+        price: 4.352
+      - period: overnight
+        start_hour: 21
+        end_hour: 6
+        price: 3.278

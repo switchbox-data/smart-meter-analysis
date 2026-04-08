@@ -306,7 +306,7 @@ def plot_centroids(centroids: np.ndarray, output_path: Path) -> None:
         x = np.arange(n_timepoints)
         xlabel = "Time Interval"
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    _fig, ax = plt.subplots(figsize=(12, 6))
     for i in range(k):
         ax.plot(x, centroids[i], label=f"Cluster {i}", linewidth=2)
 

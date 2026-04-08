@@ -1,0 +1,854 @@
+---
+title: "Who would benefit from ComEd's new TOU programs?"
+subtitle: "A statewide simulation of bill impacts under ComEd's time-of-use rate structures"
+date: 2026-XX-XX
+author:
+  - name: Griffin Sharps
+    email: griffin@switch.box
+    affiliations:
+      - Switchbox
+
+keywords: [time-of-use rates, ComEd, rate equity, smart meter data, DTOD, Rate BEST]
+
+bibliography: references.bib
+license: "CC BY-NC"
+
+toc: true
+notebook-links: false
+reference-location: margin
+fig-cap: true
+fig-cap-location: margin
+tbl-cap-location: margin
+
+appendix-style: default
+citation-location: document
+citation:
+  container-title: Switchbox
+---
+
+```{python}
+#| echo: false
+#| message: false
+
+import pickle
+from pathlib import Path
+from types import SimpleNamespace
+
+v = SimpleNamespace(**pickle.loads(Path("cache/report_variables.pkl").read_bytes()))
+
+def dollar(x, accuracy=0):
+    return f"${x:,.{accuracy}f}"
+
+def pct(x, accuracy=0):
+    return f"{x * 100:,.{accuracy}f}%"
+```
+
+
+## Introduction
+
+Today, most of ComEd's residential customers pay a **flat rate** for their
+electricity. That means that they pay the same amount of money for a given
+amount of electrical usage, at any time of day, on any date throughout the
+year.
+
+This year though, ComEd is introducing two new **time-of-use** (TOU) rates.
+Under TOU rates, customers pay more for energy during the times when the power
+grid is most likely to be under strain, and less when demand is typically
+smaller. Electricity is expensive at times when everyone is likely to
+be blasting their AC on a hot summer afternoon, but cheaper at 1 AM that same
+night. This is designed to incentivize people to shift their usage to times
+that create less strain on the grid.
+
+These new rates are the product of a years-long regulatory process. Illinois's
+2021 **Climate and Equitable Jobs Act** (CEJA) directed utility companies to
+promote electrification and to shift electricity demand away from peak hours:
+making the grid more resilient and reducing costs for customers. This
+legislation created the context for the Illinois Commerce Commission (ICC)
+to approve both TOU programs in 2025 after extensive stakeholder negotiations
+involving ComEd, the Citizens Utility Board (CUB), environmental groups,
+and competitive energy suppliers.[^fn-reg-context]
+
+[^fn-reg-context]: For a fuller account of the regulatory history, see the
+Regulatory Context section of the Appendix.
+
+Residential customers who sign up for one of these two programs have an
+opportunity to save on their electricity bills. They can pay less for energy by
+using it during the cheaper off-peak hours and avoiding the more expensive peak
+hours. But how much money could they save, exactly? And would some households
+actuallypay more?
+
+This memo analyzes data from **smart meters** installed across ComEd's service
+territory. Smart meters track how much electricity a customer uses on a
+half-hourly basis, making it easy to compare the costs of the same behavior
+under different rate structures.
+
+Three questions guide the analysis:
+
+1. Who would save money and who would pay more under ComEd's new TOU programs?
+2. Would lower-income households be negatively affected?
+3. If one of the two new TOU rates outperforms the other, why?
+
+A full analysis would model how customer behavior might change in response to
+changes in the rate structure. In this case, we are assuming that customers sign
+up, but then continue to use electricity as usual. As a result, these are
+conservative estimates on how much households might save.
+
+
+## Executive Summary
+
+We used smart meter data from July 2023[^fn-july-also] to simulate monthly
+electricity bills for `{python} f"{v.n_households_jul:,}"` ComEd residential
+accounts under the company's two new time-of-use rate structures:
+**Delivery-Only Time-of-Use (DTOD)** and **Combined Delivery and Supply
+Time-of-Use (Rate BEST)**.[^fn-commercial-names] We then compared these
+simulated bills to what each account would have paid under the current flat
+rate, assuming that customers kept their behavior identical across the two
+scenarios. Because our simulation applies current rate schedules to 2023 usage
+data, we calibrated TOU rates so that ComEd would collect the same total
+revenue as under the flat rate, which is the standard practice for energy
+utility companies. The geographic unit of analysis throughout was a Census
+block group: an area of around 600–3,000 people.
+
+[^fn-july-also]: We also ran our simulation using data from January 2023, the
+peak heating month. A comparison between the two months is given later in the
+memo.
+
+[^fn-commercial-names]: ComEd does not propose to offer a supply-only TOU rate
+option, for reasons discussed on rehearing in ICC Docket No. 24-0378.
+
+**About `{python} f"{v.pct_save_stou_jul:.0f}"`% of households would pay less
+under either rate structure.** ComEd's aggregate revenue is held constant by
+construction. This means that if everyone adopted the new rates, some customers
+would pay more so that other customers could pay less.
+
+**Neither rate would disproportionately burden lower-income communities.** We
+measured savings as a share of each household's total bill to account for the
+fact that wealthier households tend to have larger bills. In our simulation,
+lower-income neighborhoods are more likely to benefit from switching to either
+TOU structure.
+
+**Rate BEST would produce roughly three to four times larger effects than
+DTOD.** Under Rate BEST in July, the lowest-income group of block groups would
+save about
+$`{python} f"{v.stou_jul_q1_mean_delta:.2f}"`/month on average, while the
+highest-income group would pay about
+$`{python} f"{abs(v.stou_jul_q5_mean_delta):.2f}"`/month more — a difference
+of $`{python} f"{v.stou_jul_q1q5_dollar_spread:.2f}"`. Under DTOD, that
+difference shrinks to
+$`{python} f"{v.dtou_jul_q1q5_dollar_spread:.2f}"`, but the trend holds. The
+lowest-income group would save
+`{python} f"{v.stou_jul_q1_pct_savings:.1f}"`% of their bill under Rate BEST
+in July, compared to `{python} f"{v.stou_jul_q5_pct_savings:.1f}"`% for the
+highest — a gap of
+`{python} f"{v.stou_jul_q1_pct_savings - v.stou_jul_q5_pct_savings:.1f}"`
+percentage points.
+
+**Rate BEST's projected effects on consumer bills depend on placeholder supply
+rates that ComEd has not finalized.** The supply charges used in our simulation
+come from illustrative values ComEd submitted to the ICC last year. They are
+not binding tariff rates. Rate BEST launches in June 2026, and ComEd has not
+announced its actual rates. The effects we model should not be treated as a
+forecast.
+
+**Block groups in Inner Chicago tend to benefit more under both TOU
+structures,** but this reflects building stock and usage patterns rather than
+geography per se.[^fn-inner-chicago] Both single-family and multi-family homes
+in Inner Chicago would save money compared to comparable homes on the outskirts
+of the city.
+
+[^fn-inner-chicago]: "Inner Chicago" refers to block groups falling within 25
+ZIP codes along the lakefront and near downtown, running from Rogers Park south
+to South Shore and west through Humboldt Park and the West Loop. "Outskirts"
+refers to selected block groups within 46 ZIP codes spanning near-west suburbs
+(Oak Park, Berwyn, Cicero, Elmwood Park) and far northwest suburbs (Crystal
+Lake, McHenry, Woodstock, Schaumburg, Barrington, Elgin, and surrounding
+communities). These areas were selected to represent a range of suburban
+densities across ComEd's service territory.
+
+
+## Background: How electricity bills work
+
+ComEd residential bills have two main components: **supply** and **delivery**.
+Supply is the cost of generating the electricity itself. Delivery is the cost of
+the **poles and wires** that transport that electricity to your home. In other
+words, you pay for both the energy you use and the cost of getting it to you.
+
+:::{.column-margin}
+**Supply** is the cost of generating power. **Delivery** is the cost of the
+infrastructure that transports it to your home.
+:::
+
+Both of these components cost more at some points during the day than others. A
+flat rate doesn't reflect this difference and simply charges a single "average"
+price for all hours of the day.
+
+**Time-of-use (TOU) rates** replace that single flat price with prices that vary
+across different periods of the day. Prices are higher during **peak usage**
+hours, when the grid is under strain and the cost of providing electricity is
+high. Prices are lower during **off-peak** hours when the grid is not under
+strain and the cost of providing electricity is low.
+
+Both of ComEd's new TOU programs divide the day into four time blocks: Morning
+(6 AM–1 PM),
+-Day Peak (1–7 PM), Evening (7–9 PM), and Overnight (9 PM–6 AM).
+But the two programs differ in which part of the bill they change from the
+standard flat rate.
+
+:::{.column-margin}
+**DTOD (Delivery Time-of-Day)** varies only the delivery charge by time of day.
+DTOD can be paired with whatever supply rate the customer chooses, which is
+usually the utility’s default flat supply rate.
+
+:::
+
+The **Delivery Time-of-Day (DTOD)** program changes only the delivery side of
+the bill.[^fn-dtou] Supply is unaffected. During the expensive mid-day peak
+window, the delivery charge can rise to approximately 10.7¢ per unit of
+electricity, compared to about 5.9¢ under the flat rate.
+During overnight hours however, DTOD rates drop to about half what customers
+would otherwise pay.
+
+
+[^fn-dtou]: DTOD was approved in the ICC's Final Order of January 16, 2025
+(Docket 24-0378). DTOD took effect in January 2026 as a voluntary, opt-in
+program.
+
+:::{.column-margin}
+**Rate BEST (Basic Electric Service Time-of-Use)** is a bundled time-of-use
+structure that varies both supply and delivery charges by time of day and
+season.
+:::
+
+The **Rate BEST** program goes further.[^fn-rate-best] It varies
+ **both** supply and delivery charges by the time of day. While the delivery
+side follows the same four time blocks as DTOD, the supply side adds in
+additional factors. Firstly, Rate BEST's supply side adds seasonal
+differentiation (summer rates are higher than non-summer rates). Timing-wise,
+supply charges obey the same logic as DTOD's delivery charges: high costs during
+the peak, low ones in the off peak periods.
+
+[^fn-rate-best]: Rate BEST was approved on rehearing (ICC Order of July 17,
+2025, Docket 24-0378). Rate BEST launches in June 2026 as a voluntary, bundled
+package: customers who opt in receive both the time-varying supply rate and DTOD
+delivery together.
+
+So what's the difference for your electricity bill? The more parts of your bill
+that vary by time of day, the more **when** you use electricity (and not just
+how much) matters. Because DTOD varies only delivery charges — which don't swing
+as sharply between peak and off-peak as supply charges do — bill impacts
+under DTOD are modest in absolute terms. But as this memo shows, under Rate
+BEST, timing could produce big savings for ComEd customers.
+
+:::{.column-body-outset-inset-right}
+{{< embed notebooks/analysis.qmd#fig-rate-structures >}}
+:::
+
+
+## Scope and approach
+
+We simulate what `{python} f"{v.n_households_jul:,}"` ComEd residential accounts
+would have paid under either TOU rate structure, using their 2023 half-hour usage
+data.[^fn-july-scope] We then compare those simulated bills to what each
+household would have paid under the current flat rate to measure who saves, who
+pays more, and whether the answer differs meaningfully by income or geography.
+
+[^fn-july-scope]: We also conducted the same simulation for January 2023, the
+peak heating month. Results are discussed in the Findings section.
+
+The analysis makes the following assumptions:
+
+- **One month, representing a seasonal extreme.** We model July 2023 (peak
+cooling). The rates' effects in other seasons and annual net impact cannot be
+determined from one month alone.
+
+- **2025/2026 rates applied to 2023 usage.** For flat rates, we use the 2026
+non-summer prices. The TOU rate schedules are also from 2026. These present-day
+rates are applied to 2023 consumption patterns. Our findings are the result of a
+constructed simulation: not a report on historical behavior.
+
+- **No behavioral response.** We assume households do not change when or how
+much electricity they use in response to TOU pricing. In practice, the theory
+behind TOU rates is for the disparity in pricing between different times of day
+to cause customers to shift usage away from peak hours, which would increase
+their savings. Our estimates are conservative and represent a floor on
+potential savings rather than a ceiling.
+
+- **Revenue-neutral calibration.** We calibrated TOU rates so that ComEd would
+collect the same total revenue for each delivery class as under the flat rate.
+This adjustment is necessary because both the flat and TOU rate schedules are
+2025/2026 designs, but we apply them to 2023 consumption data. TOU rates are
+designed to be **revenue-neutral** (to collect the same total revenue as the
+flat rate) but that neutrality can only be maintained when rates set according
+to expected usage patterns for that year. Because usage patterns differ between
+years, applying current rates to 2023 data creates a distortion. To correct for
+this, we computed a per-class scaling factor (one number for each of ComEd's
+four residential delivery classes) that multiplies TOU bills up or down until
+the class-wide total matches the flat-rate revenue exactly. After this
+adjustment, the analysis becomes purely distributional. It isolates the winners
+and losers of the TOU structures without changing the overall revenue generated
+by customer usage. In practical terms, every dollar one household saves under
+TOU is a dollar another household pays more.
+
+- **Anonymized smart meter data.** ComEd's interval data are released under
+ICC-approved privacy rules that strip all customer identifiers (name, address,
+account number) and apply an anonymity screen. A customer's data can only be
+included if their geographic area contains at least 15 customers in the same
+delivery class, and no single customer represents 15% or more of that area's
+total load.[^fn-anon] Customers who do not pass this screen are excluded from
+the dataset entirely. In practice, ComEd's dense service territory (northern
+Illinois, including Chicago) means most customers pass the screen — though
+sparsely populated Census areas are excluded.
+
+[^fn-anon]: The anonymity screen was adopted by the ICC in Docket No. 13-0506
+and is commonly known as the 15/15 Rule.
+
+- **Percentage of bill as the equity metric.** To assess whether TOU rates
+disproportionately benefit or cost certain income groups, we measure savings as
+a percentage of each household's total flat-rate bill. This controls for the
+fact that higher-income households tend to have larger bills (and therefore
+larger potential dollar savings) regardless of rate design. Because our
+calibration forces aggregate savings to zero, this metric captures purely
+distributional effects.
+
+- **Census block group income as the income proxy.** We use median household
+income at the Census block group level (from the American Community Survey
+5-year estimates) as our measure of neighborhood income. This captures
+neighborhood-level patterns but does not identify individual low-income
+households within high-income block groups, or vice versa.[^fn-bg-income]
+
+[^fn-bg-income]: Approximately 6.6% of modeled households fall in block groups
+without valid Census income data and are excluded from the regression and
+quintile analyses. Household-level statistics (e.g., the share of households
+that save) use the full account counts.
+
+- **Rate BEST supply rates are illustrative.** The supply charges used for Rate
+BEST come from ComEd's Compromise Proposal (ICC Docket 24-0378), not from a
+final tariff. These rates have not been finalized. If the final values differ
+from the illustrative rates used here, the distributional patterns documented in
+this memo could shift in both magnitude and direction.
+
+
+## Findings
+
+### The distributional effects are neutral to mildly progressive
+
+Under both TOU structures, about **55%** of households would pay less after
+revenue-neutral calibration. Neither rate disproportionately burdens
+lower-income communities. In fact, the data show a mild progressive tilt:
+lower-income block groups are slightly more likely to benefit.
+
+The scatterplot below illustrates this for July, when the effects are largest.
+Each dot is a Census block group; the x-axis is median household income and the
+y-axis is the mean percentage change in the monthly bill. The downward slope
+means lower-income areas would benefit more.
+
+:::{.column-body-outset-inset-right}
+{{< embed notebooks/analysis.qmd#fig-scatter-stou-jul-pct >}}
+:::
+
+Under Rate BEST in July, the lowest-income quintile of block groups would save
+an average of **$`{python} f"{v.stou_jul_q1_mean_delta:.2f}"`/month**, while the highest-income quintile would pay
+**$`{python} f"{abs(v.stou_jul_q5_mean_delta):.2f}"`/month** more — a spread of **$`{python} f"{v.stou_jul_q1q5_dollar_spread:.2f}"`**. Under DTOD, the equivalent spread
+is **$`{python} f"{v.dtou_jul_q1q5_dollar_spread:.2f}"`**. All four pooled regressions (both rates, both months) show
+statistically significant progressive tilts, though income explains only a small
+share of the variation across block groups. The progressive pattern is real but
+modest — the dominant finding is distributional neutrality.
+
+
+### Rate BEST produces larger distributional effects than DTOD
+
+Rate BEST's distributional spread is roughly four times DTOD's. The two July
+maps below use the same color scale (±$7.26/month) so the contrast is directly
+comparable. Blue indicates block groups where the average household would pay
+less under TOU; orange indicates block groups where the average household would
+pay more. Gray block groups lacked sufficient data to model.
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="DTOD July" src="FELT_URL_DTOD_JUL"></iframe>
+:::
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="Rate BEST July" src="FELT_URL_STOU_JUL"></iframe>
+:::
+
+On the shared scale, DTOD appears muted while Rate BEST shows vivid blues and
+oranges across the territory. That visual contrast reflects a real difference in
+magnitude: Rate BEST varies both supply and delivery charges by time of day,
+creating more room for usage-pattern differences between households to matter.
+
+The muted appearance of DTOD on the shared scale can obscure the fact that DTOD
+does produce real distributional variation — it is simply smaller. The map below
+shows the same DTOD July data on its own scale (±$2.03/month), where the
+geographic pattern becomes visible.
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="DTOD July (own scale)" src="FELT_URL_DTOD_JUL_OWN_SCALE"></iframe>
+:::
+
+
+### Why does Rate BEST produce larger effects?
+
+The difference comes down to the supply side of the bill. Under a flat rate,
+every kilowatt-hour of supply costs roughly
+`{python} f"{v.flat_ptc_nonsummer:.1f}"`¢. Under Rate BEST, off-peak supply
+rates drop to approximately `{python} f"{v.bestec_low:.0f}"`–`{python} f"{v.bestec_high:.0f}"`¢
+— well below half the flat price — while the summer mid-day peak rate rises to
+`{python} f"{v.bestec_peak_summer:.1f}"`¢.[^fn-capacity-cost] That
+swing creates a much wider gap between what peak and off-peak electricity costs.
+DTOD, by contrast, varies only the delivery charge, which is a smaller component
+of the bill and does not swing as sharply.
+
+[^fn-capacity-cost]: The BESTECs listed here include a 1.266¢/kWh Transmission
+& Miscellaneous Procurement (T&MP) charge that ComEd adds to its supply rates.
+The underlying energy-only supply charge is lower. The T&MP charge does not vary
+by time of day, so it slightly compresses the peak-to-off-peak ratio relative to
+the energy-only rate.
+
+The larger the gap between peak and off-peak prices, the more room there is for
+differences in household usage patterns to matter. Two households with identical
+total consumption but different timing profiles would see nearly the same bill
+under DTOD, because the delivery spread is modest. Under Rate BEST, the same
+timing difference would produce a meaningful gap in bills — and because the
+analysis is revenue-neutral, that gap shows up as a wider distributional spread.
+
+:::{.callout-important}
+## Rate BEST's supply rates are illustrative
+
+The supply charges used for Rate BEST in this analysis come from ComEd's
+Compromise Proposal (ICC Docket 24-0378), not from a final tariff. ComEd has not
+announced the actual supply rates for Rate BEST's June 2026 launch. If the final
+off-peak supply rates differ materially from the illustrative values used here,
+both the magnitude and direction of the distributional effects documented in this
+memo could change.
+:::
+
+
+### The progressive tilt is strongest in summer
+
+The distributional effects are three to four times larger in July than in
+January across both rate structures.
+
+Under Rate BEST in July, the lowest-income quintile of block groups would save
+**`{python} f"{v.stou_jul_q1_pct_savings:.1f}"`%** of their bill on average,
+compared to **`{python} f"{v.stou_jul_q5_pct_savings:.1f}"`%** for the
+highest-income quintile — a gap of
+**`{python} f"{v.stou_jul_q1_pct_savings - v.stou_jul_q5_pct_savings:.1f}"`
+percentage points**.
+
+
+### January: same pattern, smaller effects
+
+The January simulation tells the same directional story at a smaller scale.
+About **`{python} f"{v.pct_save_stou_jan:.0f}"`%** of households would pay less
+under Rate BEST and **`{python} f"{v.pct_save_dtou_jan:.0f}"`%** under DTOD —
+similar shares to July but with much smaller dollar amounts at stake.
+
+The progressive tilt persists but is muted. Under DTOD in January, the
+lowest-income quintile of block groups would save
+**`{python} f"{v.dtou_jan_q1_pct:.2f}"`%** of their bill, compared to
+**`{python} f"{v.dtou_jan_q5_pct:.2f}"`%** for the highest-income quintile — a
+gap of just **`{python} f"{v.dtou_jan_q1q5_gap:.1f}"` percentage points**. Under
+Rate BEST, percentage savings hover around
+**`{python} f"{v.stou_jan_mean_pct:.1f}"`%** across all income quintiles with no
+meaningful spread, though the pooled regression remains statistically significant
+(p < 0.001). The progressive gradient is real in both cases but too small to
+have practical policy significance in any single winter month.
+
+The two January maps below use the same layout and color conventions as the July
+maps, on a shared ±$2.97/month scale. Blue indicates block groups where the
+average household would pay less under TOU; orange indicates block groups where
+the average household would pay more.
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="DTOD January" src="FELT_URL_DTOD_JAN"></iframe>
+:::
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="Rate BEST January" src="FELT_URL_STOU_JAN"></iframe>
+:::
+
+One likely explanation for the seasonal difference is air conditioning. Summer
+cooling pushes more consumption into the expensive mid-day peak window (1–7 PM),
+and that peak exposure may correlate with income — higher-income households tend
+to live in larger single-family homes with more cooling capacity. In winter,
+electric heating loads are more evenly distributed across the day, compressing
+the gap between peak and off-peak consumption and leaving less room for
+income-correlated usage patterns to produce distributional differences. We do not
+have direct evidence for this causal mechanism in our data, but it is consistent
+with the seasonal pattern we observe.
+
+
+### Geographic patterns: why does Inner Chicago benefit more?
+
+::: {.column-body-outset}
+<iframe width="100%" height="500" frameborder="0" title="Rate BEST July (Chicago detail)" src="FELT_URL_STOU_JUL_CHICAGO"></iframe>
+:::
+
+Inner Chicago block groups tend to show larger benefits under both TOU
+structures. The pattern reflects building stock and usage patterns rather than
+geography per se.
+
+Roughly **`{python} f"{v.core_chicago_mf_share*100:.0f}"`%** of accounts in
+Inner Chicago are multi-family (delivery class C24), compared to
+**`{python} f"{v.suburban_mf_share*100:.0f}"`%** in surrounding areas on the
+outskirts of the city.[^fn-delivery-classes] Multi-family households use less
+electricity overall and concentrate less of their consumption in the expensive
+Mid-Day Peak window. Under TOU pricing, that usage pattern translates into
+larger savings.
+
+[^fn-delivery-classes]: ComEd assigns residential customers to "delivery
+classes" based on their building type and heating source. The two largest
+classes are C23 (single-family homes without electric heat) and C24
+(multi-family buildings without electric heat). Each class has its own
+per-kilowatt-hour (kWh) delivery rate — the charge for each unit of electricity
+delivered to the customer. Under the current flat rate, C23 customers pay
+6.228¢/kWh for delivery, while C24 customers pay 4.791¢/kWh. A kilowatt-hour is
+the standard unit for measuring electricity consumption: approximately the
+energy used by running ten 100-watt light bulbs for one hour.
+
+But the pattern holds even within single-family homes. C23 households in Inner
+Chicago would save **$`{python} f"{v.core_chicago_sf_mean_stou_jul:.2f}"`** per
+month under Rate BEST in July, compared to a
+**$`{python} f"{v.suburban_sf_mean_stou_jul:.2f}"`** increase for C23 households
+in the outskirts. Urban single-family homes likely have smaller footprints, less
+air conditioning capacity, and more shading from adjacent structures — all of
+which reduce peak-hour consumption and produce larger benefits under TOU
+pricing.
+
+
+## The bottom line
+
+The distributional effects of both TOU rate structures are neutral to mildly
+progressive. Lower-income communities are not disproportionately burdened — they
+are slightly more likely to benefit. Rate BEST produces larger distributional
+effects than DTOD, but both the magnitude and direction of that pattern depend on
+illustrative supply rates that ComEd has not yet finalized.
+
+
+## Appendix {.appendix}
+
+### Data and Methods
+
+This section describes the data sources, transformations, and assumptions
+underlying each major finding in sufficient detail to reproduce the analysis.
+
+#### Smart meter data
+
+**Source:** ComEd Anonymous Data Service, accessed under the ICC-approved
+privacy framework (Docket No. 13-0506). The dataset provides half-hourly
+interval energy consumption (48 readings per day) for residential customers with
+AMI meters, anonymized under the 15/15 Rule.
+
+**Months modeled:** January 2023 and July 2023.
+
+**Account counts:**
+
+| Month | Accounts in raw data | Accounts in Block Group-level analysis |
+|-------|---------------------|-------------------------------|
+| January 2023 | `{python} f"{v.n_households_jan:,}"` | `{python} f"{v.n_bg_analysis_jan:,}"` |
+| July 2023 | `{python} f"{v.n_households_jul:,}"` | `{python} f"{v.n_bg_analysis_jul:,}"` |
+
+The difference between raw and Block Group-level counts reflects two filters:
+(1) an inner join to the account-to-block-group crosswalk, which drops
+approximately 0.04% of accounts with no block group match, and (2) a Census
+income filter that excludes block groups with null or invalid median household
+income. Approximately 6.6% of modeled households fall in block groups without
+valid income data and are excluded from regressions and quintile
+analyses. Household-level statistics (e.g., share saving) use the full raw
+counts.
+
+**Delivery classes included:** C23 (single-family, no electric space heat), C24
+(multi-family, no electric space heat), C26 (single-family,
+electric space heat), C28 (multi-family, electric space heat). Classes C25
+(dusk-to-dawn/outdoor lighting) and C27 (electric heating with thermal storage)
+are excluded throughout because ComEd publishes no TOU delivery facility charges
+for these non-standard residential classes. Without published rates, no bill
+comparison can be computed.
+
+**Anonymization constraints:** Account identifiers are regenerated each month.
+There is no persistent ID linking a household's January record to its July
+record. Each month is analyzed as an independent cross-section.
+
+**Data pipeline:** Raw CSVs were converted to Parquet format, with naming
+convention `YYYY/MM/part-NNNNN.parquet`. Conversion resulted in files
+approximately 1 GiB in size. All 49 months of available data were restructured
+and verified, though only January and July 2023 are used in this analysis.
+
+
+#### Geographic crosswalk
+
+**Source:** A ZIP+4-to-Census-block crosswalk was purchased from Melissa, a
+commercial data firm. Census blocks were then aggregated to block groups in a
+subsequent pipeline stage.
+
+**Match rate:** 1.34 million accounts matched to 4,840 block groups, with a
+99.97% match rate.
+
+**Income data:** Median household income at the block group level is drawn from
+the American Community Survey 2023 5-year estimates.
+
+| Statistic | Value |
+|-----------|-------|
+| Mean Block Group median income | $96,345 |
+| Median Block Group median income | $88,710 |
+| Minimum | $2,500 |
+| Maximum | $250,002 (Census top-code) |
+| Total Block Groups with data (Jan) | `{python} f"{v.n_bgs_jan:,}"` |
+| Total Block Groups with data (Jul) | `{python} f"{v.n_bgs_jul:,}"` |
+
+
+#### Bill calculation
+
+For each household and each month, three bills are computed:
+
+$$
+\begin{aligned}
+\text{Flat bill} &= \text{PTC}_{\text{flat}} \times \text{kWh}_{\text{total}} + \text{DFC}_{\text{flat}} \times \text{kWh}_{\text{total}} \\
+\text{DTOD bill} &= \text{PTC}_{\text{flat}} \times \text{kWh}_{\text{total}} + \sum_{p} \text{DFC}_{\text{TOU}}^{(p)} \times \text{kWh}^{(p)} \\
+\text{Rate BEST bill} &= \sum_{p} \text{BESTEC}^{(p)} \times \text{kWh}^{(p)} + \sum_{p} \text{DFC}_{\text{TOU}}^{(p)} \times \text{kWh}^{(p)}
+\end{aligned}
+$$
+
+**Sign convention:** `delta = flat bill − alternative bill`. Positive delta means
+the customer saves money under TOU.
+
+The four TOU time periods are: Morning (6 AM–1 PM), Mid-Day Peak (1–7 PM),
+Evening (7–9 PM), Overnight (9 PM–6 AM). These apply year-round for delivery.
+Supply periods under Rate BEST additionally vary by season (summer: June–
+September; non-summer: October–May).
+
+
+#### Revenue-neutral calibration
+
+To isolate distributional effects from rate-vintage artifacts, we apply a
+per-delivery-class revenue-neutrality scalar. For each delivery class, the scalar
+is computed as:
+
+$$
+\text{scalar}_c = \frac{\sum_{i \in c} \text{flat bill}_i}{\sum_{i \in c} \text{TOU bill}_i}
+$$
+
+Each household's TOU bill is multiplied by the scalar for its delivery class
+before computing deltas. This forces total TOU revenue to equal total flat
+revenue within each class, so the resulting bill changes reflect only
+distributional differences — who benefits and who pays more relative to other
+customers — not whether bills go up or down overall.
+
+This is a modeling choice, not a regulatory finding. It ensures that the analysis
+is purely distributional, but the scalars do not represent any rate approved or
+proposed by the ICC.
+
+
+#### Rate inputs
+
+**Flat supply — Price to Compare (PTC):**
+
+| Season | PTC (¢/kWh) | Source |
+|--------|------------|--------|
+| Non-summer (Oct–May) | 9.660 | ComEd Price to Compare (2026), confirmed by CUB |
+| Summer (Jun–Sep) | 10.028 | ComEd Price to Compare (2025 summer; 2026 summer not yet released), confirmed by CUB |
+
+**Flat delivery — Distribution Facilities Charge (DFC):**
+
+| Class | DFC (¢/kWh) | Source |
+|-------|------------|--------|
+| C23 | 6.228 | CUB DTOD Fact Sheet (January 2026) |
+| C24 | 4.791 | CUB DTOD Fact Sheet (January 2026) |
+| C26 | 3.165 | CUB DTOD Fact Sheet (January 2026) |
+| C28 | 2.996 | CUB DTOD Fact Sheet (January 2026) |
+
+These are billed rates inclusive of all rider adjustment factors.
+
+**TOU delivery rates (used by both DTOD and Rate BEST):**
+
+| Class | Morning | Mid-Day Peak | Evening | Overnight |
+|-------|---------|-------------|---------|-----------|
+| C23 | 4.009 | 10.712 | 3.747 | 2.984 |
+| C24 | 3.073 | 8.689 | 2.856 | 2.251 |
+| C26 | 1.999 | 5.329 | 1.890 | 1.550 |
+| C28 | 1.925 | 4.975 | 1.823 | 1.512 |
+
+All values ¢/kWh. No seasonal variation. Base rates from ComEd's current
+Ratebook (p. 852, Informational Sheet No. 67), which lists rates as "& ADJ"
+(before rider adjustments). The pipeline uses billed rates inclusive of all
+rider adjustments, as published in the CUB DTOD Fact Sheet (January 2026).
+
+**Rate BEST supply rates — BESTECs (Basic Electric Service Time-of-use Energy
+Charges):**
+
+| Period | Non-summer (¢/kWh) | Summer (¢/kWh) |
+|--------|-------------------|----------------|
+| Morning | 4.095 | 4.279 |
+| Mid-Day Peak | 18.080 | 19.485 |
+| Evening | 4.352 | 4.356 |
+| Overnight | 3.278 | 3.136 |
+
+Source: ComEd Ex. 19.0, ICC Docket 24-0378 — Compromise Proposal rates plus
+1.266¢/kWh Transmission & Miscellaneous Procurement (T&MP) charge. These rates
+are illustrative and do not represent final tariff rates.
+
+
+#### Equity analysis: regressions
+
+**Method:** OLS regression of block-group-level mean percentage savings on
+block-group median household income, with HC1 (heteroskedasticity-consistent)
+robust standard errors.
+
+**Specification:**
+`mean_pct_savings = β₀ + β₁ × (median_income / 10000) + ε`
+
+Income is scaled by $10,000 so that β₁ represents the change in percentage
+savings per $10,000 increase in block-group median income. A negative β₁
+indicates a progressive pattern. A positive β₁ indicates a regressive pattern.
+
+**Groupings:** Regressions were run for each of 4 scenarios (2 rate structures ×
+2 months) across 5 class groupings (pooled + 4 individual delivery classes), for
+a total of 40 regressions. All 40 were independently reproduced from the raw
+Block Group-level CSVs with exact numerical agreement.
+
+**Key pooled results (percentage savings):**
+
+| Scenario | β₁ (per $10K) | p-value | R² | Interpretation |
+|----------|--------------|---------|-----|---------------|
+| Rate BEST Jul | −0.214 | <0.001 | 5.3% | Progressive |
+| DTOD Jul | −0.059 | <0.001 | 5.4% | Progressive |
+| Rate BEST Jan | −0.060 | <0.001 | 1.0% | Progressive |
+| DTOD Jan | −0.014 | <0.001 | 0.8% | Progressive |
+
+The complete 40-regression table, including per-class results and
+absolute-dollar regressions, is available in the project repository.
+
+
+#### Equity analysis: income quintiles
+
+Block groups are sorted by median household income and divided into five
+equal-sized groups. For each quintile, mean dollar savings and mean percentage
+savings are computed.
+
+**Rate BEST July, pooled:**
+
+<!-- SOURCE: data/CUB_analysis/statewide_analysis_revneutral/quintiles_stou_jul.csv — BG-unweighted mean_delta_mean and mean_pct_savings_mean, post-revenue-neutrality adjustment -->
+| Quintile | Income range | Mean Δ ($) | Mean % savings | n Block Groups |
+|----------|-------------|-----------|----------------|-------|
+| Q1 (lowest) | $2,500–$59,077 | $1.90 | 3.69% | 878 |
+| Q2 | $59,101–$78,682 | −$0.68 | 1.42% | 878 |
+| Q3 | $78,719–$99,689 | −$1.03 | 0.99% | 878 |
+| Q4 | $99,733–$130,918 | −$2.11 | 0.13% | 878 |
+| Q5 (highest) | $130,930–$250,002 | −$1.42 | 0.15% | 879 |
+
+**DTOD July, pooled:**
+
+<!-- SOURCE: data/CUB_analysis/statewide_analysis_revneutral/quintiles_dtou_jul.csv — BG-unweighted mean_delta_mean and mean_pct_savings_mean, post-revenue-neutrality adjustment -->
+| Quintile | Income range | Mean Δ ($) | Mean % savings | n Block Groups |
+|----------|-------------|-----------|----------------|-------|
+| Q1 (lowest) | $2,500–$59,077 | $0.56 | 1.02% | 878 |
+| Q2 | $59,101–$78,682 | −$0.15 | 0.39% | 878 |
+| Q3 | $78,719–$99,689 | −$0.28 | 0.27% | 878 |
+| Q4 | $99,733–$130,918 | −$0.58 | 0.02% | 878 |
+| Q5 (highest) | $130,930–$250,002 | −$0.39 | 0.04% | 879 |
+
+**Rate BEST January, pooled:**
+
+<!-- SOURCE: data/CUB_analysis/statewide_analysis_revneutral/quintiles_stou_jan.csv — BG-unweighted mean_delta_mean and mean_pct_savings_mean, post-revenue-neutrality adjustment -->
+| Quintile | Income range | Mean Δ ($) | Mean % savings | n Block Groups |
+|----------|-------------|-----------|----------------|-------|
+| Q1 (lowest) | $2,500–$58,987 | $0.10 | 1.35% | 867 |
+| Q2 | $59,022–$78,392 | $0.39 | 1.40% | 867 |
+| Q3 | $78,418–$99,465 | $0.60 | 1.54% | 867 |
+| Q4 | $99,678–$130,456 | $0.38 | 1.21% | 867 |
+| Q5 (highest) | $130,626–$250,002 | −$0.34 | 0.73% | 870 |
+
+**DTOD January, pooled:**
+
+<!-- SOURCE: data/CUB_analysis/statewide_analysis_revneutral/quintiles_dtou_jan.csv — BG-unweighted mean_delta_mean and mean_pct_savings_mean, post-revenue-neutrality adjustment -->
+| Quintile | Income range | Mean Δ ($) | Mean % savings | n Block Groups |
+|----------|-------------|-----------|----------------|-------|
+| Q1 (lowest) | $2,500–$58,987 | −$0.00 | 0.33% | 867 |
+| Q2 | $59,022–$78,392 | $0.09 | 0.36% | 867 |
+| Q3 | $78,418–$99,465 | $0.15 | 0.41% | 867 |
+| Q4 | $99,678–$130,456 | $0.11 | 0.33% | 867 |
+| Q5 (highest) | $130,626–$250,002 | −$0.10 | 0.19% | 870 |
+
+The complete quintile tables for all 4 scenarios and all class groupings are
+available in the project repository.
+
+
+#### Choropleth maps
+
+**Platform:** Felt (felt.com).
+
+**Data preparation:** Block-group-level mean deltas are clamped and exported as
+GeoJSON. The pipeline's sign convention is `delta = flat − TOU` (positive =
+customer saves). Felt's default diverging color ramp maps high values to red. To
+align red with "pays more," the map field is inverted:
+`cost_change = -mean_delta_clamped`. This way blue = saves and red = pays more,
+matching intuitive expectations.
+
+**Color range:** ±$25.45, computed as the 80th percentile of |mean_delta| across
+all 20 scenario files. This symmetric bound ensures cross-map comparability.
+
+**Domain anchoring:** Before upload, a script injects two synthetic GeoJSON
+features with `cost_change` set to ±$25.45 and `n_households = 0` to force
+Felt's color ramp to use the full symmetric range and center on zero.
+
+
+#### Limitations
+
+1. **Two months do not capture full annual impacts.** Shoulder months likely
+show smaller bill impacts. The annual net equity effect cannot be determined
+from January and July alone.
+
+2. **No behavioral response modeled.** Some households would shift load in
+response to TOU pricing, increasing their savings. Our estimates represent a
+floor.
+
+3. **Block-group-level income proxy.** Within-Block Group income heterogeneity
+is not captured. Individual low-income households in high-income Block Groups
+are not separately identified.
+
+4. **Census income top-coding.** Approximately 40 Block Groups have median
+income at or near $250,001, understating true income and potentially
+attenuating the estimated income gradient.
+
+5. **Small-sample delivery classes.** C26 and C28 regressions have 282–341 Block
+Groups and limited statistical power. Results for these classes are directional
+only.
+
+6. **Rate vintage mixing.** Supply uses 2025/2026 flat PTCs; delivery uses 2026
+flat and TOU DFCs; Rate BEST BESTECs are illustrative from the Compromise Proposal.
+The analysis applies these rates to 2023 usage patterns.
+
+7. **Rate BEST supply rates are not final.** Both the direction and magnitude of
+Rate BEST findings depend on the actual supply rates ComEd sets for the June
+2026 launch.
+
+8. **Revenue-neutral calibration isolates distributional effects but does not
+predict actual bill changes.** The per-class scalars ensure aggregate revenue
+equality within each delivery class but do not represent a regulatory finding or
+a forecast of realized bills.
+
+
+### Regulatory context
+
+ComEd's TOU rates are the product of a multi-year legislative and regulatory
+process rooted in the Climate and Equitable Jobs Act (CEJA, P.A. 102-0662),
+signed into law on September 15, 2021. Among many other provisions, CEJA
+required Illinois utility companies to file Beneficial Electrification (BE)
+Plans to promote vehicle electrification and grid flexibility. ComEd's first BE
+Plan was approved in March 2023 (ICC Docket 22-0432/22-0442), and that order
+directed ComEd to propose a residential TOU delivery rate.
+
+The proceeding, ICC Docket 24-0378, was filed by ComEd in May 2024. Its
+statutory scope was narrow: to reallocate ComEd's delivery service revenue
+requirement among customer classes on a revenue-neutral basis. The ICC's Final
+Order (January 16, 2025) approved the Delivery Time-of-Day (DTOD) rate as a
+voluntary, opt-in program with four time blocks. The Commission initially
+declined to approve a supply-side TOU rate, citing competitive market concerns
+that had not been fully litigated.
+
+ComEd petitioned for rehearing to obtain approval for a combined
+supply-and-delivery TOU rate. The ICC granted rehearing on March 6, 2025. After
+stakeholder negotiations involving ComEd, CUB, the Environmental Defense Fund
+(EDF), and others, the Commission approved Rate BEST in its Order on Rehearing
+(July 17, 2025). Rate BEST uses the same four time blocks as DTOD and is
+available only bundled with DTOD.

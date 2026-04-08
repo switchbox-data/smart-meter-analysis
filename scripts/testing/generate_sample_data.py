@@ -17,7 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import polars as pl
 
@@ -39,7 +39,7 @@ class GenerationConfig:
     num_days: int
     start_date: date
     out_dir: Path
-    seed: Optional[int]
+    seed: int | None
 
 
 def _iter_days(start: date, num_days: int) -> Iterable[date]:

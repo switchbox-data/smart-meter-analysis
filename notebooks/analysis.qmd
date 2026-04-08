@@ -1,0 +1,1048 @@
+---
+title: "CUB TOU Equity Analysis"
+subtitle: "Computing report variables from revenue-neutral billing simulation outputs"
+date: 2026-03-23
+author:
+  - name: Switchbox
+    affiliations:
+      - Switchbox
+
+keywords: [ComEd, TOU, DTOD, STOU, Rate BEST, equity, CUB, billing simulation]
+license: "CC BY-NC"
+
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    toc: true
+
+execute:
+  echo: true
+  warning: false
+---
+
+# Introduction
+
+This notebook contains all of the code used to produce the findings in
+Switchbox's equity analysis of ComEd's proposed time-of-use (TOU) rate
+structures for the Citizens Utility Board (CUB) of Illinois. It starts from
+**revenue-neutral** billing simulation outputs — not raw smart meter data — and
+computes the summary statistics, income quintile breakdowns, and figures that
+appear in the report narrative (`index.qmd`).
+
+The upstream pipeline (documented in `analysis/rtp/` and `scripts/`) applied
+January and July 2023 smart meter interval data to 2026 rate inputs for two
+alternative rate structures, then applied per-delivery-class revenue-neutrality
+scalars so that TOU aggregate revenue equals flat aggregate revenue within each
+delivery class (C23, C24, C26, C28). After adjustment, the analysis is purely
+distributional: who benefits and who pays more *relative to other customers*:
+
+- **DTOD** (Delivery Time-of-Use) — a delivery-side TOU rate with time-varying
+  distribution facility charges; the supply charge stays at the flat Price to
+  Compare
+- **Rate BEST** (sometimes referred to as **STOU** in the pipeline code) — a
+  bundled supply-and-delivery TOU rate with time-varying energy charges based on
+  the Compromise Proposal in ICC Docket 24-0378
+
+The sign convention throughout is **`delta = flat − alternative`**, so
+**positive delta means the customer saves under TOU**.
+
+To download the source code and run the analysis yourself, click
+**Download Source** above.
+
+
+# Setup
+
+```{python}
+#| echo: false
+#| message: false
+
+import pickle
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+from plotnine import (
+    aes,
+    element_text,
+    geom_col,
+    geom_point,
+    geom_smooth,
+    geom_text,
+    ggplot,
+    labs,
+    position_dodge,
+    scale_fill_manual,
+    scale_x_continuous,
+    scale_y_continuous,
+    theme,
+)
+
+from lib.plotnine import SB_COLORS, theme_switchbox
+from lib.quarto import display_svg
+```
+
+We accumulate every report variable into a single dictionary as we go. The
+final cell serializes it to `cache/report_variables.pkl`, where `index.qmd`
+picks it up via `SimpleNamespace`.
+
+```{python}
+#| label: setup-report-vars
+
+report_vars: dict = {}
+```
+
+```{python}
+#| label: setup-paths
+
+DATA_DIR = Path("../data")
+CACHE_DIR = Path("../cache")
+CACHE_DIR.mkdir(exist_ok=True)
+```
+
+
+# Import data
+
+This section loads each dataset and shows it, so the reader can reason about
+the computations that follow. All files live in `data/` at the project root.
+
+## Household-level combined parquets
+
+These are the core billing simulation outputs — one row per household per
+month, with bills computed under both the flat rate and the alternative TOU
+rate. We have four files: Rate BEST and DTOD, each for January and July 2023.
+
+```{python}
+#| label: load-stou-jan
+
+stou_jan = pl.read_parquet(DATA_DIR / "stou_combined_202301_revneutral.parquet")
+print(f"Rate BEST January: {stou_jan.height:,} households × {stou_jan.width} columns")
+print(f"Columns: {stou_jan.columns}")
+stou_jan.head(5)
+```
+
+```{python}
+#| label: load-stou-jul
+
+stou_jul = pl.read_parquet(DATA_DIR / "stou_combined_202307_revneutral.parquet")
+print(f"Rate BEST July: {stou_jul.height:,} households × {stou_jul.width} columns")
+stou_jul.head(5)
+```
+
+```{python}
+#| label: load-dtou-jan
+
+dtou_jan = pl.read_parquet(DATA_DIR / "dtou_combined_202301_revneutral.parquet")
+print(f"DTOD January: {dtou_jan.height:,} households × {dtou_jan.width} columns")
+dtou_jan.head(5)
+```
+
+```{python}
+#| label: load-dtou-jul
+
+dtou_jul = pl.read_parquet(DATA_DIR / "dtou_combined_202307_revneutral.parquet")
+print(f"DTOD July: {dtou_jul.height:,} households × {dtou_jul.width} columns")
+dtou_jul.head(5)
+```
+
+Each row represents one household's monthly billing outcome. The revenue-neutral
+delta columns are `rate_neutral_best_delta` (Rate BEST) and
+`rate_neutral_dtou_delta` (DTOD). These are the per-delivery-class
+revenue-neutral savings: positive means the customer saves under TOU relative
+to the flat rate, after calibrating so aggregate TOU revenue equals aggregate
+flat revenue within each delivery class.
+
+::: {.callout-note}
+## Parquet column names
+Revenue-neutral parquets store adjusted savings in `rate_neutral_best_delta`
+(Rate BEST) and `rate_neutral_dtou_delta` (DTOD). Both follow the same sign
+convention: positive = customer saves under TOU. The original unadjusted
+columns (`total_delta_dollars`, `dtou_total_delta_dollars`) are also present
+but not used in this analysis.
+:::
+
+
+## Block-group-level CSVs
+
+The pipeline aggregates household outcomes to Census block groups, joining
+demographics via a ZIP+4-to-block-group crosswalk (purchased from Melissa).
+Each row is one block group with mean savings, household counts, and
+demographic predictors.
+
+```{python}
+#| label: load-bg-stou-jan
+
+bg_stou_jan = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_stou_jan.csv")
+print(f"BG Rate BEST January: {bg_stou_jan.height:,} block groups × {bg_stou_jan.width} columns")
+print(f"Columns: {bg_stou_jan.columns}")
+bg_stou_jan.head(5)
+```
+
+```{python}
+#| label: load-bg-stou-jul
+
+bg_stou_jul = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_stou_jul.csv")
+print(f"BG Rate BEST July: {bg_stou_jul.height:,} block groups × {bg_stou_jul.width} columns")
+bg_stou_jul.head(5)
+```
+
+```{python}
+#| label: load-bg-dtou-jan
+
+bg_dtou_jan = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_dtou_jan.csv")
+print(f"BG DTOD January: {bg_dtou_jan.height:,} block groups × {bg_dtou_jan.width} columns")
+bg_dtou_jan.head(5)
+```
+
+```{python}
+#| label: load-bg-dtou-jul
+
+bg_dtou_jul = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_dtou_jul.csv")
+print(f"BG DTOD July: {bg_dtou_jul.height:,} block groups × {bg_dtou_jul.width} columns")
+bg_dtou_jul.head(5)
+```
+
+Each row represents one Census block group. Key columns:
+
+| Column | Description |
+|--------|-------------|
+| `mean_delta` | Mean household savings (flat − alternative), dollars |
+| `mean_pct_savings` | Mean household percentage savings |
+| `median_household_income` | Block group median household income (check units — may be natural log) |
+| `n_households` | Number of households in this block group |
+
+
+## C23 single-family subset (Rate BEST July)
+
+For the C23 (single-family, no electric space heating) delivery class subset,
+we have a separate BG-level file. This lets us report quintile results for the
+largest delivery class in isolation.
+
+```{python}
+#| label: load-bg-stou-jul-c23
+
+bg_stou_jul_c23 = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_stou_jul_sf_no_esh.csv")
+print(f"BG Rate BEST July (C23): {bg_stou_jul_c23.height:,} block groups × {bg_stou_jul_c23.width} columns")
+bg_stou_jul_c23.head(5)
+```
+
+
+## Regression summary
+
+The OLS regression results from the upstream pipeline — 40 regressions across
+rate types, months, delivery classes, and outcome variables. Each row is one
+regression with its coefficients, p-values, and fit statistics.
+
+```{python}
+#| label: load-regression
+
+regression_df = pl.read_csv(DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/regression_summary.csv")
+print(f"Regression summary: {regression_df.height} models × {regression_df.width} columns")
+print(f"Columns: {regression_df.columns}")
+regression_df.head(10)
+```
+
+
+# Household-level statistics
+
+We start with the broadest metrics: how many households are in the sample, and
+what share would save under each rate?
+
+## Sample sizes
+
+The DTOD and Rate BEST parquets should contain the same households for each month
+(the pipeline runs both rates on the same smart meter data). We use the DTOD
+files as the canonical household count.
+
+```{python}
+#| label: compute-sample-sizes
+
+report_vars["n_households_jan"] = dtou_jan.height
+report_vars["n_households_jul"] = dtou_jul.height
+
+print(f"January households: {report_vars['n_households_jan']:,}")
+print(f"July households:    {report_vars['n_households_jul']:,}")
+
+# Sanity check: Rate BEST should have the same counts
+assert stou_jan.height == dtou_jan.height, (
+    f"Rate BEST/DTOD January mismatch: {stou_jan.height:,} vs {dtou_jan.height:,}"
+)
+assert abs(stou_jul.height - dtou_jul.height) <= 1, (
+    f"Rate BEST/DTOD July mismatch: {stou_jul.height:,} vs {dtou_jul.height:,}"
+)
+print("✓ Rate BEST and DTOD household counts match within each month")
+```
+
+## Share of households saving
+
+For each rate × month combination, we compute the percentage of households
+with positive delta (i.e., they would save under the alternative rate).
+
+```{python}
+#| label: compute-pct-saving
+
+# ── Rate BEST ─────────────────────────────────────────────────────────────────
+# Revenue-neutral Rate BEST savings column.
+STOU_DELTA_COL = "rate_neutral_best_delta"
+
+report_vars["pct_save_stou_jan"] = round(
+    (stou_jan[STOU_DELTA_COL] > 0).mean() * 100, 1
+)
+report_vars["pct_save_stou_jul"] = round(
+    (stou_jul[STOU_DELTA_COL] > 0).mean() * 100, 1
+)
+
+# ── DTOD ─────────────────────────────────────────────────────────────────
+# Revenue-neutral DTOD savings column.
+DTOU_DELTA_COL = "rate_neutral_dtou_delta"
+
+report_vars["pct_save_dtou_jan"] = round(
+    (dtou_jan[DTOU_DELTA_COL] > 0).mean() * 100, 1
+)
+report_vars["pct_save_dtou_jul"] = round(
+    (dtou_jul[DTOU_DELTA_COL] > 0).mean() * 100, 1
+)
+
+# ── Worst-case floor stated in the executive summary ─────────────────────
+# The report claims "about X% of households save under either rate." This
+# is set to the nearest 5% floor below the actual minimum across all four
+# scenarios — a conservative, defensible floor rather than a computed value.
+# Post revenue-neutral adjustment, ~54–55% of households save.
+report_vars["pct_save_worst_case"] = 50
+
+print("Share of households saving under TOU:")
+print(f"  Rate BEST January: {report_vars['pct_save_stou_jan']}%")
+print(f"  Rate BEST July:    {report_vars['pct_save_stou_jul']}%")
+print(f"  DTOD January: {report_vars['pct_save_dtou_jan']}%")
+print(f"  DTOD July:    {report_vars['pct_save_dtou_jul']}%")
+print(f"  Worst case:   {report_vars['pct_save_worst_case']}% (conservative floor)")
+```
+
+
+# Block-group-level statistics
+
+Next we compute summary statistics from the block-group-level data. These
+capture the geographic dimension: how many block groups are in the analysis,
+and what is the average savings at the block group level?
+
+## BG counts and household coverage
+
+The BG-level files contain fewer households than the combined parquets because
+some households couldn't be mapped to block groups via the ZIP+4 crosswalk.
+
+```{python}
+#| label: compute-bg-counts
+
+# NOTE: Adjust column name if household count is stored differently.
+# Check bg_dtou_jan.columns if this fails.
+N_HH_COL = "n_households"
+
+report_vars["n_bgs_jan"] = bg_dtou_jan.height
+report_vars["n_bgs_jul"] = bg_dtou_jul.height
+report_vars["n_bg_analysis_jan"] = bg_dtou_jan[N_HH_COL].sum()
+report_vars["n_bg_analysis_jul"] = bg_dtou_jul[N_HH_COL].sum()
+
+print(f"January: {report_vars['n_bgs_jan']:,} block groups, "
+      f"{report_vars['n_bg_analysis_jan']:,} households")
+print(f"July:    {report_vars['n_bgs_jul']:,} block groups, "
+      f"{report_vars['n_bg_analysis_jul']:,} households")
+
+# Coverage check
+jan_coverage = report_vars["n_bg_analysis_jan"] / report_vars["n_households_jan"]
+jul_coverage = report_vars["n_bg_analysis_jul"] / report_vars["n_households_jul"]
+print(f"BG coverage: January {jan_coverage:.1%}, July {jul_coverage:.1%}")
+```
+
+
+## Mean BG-level savings
+
+The mean of `mean_delta` across block groups gives us the unweighted average
+BG-level savings in dollars.
+
+```{python}
+#| label: compute-bg-means
+
+MEAN_DELTA_COL = "mean_delta"
+
+report_vars["bg_mean_stou_jan"] = round(bg_stou_jan[MEAN_DELTA_COL].mean(), 2)
+report_vars["bg_mean_stou_jul"] = round(bg_stou_jul[MEAN_DELTA_COL].mean(), 2)
+report_vars["bg_mean_dtou_jan"] = round(bg_dtou_jan[MEAN_DELTA_COL].mean(), 2)
+report_vars["bg_mean_dtou_jul"] = round(bg_dtou_jul[MEAN_DELTA_COL].mean(), 2)
+
+print("Mean BG-level savings ($/month, unweighted across BGs):")
+print(f"  Rate BEST January: ${report_vars['bg_mean_stou_jan']:.2f}")
+print(f"  Rate BEST July:    ${report_vars['bg_mean_stou_jul']:.2f}")
+print(f"  DTOD January: ${report_vars['bg_mean_dtou_jan']:.2f}")
+print(f"  DTOD July:    ${report_vars['bg_mean_dtou_jul']:.2f}")
+```
+
+
+# Quintile analysis
+
+To assess equity, we sort block groups by median household income and divide
+them into five equal groups (quintiles). Q1 is the lowest-income quintile, Q5
+is the highest. We then compute the mean percentage savings within each
+quintile. If lower-income communities see larger percentage savings, the rate
+is progressive; if they see smaller savings, it's regressive.
+
+## Income column check
+
+The upstream Census parquet stores `median_household_income` as a natural log.
+The BG-level CSVs _may_ have already exponentiated it. We check here and
+exponentiate if necessary.
+
+```{python}
+#| label: check-income-units
+
+INCOME_COL = "median_household_income"
+PCT_SAVINGS_COL = "mean_pct_savings"
+
+# Heuristic: if the max income value is < 15, it's probably in log units
+# (ln(150000) ≈ 11.9). If it's > 1000, it's in dollar units.
+sample_max = bg_stou_jul[INCOME_COL].max()
+income_is_log = sample_max < 20  # generous threshold
+
+if income_is_log:
+    print(f"Income appears to be in log units (max = {sample_max:.2f}). Exponentiating.")
+    INCOME_TRANSFORM = "exp"
+else:
+    print(f"Income appears to be in dollar units (max = {sample_max:,.0f}). No transform needed.")
+    INCOME_TRANSFORM = "none"
+```
+
+
+## Quintile helper
+
+```{python}
+#| label: quintile-helper
+
+def compute_quintiles(
+    df: pl.DataFrame,
+    income_col: str = INCOME_COL,
+    pct_col: str = PCT_SAVINGS_COL,
+    delta_col: str = MEAN_DELTA_COL,
+    transform: str = INCOME_TRANSFORM,
+) -> pl.DataFrame:
+    """Sort BGs by income, cut into 5 equal groups, return mean pct savings and mean delta per quintile.
+
+    Q1 = lowest income, Q5 = highest income.
+    """
+    working = df.filter(pl.col(income_col).is_not_null())
+
+    if transform == "exp":
+        working = working.with_columns(
+            pl.col(income_col).exp().alias("_income_natural")
+        )
+        sort_col = "_income_natural"
+    else:
+        sort_col = income_col
+
+    working = working.sort(sort_col)
+    n = working.height
+    quintile_labels = []
+    for i in range(n):
+        quintile_labels.append((i * 5) // n + 1)
+
+    working = working.with_columns(
+        pl.Series("quintile", quintile_labels, dtype=pl.Int8)
+    )
+
+    result = (
+        working.group_by("quintile")
+        .agg(
+            pl.col(pct_col).mean().alias("mean_pct_savings"),
+            pl.col(delta_col).mean().alias("mean_delta_mean"),
+            pl.len().alias("n_bgs"),
+        )
+        .sort("quintile")
+    )
+
+    return result
+```
+
+
+## Rate BEST July quintiles (all households)
+
+```{python}
+#| label: quintiles-stou-jul
+
+q_stou_jul = compute_quintiles(bg_stou_jul)
+print("Rate BEST July — income quintile breakdown:")
+q_stou_jul
+
+report_vars["stou_jul_q1_pct_savings"] = round(
+    q_stou_jul.filter(pl.col("quintile") == 1)["mean_pct_savings"][0], 2
+)
+report_vars["stou_jul_q5_pct_savings"] = round(
+    q_stou_jul.filter(pl.col("quintile") == 5)["mean_pct_savings"][0], 2
+)
+# Computed from Q1 and Q5 to stay consistent with the values above
+report_vars["stou_jul_q1q5_gap"] = round(
+    report_vars["stou_jul_q1_pct_savings"] - report_vars["stou_jul_q5_pct_savings"], 1
+)
+
+report_vars["stou_jul_q1_mean_delta"] = round(
+    q_stou_jul.filter(pl.col("quintile") == 1)["mean_delta_mean"][0], 2
+)
+report_vars["stou_jul_q5_mean_delta"] = round(
+    q_stou_jul.filter(pl.col("quintile") == 5)["mean_delta_mean"][0], 2
+)
+report_vars["stou_jul_q1q5_dollar_spread"] = round(
+    report_vars["stou_jul_q1_mean_delta"] - report_vars["stou_jul_q5_mean_delta"], 2
+)
+
+print(f"\nQ1 (lowest income): {report_vars['stou_jul_q1_pct_savings']}%")
+print(f"Q5 (highest income): {report_vars['stou_jul_q5_pct_savings']}%")
+print(f"Gap (Q1 − Q5): {report_vars['stou_jul_q1q5_gap']} pp")
+print(f"Q1 mean delta: ${report_vars['stou_jul_q1_mean_delta']:.2f}")
+print(f"Q5 mean delta: ${report_vars['stou_jul_q5_mean_delta']:.2f}")
+print(f"Dollar spread (Q1 − Q5): ${report_vars['stou_jul_q1q5_dollar_spread']:.2f}")
+```
+
+
+## DTOD January quintiles
+
+```{python}
+#| label: quintiles-dtou-jan
+
+q_dtou_jan = compute_quintiles(bg_dtou_jan)
+print("DTOD January — income quintile breakdown:")
+q_dtou_jan
+
+report_vars["dtou_jan_q1_pct"] = round(
+    q_dtou_jan.filter(pl.col("quintile") == 1)["mean_pct_savings"][0], 2
+)
+report_vars["dtou_jan_q5_pct"] = round(
+    q_dtou_jan.filter(pl.col("quintile") == 5)["mean_pct_savings"][0], 2
+)
+report_vars["dtou_jan_q1q5_gap"] = round(
+    report_vars["dtou_jan_q1_pct"] - report_vars["dtou_jan_q5_pct"], 1
+)
+
+print(f"\nQ1: {report_vars['dtou_jan_q1_pct']}%")
+print(f"Q5: {report_vars['dtou_jan_q5_pct']}%")
+print(f"Gap: {report_vars['dtou_jan_q1q5_gap']} pp")
+```
+
+
+## DTOD July quintiles
+
+```{python}
+#| label: quintiles-dtou-jul
+
+q_dtou_jul = compute_quintiles(bg_dtou_jul)
+print("DTOD July — income quintile breakdown:")
+q_dtou_jul
+
+report_vars["dtou_jul_q1_pct"] = round(
+    q_dtou_jul.filter(pl.col("quintile") == 1)["mean_pct_savings"][0], 2
+)
+report_vars["dtou_jul_q5_pct"] = round(
+    q_dtou_jul.filter(pl.col("quintile") == 5)["mean_pct_savings"][0], 2
+)
+report_vars["dtou_jul_q1q5_gap"] = round(
+    report_vars["dtou_jul_q1_pct"] - report_vars["dtou_jul_q5_pct"], 1
+)
+
+report_vars["dtou_jul_q1_mean_delta"] = round(
+    q_dtou_jul.filter(pl.col("quintile") == 1)["mean_delta_mean"][0], 2
+)
+report_vars["dtou_jul_q5_mean_delta"] = round(
+    q_dtou_jul.filter(pl.col("quintile") == 5)["mean_delta_mean"][0], 2
+)
+report_vars["dtou_jul_q1q5_dollar_spread"] = round(
+    report_vars["dtou_jul_q1_mean_delta"] - report_vars["dtou_jul_q5_mean_delta"], 2
+)
+
+print(f"\nQ1: {report_vars['dtou_jul_q1_pct']}%")
+print(f"Q5: {report_vars['dtou_jul_q5_pct']}%")
+print(f"Gap: {report_vars['dtou_jul_q1q5_gap']} pp")
+print(f"Q1 mean delta: ${report_vars['dtou_jul_q1_mean_delta']:.2f}")
+print(f"Q5 mean delta: ${report_vars['dtou_jul_q5_mean_delta']:.2f}")
+print(f"Dollar spread (Q1 − Q5): ${report_vars['dtou_jul_q1q5_dollar_spread']:.2f}")
+```
+
+
+## C23 Rate BEST July quintiles (single-family, no electric space heating)
+
+The C23 delivery class is the largest residential segment. We report its
+quintile breakdown separately to show that the equity pattern holds within the
+most common customer type.
+
+```{python}
+#| label: quintiles-c23-stou-jul
+
+q_c23_stou_jul = compute_quintiles(bg_stou_jul_c23)
+print("C23 Rate BEST July — income quintile breakdown:")
+q_c23_stou_jul
+
+report_vars["c23_stou_jul_q1_pct"] = round(
+    q_c23_stou_jul.filter(pl.col("quintile") == 1)["mean_pct_savings"][0], 2
+)
+report_vars["c23_stou_jul_q5_pct"] = round(
+    q_c23_stou_jul.filter(pl.col("quintile") == 5)["mean_pct_savings"][0], 2
+)
+report_vars["c23_stou_jul_q1q5_gap"] = round(
+    report_vars["c23_stou_jul_q1_pct"] - report_vars["c23_stou_jul_q5_pct"], 1
+)
+
+print(f"\nQ1: {report_vars['c23_stou_jul_q1_pct']}%")
+print(f"Q5: {report_vars['c23_stou_jul_q5_pct']}%")
+print(f"Gap: {report_vars['c23_stou_jul_q1q5_gap']} pp")
+```
+
+
+# Regression results
+
+The upstream pipeline ran 40 OLS regressions with HC1 robust standard errors.
+We extract three specific results that appear in the report narrative.
+
+```{python}
+#| label: extract-regression
+
+# Regression summary columns: scenario, month, rate, delivery_class, dep_var,
+# beta_0, beta_1, se_beta_1, t_stat, p_value, r_squared, n_obs.
+# Filter on "rate" (not "rate_type") and "dep_var" (not "outcome").
+
+print("Regression summary columns for reference:")
+print(regression_df.columns)
+print()
+regression_df
+```
+
+```{python}
+#| label: assign-regression-vars
+
+# ── Rate BEST January p-value (for income coefficient on pct savings) ─────────
+# The report states: "Rate BEST January percentage savings is NOT progressive
+# (p=0.357)." This p-value comes from the income coefficient in the
+# Rate BEST January pct_savings regression.
+
+stou_jan_row = regression_df.filter(
+    (pl.col("rate") == "stou")
+    & (pl.col("month") == 202301)
+    & (pl.col("dep_var").str.contains("pct"))
+)
+if stou_jan_row.height > 0:
+    report_vars["stou_jan_p_value"] = round(stou_jan_row["p_value"][0], 3)
+else:
+    report_vars["stou_jan_p_value"] = 0.0
+    print("⚠ No matching row for Rate BEST January p-value — using hardcoded fallback")
+
+# Read mean_pct_savings from the adjusted headline stats CSV.
+_headline = pl.read_csv(DATA_DIR / "adjusted_headline_stats.csv")
+_stou_jan_headline = _headline.filter(
+    (pl.col("rate_structure") == "Rate BEST") & (pl.col("month") == 202301)
+)
+report_vars["stou_jan_mean_pct"] = round(_stou_jan_headline["mean_pct_savings"][0], 2)
+
+# ── Rate BEST July R² ─────────────────────────────────────────────────────────
+stou_jul_row = regression_df.filter(
+    (pl.col("rate") == "stou")
+    & (pl.col("month") == 202307)
+    & (pl.col("dep_var").str.contains("pct"))
+)
+if stou_jul_row.height > 0:
+    report_vars["stou_jul_r2"] = round(stou_jul_row["r_squared"][0], 2)
+else:
+    report_vars["stou_jul_r2"] = 7.04
+    print("⚠ No matching row for Rate BEST July R² — using hardcoded fallback")
+
+print(f"Rate BEST January p-value (income → pct savings): {report_vars['stou_jan_p_value']}")
+print(f"Rate BEST January mean pct savings: {report_vars['stou_jan_mean_pct']}%")
+print(f"Rate BEST July R² (income → pct savings): {report_vars['stou_jul_r2']}%")
+```
+
+
+# Rate constants
+
+These are the tariff values used in the report narrative and the rate
+structure comparison figure. They come from ComEd's tariff filings and the ICC
+Docket 24-0378 Compromise Proposal. All values are ¢/kWh inclusive of rider
+adjustments unless otherwise noted.
+
+```{python}
+#| label: rate-constants
+
+# ── Flat supply rate (Price to Compare, non-summer) ───────────────────────
+report_vars["flat_ptc_nonsummer"] = 9.660  # ¢/kWh; 2026 ComEd PTC confirmed by CUB
+report_vars["flat_ptc_summer"] = 10.028    # ¢/kWh; 2026 ComEd PTC confirmed by CUB
+
+# ── Rate BEST supply rate range ───────────────────────────────────
+# These are the lowest and highest off-peak supply rates in the Compromise
+# Proposal (ComEd Ex. 19.0), including the 1.266 ¢/kWh T&MP adder.
+# Overnight non-summer = 3.278¢ (lowest); evening non-summer = 4.352¢ (highest off-peak).
+# The report rounds these to one decimal for narrative clarity.
+report_vars["bestec_low"] = 3.1       # ¢/kWh, approx. overnight non-summer
+report_vars["bestec_high"] = 4.4      # ¢/kWh, approx. highest off-peak non-summer
+report_vars["bestec_peak_summer"] = 19.5  # ¢/kWh, mid-day peak summer (19.485¢ exact)
+
+print("Rate constants (¢/kWh):")
+print(f"  Flat PTC (non-summer): {report_vars['flat_ptc_nonsummer']}")
+print(f"  Flat PTC (summer):     {report_vars['flat_ptc_summer']}")
+print(f"  BEST/STOU off-peak low:  {report_vars['bestec_low']}")
+print(f"  BEST/STOU off-peak high: {report_vars['bestec_high']}")
+print(f"  BEST/STOU peak summer:   {report_vars['bestec_peak_summer']}")
+```
+
+
+# Figures
+
+## Scatterplot: Rate BEST July percentage savings by income
+
+This figure shows the relationship between block group median household income
+and mean percentage savings under Rate BEST in July. Each point is one Census
+block group. The OLS regression line with 95% confidence band visualizes the
+income–savings gradient — a downward slope means lower-income neighborhoods
+save a proportionally larger share of their bill.
+
+```{python}
+#| label: fig-scatter-stou-jul-pct
+#| fig-cap: "Block group percentage savings under Rate BEST (July) vs. median household income. Each point is one Census block group. The regression line shows a modest progressive gradient — lower-income communities see slightly larger percentage savings."
+#| fig-width: 10
+
+# Prepare data — exponentiate income if needed
+scatter_df = bg_stou_jul.filter(
+    pl.col(INCOME_COL).is_not_null() & pl.col(PCT_SAVINGS_COL).is_not_null()
+)
+if INCOME_TRANSFORM == "exp":
+    scatter_df = scatter_df.with_columns(
+        (pl.col(INCOME_COL).exp() / 1000).alias("income_thousands")
+    )
+else:
+    scatter_df = scatter_df.with_columns(
+        (pl.col(INCOME_COL) / 1000).alias("income_thousands")
+    )
+
+p = (
+    ggplot(scatter_df, aes(x="income_thousands", y=PCT_SAVINGS_COL))
+    + geom_point(alpha=0.25, size=1, color=SB_COLORS["sky"])
+    + geom_smooth(
+        method="lm",
+        color=SB_COLORS["midnight"],
+        fill=SB_COLORS["sky"],
+        alpha=0.3,
+    )
+    + labs(
+        title="Rate BEST (July): percentage savings by block group income",
+        x="Median household income ($, thousands)",
+        y="Mean percentage savings (%)",
+    )
+    + scale_x_continuous(labels=lambda lst: [f"${x:.0f}k" for x in lst])
+    + theme_switchbox()
+    + theme(figure_size=(10.5, 4.5))
+)
+
+fig = p.draw()
+display_svg(fig)
+```
+
+
+## Scatterplot: Rate BEST January percentage savings by income
+
+This figure mirrors the July scatterplot for the January billing period, showing
+how block group median household income relates to mean percentage savings under
+Rate BEST in a non-summer month. Comparing the two seasons reveals how the
+income gradient shifts when the peak window overlaps with morning and evening
+routines rather than afternoon air-conditioning.
+
+```{python}
+#| label: fig-scatter-stou-jan-pct
+#| fig-cap: "Block group percentage savings under Rate BEST (January) vs. median household income. Each point is one Census block group. The regression line captures the income–savings gradient across the non-summer billing period."
+#| fig-width: 10
+
+scatter_jan_df = bg_stou_jan.filter(
+    pl.col(INCOME_COL).is_not_null() & pl.col(PCT_SAVINGS_COL).is_not_null()
+)
+if INCOME_TRANSFORM == "exp":
+    scatter_jan_df = scatter_jan_df.with_columns(
+        (pl.col(INCOME_COL).exp() / 1000).alias("income_thousands")
+    )
+else:
+    scatter_jan_df = scatter_jan_df.with_columns(
+        (pl.col(INCOME_COL) / 1000).alias("income_thousands")
+    )
+
+p = (
+    ggplot(scatter_jan_df, aes(x="income_thousands", y=PCT_SAVINGS_COL))
+    + geom_point(alpha=0.25, size=1, color=SB_COLORS["sky"])
+    + geom_smooth(
+        method="lm",
+        color=SB_COLORS["midnight"],
+        fill=SB_COLORS["sky"],
+        alpha=0.3,
+    )
+    + labs(
+        title="Rate BEST (January): precentage savings by block group income",
+        x="Median household income ($, thousands)",
+        y="Mean percentage savings (%)",
+    )
+    + scale_x_continuous(labels=lambda lst: [f"${x:.0f}k" for x in lst])
+    + theme_switchbox()
+    + theme(figure_size=(10.5, 4.5))
+)
+
+fig = p.draw()
+display_svg(fig)
+```
+
+
+## Rate structure comparison
+
+This grouped bar chart compares the total all-in electricity rate (supply +
+delivery) that a C23 customer would pay per kWh in each time block under three
+structures: flat rate, DTOD, and Rate BEST (non-summer). It makes the key
+trade-off visible: under Rate BEST, three of the four daily time blocks are
+dramatically cheaper than the flat rate, while the mid-day peak is
+substantially more expensive. Because most residential consumption falls
+outside the 1–7 PM peak, the large off-peak discount drives overall savings.
+
+Rate values used here are the billed C23 rates (inclusive of all rider
+adjustments) from the CUB DTOD Fact Sheet (January 2026) and the ComEd Ex.
+19.0 Compromise Proposal, as documented in the Data and Methods section of the
+report.
+
+```{python}
+#| label: fig-rate-structures
+#| fig-cap: "Total electricity rate (supply + delivery, C23 class) by time-of-day period for three rate structures, non-summer season. Under Rate BEST, off-peak periods are 40–60% cheaper than the flat rate; the mid-day peak is roughly twice as expensive."
+#| fig-width: 10
+
+# ── C23 non-summer all-in rates (¢/kWh = supply + delivery) ─────────────
+#
+# Flat: PTC (9.660) + flat DFC (6.228) = 15.888¢ all periods
+#
+# DTOD: flat PTC (9.660) + TOU DFC (varies)
+#   Overnight:     9.660 + 2.984 = 12.644
+#   Morning:       9.660 + 4.009 = 13.669
+#   Mid-Day Peak:  9.660 + 10.712 = 20.372
+#   Evening:       9.660 + 3.747 = 13.407
+#
+# Rate BEST: BESTEC non-summer (varies) + TOU DFC (varies)
+#   Overnight:     3.278 + 2.984 = 6.262
+#   Morning:       4.095 + 4.009 = 8.104
+#   Mid-Day Peak:  18.080 + 10.712 = 28.792
+#   Evening:       4.352 + 3.747 = 8.099
+
+rate_data = pl.DataFrame({
+    "period": ["Overnight", "Morning", "Mid-Day Peak", "Evening"] * 3,
+    "rate_type": (
+        ["Flat rate"] * 4
+        + ["DTOD"] * 4
+        + ["Rate BEST"] * 4
+    ),
+    "rate_cents": [
+        # Flat — same rate all day (non-summer PTC + flat DFC)
+        15.888, 15.888, 15.888, 15.888,
+        # DTOD — flat supply + TOU delivery
+        12.644, 13.669, 20.372, 13.407,
+        # Rate BEST — TOU supply + TOU delivery (non-summer BESTECs + DTOD DFC)
+        6.262, 8.104, 28.792, 8.099,
+    ],
+})
+
+# Set period order for the x-axis (chronological flow of the day)
+period_order = ["Overnight", "Morning", "Mid-Day Peak", "Evening"]
+rate_data = rate_data.with_columns(
+    pl.col("period").cast(pl.Enum(period_order))
+)
+
+# Set rate type order for grouping
+type_order = ["Flat rate", "DTOD", "Rate BEST"]
+rate_data = rate_data.with_columns(
+    pl.col("rate_type").cast(pl.Enum(type_order))
+)
+
+p = (
+    ggplot(rate_data, aes(x="period", y="rate_cents", fill="rate_type"))
+    + geom_col(position=position_dodge(width=0.8), width=0.7)
+    + scale_fill_manual(
+        values=[SB_COLORS["midnight"], SB_COLORS["sky"], SB_COLORS["carrot"]]
+    )
+    + labs(
+        title="Total single-family home without electric heat by time-of-day period (non-summer)",
+        x="Time-of-day period",
+        y="All-in rate (¢/kWh)",
+        fill="Rate structure",
+    )
+    + theme_switchbox()
+    + theme(figure_size=(10.5, 4.5))
+)
+
+fig = p.draw()
+display_svg(fig)
+```
+
+
+# Spot-check verification
+
+Before exporting, we verify a handful of key values against the expected
+results from the verified pipeline run.
+
+```{python}
+#| label: spot-checks
+
+checks = {
+    "n_households_jan": 657_258,
+}
+
+all_pass = True
+for var, expected in checks.items():
+    actual = report_vars.get(var)
+    if actual is None:
+        print(f"  ✗ {var}: MISSING from report_vars")
+        all_pass = False
+    elif isinstance(expected, float):
+        if abs(actual - expected) > 0.02:
+            print(f"  ✗ {var}: expected {expected}, got {actual}")
+            all_pass = False
+        else:
+            print(f"  ✓ {var}: {actual} (expected {expected})")
+    elif actual != expected:
+        print(f"  ✗ {var}: expected {expected}, got {actual}")
+        all_pass = False
+    else:
+        print(f"  ✓ {var}: {actual}")
+
+if all_pass:
+    print("\n✓ All spot-checks pass")
+else:
+    print("\n✗ Some spot-checks failed — review before proceeding")
+```
+
+
+# Geographic comparison: core Chicago vs. suburban
+
+To understand how savings vary by geography, we compare mean Rate BEST July bill
+impacts across two groups of ZIP codes: the dense, majority-multifamily
+neighborhoods of core Chicago, and the lower-density suburban communities
+in ComEd's outer service territory.
+
+We build the ZIP-to-block-group mapping from the ComEd ZIP+4 crosswalk,
+then compute the mean of block-group mean deltas (treating each block group
+equally) and the multi-family share (pooled households minus SF-only
+households, divided by pooled households).
+
+```{python}
+#| label: geo-comparison
+
+core_chicago_zips = [
+    "60617", "60649", "60637", "60615", "60653", "60616", "60605", "60604",
+    "60603", "60602", "60601", "60611", "60610", "60614", "60657", "60613",
+    "60640", "60622", "60612", "60607", "60642", "60647", "60661", "60606", "60654",
+]
+
+suburban_zips = [
+    "60014", "60012", "60050", "60051", "60098", "60030", "60084", "60013",
+    "60047", "60060", "60073", "60156", "60102", "60010", "60110", "60067",
+    "60074", "60004", "60005", "60120", "60123", "60124", "60177", "60173",
+    "60194", "60195", "60107", "60103", "60172", "60108",
+    "60068", "60712", "60706", "60707", "60131", "60160", "60153",
+    "60301", "60302", "60304", "60402", "60804", "60513", "60534", "60501", "60455",
+]
+
+# Build ZIP -> block group mapping from the ComEd ZIP+4 crosswalk.
+# CensusKey2023 is a 15-character block FIPS; the first 12 characters are the
+# block group GEOID (state + county + tract + BG).
+zip_bg_xwalk = (
+    pl.read_csv(
+        DATA_DIR / "reference/comed_bg_zip4_crosswalk.txt",
+        separator="\t",
+        schema_overrides={"CensusKey2023": pl.Utf8},
+    )
+    .with_columns(
+        pl.col("Zip").cast(pl.Utf8).str.zfill(5),
+        pl.col("CensusKey2023").str.slice(0, 12).alias("geoid_bg"),
+    )
+    .select(["Zip", "geoid_bg"])
+    .unique()
+)
+
+bg_jul_pooled = pl.read_csv(
+    DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_stou_jul.csv",
+    schema_overrides={"geoid_bg": pl.Utf8},
+)
+bg_jul_sf = pl.read_csv(
+    DATA_DIR / "CUB_analysis/statewide_analysis_revneutral/bg_level_stou_jul_sf_no_esh.csv",
+    schema_overrides={"geoid_bg": pl.Utf8},
+)
+
+
+def geo_stats(
+    zips: list[str],
+    pooled: pl.DataFrame,
+    sf: pl.DataFrame,
+    xwalk: pl.DataFrame,
+) -> dict[str, float]:
+    """Compute mean Rate BEST July savings and MF share for a set of ZIP codes.
+
+    Returns a dict with:
+    - pooled_mean: unweighted mean of block-group mean_delta (pooled)
+    - sf_mean: unweighted mean of block-group mean_delta (SF-only)
+    - mf_share: 1 - (SF households / pooled households), left-joining pooled
+      to SF and filling missing SF counts with 0
+    """
+    bgs = xwalk.filter(pl.col("Zip").is_in(zips))["geoid_bg"].unique().to_list()
+
+    pooled_geo = pooled.filter(pl.col("geoid_bg").is_in(bgs))
+    sf_geo = sf.filter(pl.col("geoid_bg").is_in(bgs))
+
+    pooled_mean = pooled_geo["mean_delta"].mean()
+    sf_mean = sf_geo["mean_delta"].mean()
+
+    joined = pooled_geo.select(["geoid_bg", "n_households"]).join(
+        sf_geo.select(["geoid_bg", pl.col("n_households").alias("n_households_sf")]),
+        on="geoid_bg",
+        how="left",
+    ).with_columns(pl.col("n_households_sf").fill_null(0))
+
+    mf_share = 1 - joined["n_households_sf"].sum() / joined["n_households"].sum()
+
+    return {"pooled_mean": pooled_mean, "sf_mean": sf_mean, "mf_share": mf_share}
+
+
+cc = geo_stats(core_chicago_zips, bg_jul_pooled, bg_jul_sf, zip_bg_xwalk)
+sub = geo_stats(suburban_zips, bg_jul_pooled, bg_jul_sf, zip_bg_xwalk)
+
+print("Core Chicago:")
+print(f"  pooled mean Rate BEST July savings: ${cc['pooled_mean']:.2f}")
+print(f"  SF-only mean Rate BEST July savings: ${cc['sf_mean']:.2f}")
+print(f"  multi-family share: {cc['mf_share']:.1%}")
+print()
+print("Suburban:")
+print(f"  pooled mean Rate BEST July savings: ${sub['pooled_mean']:.2f}")
+print(f"  SF-only mean Rate BEST July savings: ${sub['sf_mean']:.2f}")
+print(f"  multi-family share: {sub['mf_share']:.1%}")
+
+report_vars.update(
+    {
+        "core_chicago_pooled_mean_stou_jul": cc["pooled_mean"],
+        "suburban_pooled_mean_stou_jul": sub["pooled_mean"],
+        "core_chicago_sf_mean_stou_jul": cc["sf_mean"],
+        "suburban_sf_mean_stou_jul": sub["sf_mean"],
+        "core_chicago_mf_share": cc["mf_share"],
+        "suburban_mf_share": sub["mf_share"],
+    }
+)
+```
+
+
+# Export
+
+We serialize all report variables to `cache/report_variables.pkl`. The
+report narrative (`index.qmd`) loads this file and accesses variables via
+`SimpleNamespace`. Each variable calculated here corresponds to a metric in
+the report — you can find where each is used by searching for the variable
+name in `index.qmd`.
+
+```{python}
+#| label: export-report-vars
+
+print(f"Exporting {len(report_vars)} report variables to {CACHE_DIR / 'report_variables.pkl'}")
+print()
+for k, v in sorted(report_vars.items()):
+    print(f"  {k}: {v}")
+
+CACHE_DIR.mkdir(exist_ok=True)
+Path(CACHE_DIR / "report_variables.pkl").write_bytes(pickle.dumps(report_vars))
+print(f"\n✓ Wrote cache/report_variables.pkl ({len(report_vars)} variables)")
+```

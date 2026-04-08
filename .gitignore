@@ -18,7 +18,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -143,6 +142,7 @@ cython_debug/
 *.xlsx
 *.csv
 *.parquet
+*.geojson
 *.tsv
 *.kml
 *.zip
@@ -156,7 +156,10 @@ data/
 # Temporary files
 scratch/
 *_sample_*.csv
+# Ignore ad-hoc test scripts in the project root (test_foo.py scratch files)
+# but keep real test files in the tests/ directory via negation pattern.
 test_*.py
+!tests/test_*.py
 debug_*.py
 
 # Debug files
@@ -166,9 +169,28 @@ archive/
 
 # generated artifacts
 out/
+output/
 results/
 
 # benchmark artificats
 profiles/
 docs/*.html
 docs/index_files/
+
+# Local run artifacts (shard lists, input lists, temp dirs)
+*.txt
+.tmp/
+archive_quarantine/
+tmp_polars_run_*/
+subagent_packages/
+
+# Operator-only env (do not commit)
+.env.comed
+
+# Pricing pilot data
+data/pilot_interval_parquet/
+CLAUDE.md
+.cursor/
+
+/.quarto/
+_manuscript/

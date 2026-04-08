@@ -1,0 +1,507 @@
+/*-- scss:defaults --*/
+
+/* switchbox colors */
+$sky: #68bed8;
+$carrot: #fc9706;
+$midnight: #023047;
+$midnight_lighter: #0b6082;
+$saffron: #ffc729;
+$pistachio: #a0af12;
+$pistachio_darker: #546800;
+$black: #000000;
+$grey: #a9aaae;
+$white: #ffffff;
+
+$link-color: $midnight_lighter !default;
+$link-decoration: underline !default;
+
+$h1-font-size: 2.5em;
+$h2-font-size: 1em;
+$h3-font-size: 1em;
+
+// The left hand sidebar
+$grid-sidebar-width: 300px !default;
+
+// The main body
+$grid-body-width: 750px !default;
+
+// The right hand margin bar
+$grid-margin-width: 300px !default;
+
+// The gutter that appears between the above columns
+$width: screen and
+  (
+    min-width: 768px,
+  );
+
+$grid-column-gutter-width: 5rem;
+
+@if $width == true {
+  $grid-column-gutter-width: 1rem;
+}
+
+/*-- scss:rules --*/
+
+/* farnham_text */
+@font-face {
+  font-display: swap;
+  font-family: "Farnham";
+  font-style: normal;
+  src: url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Regular.otf")
+      format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Regular.otf") format("opentype");
+}
+
+/* farnham_text_bold */
+@font-face {
+  font-display: swap;
+  font-family: "Farnham-Bold";
+  font-style: normal;
+  src: url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Bold.otf") format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Bold.otf") format("opentype");
+}
+
+/* gt_planar */
+@font-face {
+  font-display: swap;
+  font-family: "GT-Planar";
+  font-style: normal;
+  src: url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Regular.otf") format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Regular.otf") format("opentype");
+}
+
+/* gt_planar_bold */
+@font-face {
+  font-display: swap;
+  font-family: "GT-Planar-Bold";
+  src: url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Bold.otf") format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Bold.otf") format("opentype");
+}
+
+/* gt_planar_black */
+@font-face {
+  font-display: swap;
+  font-family: "GT-Planar-Black";
+  src: url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Black.otf") format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Black.otf") format("opentype");
+}
+
+/* ibm_plex_sans */
+@font-face {
+  font-display: swap;
+  font-family: "IBM-Plex-Sans";
+  src: url("https://switchbox-data.github.io/reports/fonts/ibm_plex_sans/IBMPlexSans-Regular.otf")
+      format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/ibm_plex_sans/IBMPlexSans-Regular.otf")
+      format("opentype");
+}
+
+/* sf_mono */
+@font-face {
+  font-display: swap;
+  font-family: "SFMono";
+  font-style: normal;
+  font-weight: 400;
+  src: url("https://switchbox-data.github.io/reports/fonts/sf_mono/SFMono-Regular.otf") format("opentype"),
+    url("https://switchbox-data.github.io/reports/fonts/sf_mono/SFMono-Regular.otf") format("opentype");
+}
+
+/* Matplotlib SVG font aliases — match the internal OTF names that matplotlib
+   outputs in <text> elements when svg.fonttype = "none". These allow inline
+   SVG chart text to resolve to the correct Switchbox brand fonts via the
+   page's CSS cascade. */
+@font-face {
+  font-display: swap;
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  src: url("https://switchbox-data.github.io/reports/fonts/ibm_plex_sans/IBMPlexSans-Regular.otf")
+      format("opentype");
+}
+@font-face {
+  font-display: swap;
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 700;
+  src: url("https://switchbox-data.github.io/reports/fonts/ibm_plex_sans/IBMPlexSans-Bold.otf")
+      format("opentype");
+}
+@font-face {
+  font-display: swap;
+  font-family: "GT Planar";
+  font-style: normal;
+  font-weight: 400;
+  src: url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Regular.otf")
+      format("opentype");
+}
+@font-face {
+  font-display: swap;
+  font-family: "GT Planar";
+  font-style: normal;
+  font-weight: 700;
+  src: url("https://switchbox-data.github.io/reports/fonts/gt_planar/GT-Planar-Bold.otf")
+      format("opentype");
+}
+@font-face {
+  font-display: swap;
+  font-family: "Farnham Text";
+  font-style: normal;
+  font-weight: 400;
+  src: url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Regular.otf")
+      format("opentype");
+}
+@font-face {
+  font-display: swap;
+  font-family: "Farnham Text";
+  font-style: normal;
+  font-weight: 700;
+  src: url("https://switchbox-data.github.io/reports/fonts/farnham_text/FarnhamText-Bold.otf")
+      format("opentype");
+}
+
+sup {
+  color: $carrot;
+  font-family: "GT-Planar-Black";
+  font-size: 13px;
+}
+
+main {
+  line-height: 1.7;
+
+  a {
+    text-decoration-color: $sky;
+  }
+
+  h1 {
+    font-family: "GT-Planar-Bold";
+  }
+
+  h2 {
+    font-family: "GT-Planar-Black";
+    text-transform: uppercase;
+    border-bottom: 0;
+    border-top: 0.25em solid $black;
+    letter-spacing: 0.06em;
+    padding: 10px 0 16px;
+  }
+
+  h3 {
+    font-family: "GT-Planar-Bold";
+    border-top: 1px black solid;
+    padding: 10px 0 20px;
+  }
+
+  h4 {
+    font-family: "Farnham-Bold";
+    font-size: 1.07em;
+  }
+
+  p {
+    font-family: "Farnham";
+    font-size: 1.07em;
+  }
+
+  strong {
+    font-family: "Farnham-Bold";
+    font-size: 1.07em;
+  }
+
+  div {
+    font-family: "Farnham";
+    font-size: 1.07em;
+  }
+
+  code {
+    font-family: "SFMono";
+    font-size: .9em;
+  }
+
+  .column {
+    p {
+      font-family: "Farnham" !important;
+      font-size: 1.07em !important;
+    }
+  }
+
+  ol {
+    list-style-position: outside;
+    padding: 0;
+
+    li {
+      font-family: "Farnham";
+      font-size: 1.07em;
+
+      strong {
+        font-family: "Farnham-Bold";
+      }
+
+      li {
+        font-size: inherit;
+      }
+    }
+
+    li::marker {
+      color: $sky;
+      font-family: "GT-Planar";
+    }
+
+    li > p {
+      font-size: inherit;
+      margin-top: 0;
+      margin-bottom: 0;
+    }
+  }
+
+  ul {
+    list-style: none;
+    display: table-cell;
+    padding: 0;
+    margin: 0;
+
+    li {
+      font-family: "Farnham";
+      font-size: 1.07em;
+      padding-left: 2.2em;
+      text-indent: -1.8em;
+
+      strong {
+        font-family: "Farnham-Bold";
+      }
+
+      li {
+        font-size: inherit;
+      }
+    }
+
+    li:before {
+      content: "\25CB";
+      color: $sky;
+      padding-right: 20px;
+    }
+
+    li > p:first-child {
+      display: inline;
+    }
+
+    li > p {
+      font-size: inherit;
+      margin-top: 0;
+      margin-bottom: 0;
+    }
+  }
+
+  li {
+    margin: 10px 0px;
+  }
+
+  table {
+    font-size: 0.75rem;
+
+    thead {
+      border-top: 3px $black solid;
+      font-family: "GT-Planar";
+
+      th:first-of-type {
+        text-align: start;
+      }
+
+      th {
+        vertical-align: top;
+        text-align: end;
+      }
+    }
+
+    th,
+    td {
+      border-right: 1px solid rgba(0, 0, 0, 0.08);
+
+      &:last-child {
+        border-right: none;
+      }
+    }
+
+    td:first-of-type {
+      font-family: "GT-Planar";
+      text-align: start;
+
+      strong {
+        font-family: "GT-Planar-Bold";
+      }
+    }
+
+    td {
+      font-family: "IBM-Plex-Sans";
+      text-align: end;
+
+      strong {
+        font-family: "IBM-Plex-Sans";
+        font-weight: bold;
+        font-size: inherit;
+      }
+    }
+  }
+}
+
+.cell-output-display.page-full,
+.quarto-float.page-full {
+  z-index: 0 !important;
+}
+
+.column-margin {
+  z-index: 998 !important;
+  sup {
+    top: 0;
+    margin-right: 4em;
+    font-size: 1em;
+    line-height: 1.4em;
+  }
+  p {
+    font-family: "GT-Planar" !important;
+    color: $grey;
+    font-size: 1em;
+    line-height: 1.4em;
+  }
+
+  strong {
+    font-family: "GT-Planar-Bold" !important;
+  }
+  a {
+    color: $sky;
+    text-decoration: none;
+  }
+}
+
+.sidebar {
+  h2 {
+    font-family: "GT-Planar-Black" !important;
+    text-transform: uppercase;
+    color: $midnight_lighter;
+  }
+
+  a {
+    font-family: "GT-Planar" !important;
+    color: $grey !important;
+    :active {
+      color: $sky !important;
+    }
+    :hover {
+      color: $sky !important;
+    }
+  }
+}
+
+.quarto-title-banner {
+  a {
+    color: $sky;
+  }
+
+  h1 {
+    color: $sky;
+    font-family: "GT-Planar-Bold";
+  }
+
+  .subtitle {
+    font-family: "GT-Planar";
+  }
+
+  .quarto-title-meta-heading {
+    font-family: "GT-Planar-Black";
+  }
+
+  background-color: $midnight;
+  color: $sky;
+  font-family: "GT-Planar";
+  background-image: url("https://switchbox-data.github.io/reports/icon-white.png");
+  background-size: 100px;
+  background-repeat: no-repeat, no-repeat;
+  background-position: 80%;
+}
+
+.quarto-appendix-heading {
+  margin-bottom: 17px;
+}
+
+.quarto-appendix-contents {
+  .csl-entry {
+    margin: 18px 0;
+  }
+}
+
+.references {
+  .csl-entry {
+    margin: 18px 0;
+  }
+}
+
+code {
+  font-family: "SFMono";
+}
+
+figcaption {
+  display: flex;
+
+  .figure {
+    font-family: "GT-Planar-Black" !important;
+    color: $carrot;
+    margin-right: 5px;
+    font-size: 13px;
+  }
+
+  p {
+    font-family: "GT-Planar" !important;
+    color: $grey;
+    font-size: 1em;
+    line-height: 1.4em;
+  }
+
+  p strong {
+    font-family: "GT-Planar-Bold" !important;
+  }
+}
+
+dt {
+  font-family: "GT-Planar-bold" !important;
+  color: $grey !important;
+  font-size: 1em !important;
+}
+dd {
+  font-family: "GT-Planar" !important;
+  color: $grey !important;
+  font-size: 1em !important;
+}
+
+.sidebar nav[role="doc-toc"] ul > li > a.active,
+.sidebar nav[role="doc-toc"] ul > li > ul > li > a.active {
+  border-left: 1px solid $sky;
+  color: $sky !important;
+}
+
+.sidebar nav[role="doc-toc"] ul > li > a:hover,
+.sidebar nav[role="doc-toc"] ul > li > ul > li > a:hover {
+  color: $sky !important;
+}
+
+
+div.callout-tip.callout {
+  border-left-color: $pistachio;
+}
+
+div.callout-tip.callout-style-default>.callout-header {
+  background-color: #f7fbd4;
+}
+
+div.callout-warning.callout {
+  border-left-color: $carrot;
+}
+
+div.callout-warning.callout-style-default>.callout-header {
+  background-color: #ffefda;
+}
+
+div.callout-note.callout {
+  border-left-color: $sky;
+}
+
+div.callout-note.callout-style-default>.callout-header {
+  background-color: #e8f5f9;
+}
